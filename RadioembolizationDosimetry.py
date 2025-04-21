@@ -53,7 +53,6 @@ class RadioembolizationDosimetryWidget(ScriptedLoadableModuleWidget):
             self.layout.addWidget(bannerLabel)
         else:
             print(f"❌ WARNING: Banner file not found at {bannerPath}")
-
         
         # Input SPECT Volume Selector
         self.spectSelector = slicer.qMRMLNodeComboBox()
@@ -129,10 +128,6 @@ class RadioembolizationDosimetryWidget(ScriptedLoadableModuleWidget):
         self.liverDensitySpinBox.setSingleStep(0.01)
         formLayout.addRow("Liver Density (g/mL):", self.liverDensitySpinBox)
 
-
-
-
-
         # Output Volume Selector
         self.outputVolumeSelector = slicer.qMRMLNodeComboBox()
         self.outputVolumeSelector.nodeTypes = ["vtkMRMLScalarVolumeNode"]
@@ -162,7 +157,6 @@ class RadioembolizationDosimetryWidget(ScriptedLoadableModuleWidget):
         self.targetSegmentSelector.setMRMLScene(slicer.mrmlScene)
         self.targetSegmentSelector.setToolTip("Select the segment representing the tumor.")
         formLayout.addRow("Target Tissue: ", self.targetSegmentSelector)
-
        
         # Calculate Button
         self.calculateButtonlim = qt.QPushButton("Calculate the activity for target dose")
@@ -175,6 +169,12 @@ class RadioembolizationDosimetryWidget(ScriptedLoadableModuleWidget):
         self.segmentDoseTable.setHorizontalHeaderLabels(["Segment", "Dose (Gy)","Volume (mL)","Activity (MBq)"])
         self.segmentDoseTable.setFixedSize(420,350)
         formLayout.addRow("Segment Doses: ", self.segmentDoseTable)
+
+        # Save Report Button
+        self.saveReportButton = qt.QPushButton("Save Report as RTF")
+        self.saveReportButton.toolTip = "Export dosimetry results to a report file."
+        formLayout.addRow(self.saveReportButton)
+        self.saveReportButton.connect('clicked(bool)', self.onSaveReportClicked)
 
         # Connections
         self.calculateButton.connect('clicked(bool)', self.onCalculateButton)
@@ -194,6 +194,10 @@ class RadioembolizationDosimetryWidget(ScriptedLoadableModuleWidget):
         )
         infoTextBox.setToolTip("Module information and instructions.")  # Add a tooltip for additional help
         self.layout.addWidget(infoTextBox)
+
+
+
+
         
     def onSegmentationNodeChanged(self, node):
         self.liverSegmentSelector.setSegmentationNode(node)
@@ -507,3 +511,62 @@ class RadioembolizationDosimetryWidget(ScriptedLoadableModuleWidget):
        
         
         return 0
+
+    def onSaveReportClicked(self):
+        # Open file dialog to select save path
+        fileDialog = qt.QFileDialog()
+        fileName = fileDialog.getSaveFileName(None, "Save Dosimetry Report", "", "RTF Files (*.rtf)")
+        if not fileName:
+            return
+        if not fileName.lower().endswith(".rtf"):
+            fileName += ".rtf"
+
+        # Build RTF content
+        import datetime
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conversionFactor = self.conversionFactorSpinBox.value
+        lungMass = self.lungMassSpinBox.value
+        liverDensity = self.liverDensitySpinBox.value
+        activity = self.activitySlider.value
+        lungShunt = self.lungShuntSlider.value
+
+        rtf = r"""{\rtf1\ansi\deff0
+{\b Taranis - Patient Relative Quantification\line
+\b Radioembolization Dosimetry Report}\line
+Generated: """ + now + r"""\line
+\line
+{\b Parameters}\line
+Activity: """ + f"{activity:.2f} MBq" + r"""\line
+Lung Shunt: """ + f"{lungShunt:.2f}%" + r"""\line
+Conversion Factor: """ + f"{conversionFactor:.2f} Gy/MBq/g" + r"""\line
+Lung Mass: """ + f"{lungMass:.2f} g" + r"""\line
+Liver Density: """ + f"{liverDensity:.2f} g/mL" + r"""\line
+\line
+{\b Segment Doses}\line
+"""
+
+        rowCount = self.segmentDoseTable.rowCount
+        colCount = self.segmentDoseTable.columnCount
+        for row in range(rowCount):
+            segment = self.segmentDoseTable.item(row, 0)
+            dose = self.segmentDoseTable.item(row, 1)
+            vol = self.segmentDoseTable.item(row, 2) if colCount > 2 else None
+            act = self.segmentDoseTable.item(row, 3) if colCount > 3 else None
+            
+            rtf += f"Segment: {segment.text()}, "
+
+            if dose:
+                rtf += f"Dose = {dose.text()} Gy"
+            if vol:
+                rtf += f", Volume = {vol.text()} mL"
+            if act:
+                rtf += f", Activity = {act.text()} MBq"
+            rtf += r"\line\n "
+
+        rtf += r"\line\n End of Report}"
+        
+        # Write to file
+        with open(fileName, "w") as file:
+            file.write(rtf)
+
+        slicer.util.infoDisplay("RTF report saved successfully.")

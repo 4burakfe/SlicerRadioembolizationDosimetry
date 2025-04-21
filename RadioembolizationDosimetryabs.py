@@ -132,6 +132,14 @@ class RadioembolizationDosimetryabsWidget(ScriptedLoadableModuleWidget):
         self.segmentDoseTable.setFixedSize(400,350)
         formLayout.addRow("Segment Doses: ", self.segmentDoseTable)
 
+
+        # Save Report Button
+        self.saveReportButton = qt.QPushButton("Save Report as RTF")
+        self.saveReportButton.toolTip = "Export dosimetry results to a report file."
+        formLayout.addRow(self.saveReportButton)
+        self.saveReportButton.connect('clicked(bool)', self.onSaveReportClicked)
+        
+        
         # Total Activity Text Box
         self.totalActivityTextBox = qt.QLineEdit()
         self.totalActivityTextBox.setReadOnly(True)
@@ -291,3 +299,58 @@ class RadioembolizationDosimetryabsWidget(ScriptedLoadableModuleWidget):
 
         logging.info("Dosimetric calculations completed.")
         return segmentDoses
+        
+        
+    def onSaveReportClicked(self):
+        # Open file dialog to select save path
+        fileDialog = qt.QFileDialog()
+        fileName = fileDialog.getSaveFileName(None, "Save Dosimetry Report", "", "RTF Files (*.rtf)")
+        if not fileName:
+            return
+        if not fileName.lower().endswith(".rtf"):
+            fileName += ".rtf"
+
+        # Build RTF content
+        import datetime
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conversionFactor = self.conversionFactorSpinBox.value
+        liverDensity = self.liverDensitySpinBox.value
+        rtf = r"""{\rtf1\ansi\deff0
+{\b Taranis - Absolute Quantification\line
+\b Radioembolization Dosimetry Report}\line
+Generated: """ + now + r"""\line
+\line
+{\b Parameters}\line
+Activity During Imaging: """ + f"{self.totalActivityTextBox.text}" + r"""\line
+Decay Corrected Activity: """ + f"{self.dectotalActivityTextBox.text}" + r"""\line
+Conversion Factor: """ + f"{conversionFactor:.2f} Gy/MBq/g" + r"""\line
+Liver Density: """ + f"{liverDensity:.2f} g/mL" + r"""\line
+\line
+{\b Segment Doses}\line
+"""
+
+        rowCount = self.segmentDoseTable.rowCount
+        colCount = self.segmentDoseTable.columnCount
+        for row in range(rowCount):
+            segment = self.segmentDoseTable.item(row, 0)
+            dose = self.segmentDoseTable.item(row, 1)
+            vol = self.segmentDoseTable.item(row, 2) if colCount > 2 else None
+            act = self.segmentDoseTable.item(row, 3) if colCount > 3 else None
+            
+            rtf += f"Segment: {segment.text()}, "
+
+            if dose:
+                rtf += f"Dose = {dose.text()} Gy"
+            if vol:
+                rtf += f", Volume = {vol.text()} mL"
+            if act:
+                rtf += f", Activity = {act.text()} MBq"
+            rtf += r"\line\n "
+
+        rtf += r"\line\n End of Report}"
+        
+        # Write to file
+        with open(fileName, "w") as file:
+            file.write(rtf)
+
+        slicer.util.infoDisplay("RTF report saved successfully.")        
