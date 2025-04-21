@@ -90,6 +90,23 @@ class RadioembolizationDosimetryabsWidget(ScriptedLoadableModuleWidget):
         self.hourSlider.setToolTip("Hours after treatment")
         formLayout.addRow("Hours after treatment: ", self.hourSlider)
 
+        # Conversion Factor (Gy/MBq/g)
+        self.conversionFactorSpinBox = qt.QDoubleSpinBox()
+        self.conversionFactorSpinBox.setRange(0.0, 100.0)
+        self.conversionFactorSpinBox.setValue(49.67)
+        self.conversionFactorSpinBox.setSingleStep(0.1)
+        formLayout.addRow("Conversion Factor (Gy/MBq/g):", self.conversionFactorSpinBox)
+
+        # Liver Tissue Density (g/mL)
+        self.liverDensitySpinBox = qt.QDoubleSpinBox()
+        self.liverDensitySpinBox.setRange(0.0, 10.0)
+        self.liverDensitySpinBox.setValue(1.05)
+        self.liverDensitySpinBox.setSingleStep(0.01)
+        formLayout.addRow("Liver Density (g/mL):", self.liverDensitySpinBox)
+
+
+
+
         # Output Volume Selector
         self.outputVolumeSelector = slicer.qMRMLNodeComboBox()
         self.outputVolumeSelector.nodeTypes = ["vtkMRMLScalarVolumeNode"]
@@ -137,9 +154,10 @@ class RadioembolizationDosimetryabsWidget(ScriptedLoadableModuleWidget):
         infoTextBox.setPlainText(
             "This module enables predictive dosimetry with SPECT and PET images.\n"
             "This module is NOT a medical device. It is for research purposes only.\n"
-            "Prepared by: Burak Demir, MD, FEBNM \n"
+            "Default conversion factor is for Y-90 which equals to 49.67 J/GBq\n"
+            "Conversion factor for Ho-166 is 14.85 J/GBq\n" 
+            "Written by: Burak Demir, MD, FEBNM \n"
             "For support, feedback, and suggestions: 4burakfe@gmail.com\n"
-            "Version: alpha v1.1"
         )
         infoTextBox.setToolTip("Module information and instructions.")  # Add a tooltip for additional help
         self.layout.addWidget(infoTextBox)
@@ -159,8 +177,7 @@ class RadioembolizationDosimetryabsWidget(ScriptedLoadableModuleWidget):
         backgroundVolumeid = slicer.app.layoutManager().sliceWidget("Red").mrmlSliceCompositeNode().GetBackgroundVolumeID()
 
         # Perform dosimetric calculations
-        logic = RadioembolizationDosimetryabsLogic()
-        logic.calculateDose(spectVolumeNode, segmentationNode, hourelapsed, outputVolumeNode,self.totalActivityTextBox,self.dectotalActivityTextBox,self.segmentDoseTable)
+        self.calculateDose(spectVolumeNode, segmentationNode, hourelapsed, outputVolumeNode,self.totalActivityTextBox,self.dectotalActivityTextBox,self.segmentDoseTable)
         self.outputVolumeSelector.currentNode().SetName("Dose Map (Gy)")
         foregroundVolumeid = self.outputVolumeSelector.currentNode().GetID()
         sliceCompositeNode.SetBackgroundVolumeID(backgroundVolumeid)
@@ -169,7 +186,6 @@ class RadioembolizationDosimetryabsWidget(ScriptedLoadableModuleWidget):
         segmentationNode
         
         
-class RadioembolizationDosimetryabsLogic(ScriptedLoadableModuleLogic):
     def calculateDose(self, spectVolumeNode, segmentationNode, hourelapsed, outputVolumeNode, totalActivityTextBox,dectotalActivityTextBox,segmentDoseTable):
         """
         Perform dosimetric calculations using the given inputs.
@@ -210,8 +226,8 @@ class RadioembolizationDosimetryabsLogic(ScriptedLoadableModuleLogic):
         dectotalActivityTextBox.setText(f"{activityMBq:.2f} MBq")
 
         # Constants for Y-90 dosimetry
-        densityGPerML = 1.05  # g/mL for liver tissue
-        conversionFactor = 50  # Gy per MBq per g of tissue
+        conversionFactor = self.conversionFactorSpinBox.value
+        densityGPerML = self.liverDensitySpinBox.value
 
         # Calculate mean output dose
         meanOutputDoseGy = (activityMBq / (totalVolumeML * densityGPerML)) * conversionFactor

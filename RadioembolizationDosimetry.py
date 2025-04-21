@@ -94,7 +94,7 @@ class RadioembolizationDosimetryWidget(ScriptedLoadableModuleWidget):
         self.activitySlider = ctk.ctkSliderWidget()
         self.activitySlider.singleStep = 1
         self.activitySlider.minimum = 0
-        self.activitySlider.maximum = 6000
+        self.activitySlider.maximum = 10000
         self.activitySlider.value = 0
         self.activitySlider.setToolTip("Specify the desired activity in MBq.")
         formLayout.addRow("Y-90 Activity (MBq): ", self.activitySlider)
@@ -107,6 +107,31 @@ class RadioembolizationDosimetryWidget(ScriptedLoadableModuleWidget):
         self.lungShuntSlider.value = 0
         self.lungShuntSlider.setToolTip("Specify the lung shunt fraction as a percentage.")
         formLayout.addRow("Lung Shunt Fraction (%): ", self.lungShuntSlider)
+
+        # Conversion Factor (Gy/MBq/g)
+        self.conversionFactorSpinBox = qt.QDoubleSpinBox()
+        self.conversionFactorSpinBox.setRange(0.0, 100.0)
+        self.conversionFactorSpinBox.setValue(49.67)
+        self.conversionFactorSpinBox.setSingleStep(0.1)
+        formLayout.addRow("Conversion Factor (Gy/MBq/g):", self.conversionFactorSpinBox)
+
+        # Lung Mass (g)
+        self.lungMassSpinBox = qt.QDoubleSpinBox()
+        self.lungMassSpinBox.setRange(0.0, 5000.0)
+        self.lungMassSpinBox.setValue(1000.0)
+        self.lungMassSpinBox.setSingleStep(50.0)
+        formLayout.addRow("Lung Mass (g):", self.lungMassSpinBox)
+
+        # Liver Tissue Density (g/mL)
+        self.liverDensitySpinBox = qt.QDoubleSpinBox()
+        self.liverDensitySpinBox.setRange(0.0, 10.0)
+        self.liverDensitySpinBox.setValue(1.05)
+        self.liverDensitySpinBox.setSingleStep(0.01)
+        formLayout.addRow("Liver Density (g/mL):", self.liverDensitySpinBox)
+
+
+
+
 
         # Output Volume Selector
         self.outputVolumeSelector = slicer.qMRMLNodeComboBox()
@@ -126,42 +151,23 @@ class RadioembolizationDosimetryWidget(ScriptedLoadableModuleWidget):
         self.calculateButton.toolTip = "Perform dosimetric calculations."
         formLayout.addRow(self.calculateButton)
 
-        # Limit normal Dose Slider
-        self.ndoseSlider = ctk.ctkSliderWidget()
-        self.ndoseSlider.singleStep = 1
-        self.ndoseSlider.minimum = 0
-        self.ndoseSlider.maximum = 400
-        self.ndoseSlider.value = 0
-        self.ndoseSlider.setToolTip("Specify the dose limit for normal tissue")
-#        formLayout.addRow("Limit dose for segment(Gy):", self.ndoseSlider)
+        self.targetdoseSlider = ctk.ctkSliderWidget()
+        self.targetdoseSlider.singleStep = 1
+        self.targetdoseSlider.minimum = 0
+        self.targetdoseSlider.maximum = 1000
+        self.targetdoseSlider.value = 0
+        formLayout.addRow("Target dose for segment(Gy):", self.targetdoseSlider)
 
-        # normal
-        self.normalSegmentSelector = slicer.qMRMLSegmentSelectorWidget()
-        self.normalSegmentSelector.setMRMLScene(slicer.mrmlScene)
-        self.normalSegmentSelector.setToolTip("Select the segment representing the tumor.")
-#        formLayout.addRow("Normal Tissue: ", self.normalSegmentSelector)
+        self.targetSegmentSelector = slicer.qMRMLSegmentSelectorWidget()
+        self.targetSegmentSelector.setMRMLScene(slicer.mrmlScene)
+        self.targetSegmentSelector.setToolTip("Select the segment representing the tumor.")
+        formLayout.addRow("Target Tissue: ", self.targetSegmentSelector)
 
-        # Limit lung Dose Slider
-        self.ldoseSlider = ctk.ctkSliderWidget()
-        self.ldoseSlider.singleStep = 1
-        self.ldoseSlider.minimum = 0
-        self.ldoseSlider.maximum = 400
-        self.ldoseSlider.value = 0
-        self.ldoseSlider.setToolTip("Specify the dose limit for lung tissue")
-#        formLayout.addRow("Limit dose for lungs(Gy):", self.ldoseSlider)
-
-        limTextBox = qt.QTextEdit()
-        limTextBox.setReadOnly(True)  # Make the text box read-only
-        limTextBox.append(
-            "Set maximum limit doses for segments. Tumor dose will be maximized within the limits.\n"
-            "If you do not desire to use one or more limits or targets, set value to zero.\n"
-        )
-#        formLayout.addRow("Processing Log:", limTextBox)
        
         # Calculate Button
-        self.calculateButtonlim = qt.QPushButton("Calculate with the maximal activity within limit doses")
+        self.calculateButtonlim = qt.QPushButton("Calculate the activity for target dose")
         self.calculateButtonlim.toolTip = "Perform dosimetric calculations."
-#        formLayout.addRow(self.calculateButtonlim)
+        formLayout.addRow(self.calculateButtonlim)
 
         # Segment Dose Table
         self.segmentDoseTable = qt.QTableWidget()
@@ -181,9 +187,10 @@ class RadioembolizationDosimetryWidget(ScriptedLoadableModuleWidget):
         infoTextBox.setPlainText(
             "This module enables predictive dosimetry with SPECT and PET images.\n"
             "This module is NOT a medical device. It is for research purposes only.\n"
-            "Prepared by: Burak Demir, MD, FEBNM \n"
+            "Default conversion factor is for Y-90 which equals to 49.67 J/GBq\n"
+            "Conversion factor for Ho-166 is 14.85 J/GBq\n"         
+            "Written by: Burak Demir, MD, FEBNM \n"
             "For support, feedback, and suggestions: 4burakfe@gmail.com\n"
-            "Version: alpha v1.1"
         )
         infoTextBox.setToolTip("Module information and instructions.")  # Add a tooltip for additional help
         self.layout.addWidget(infoTextBox)
@@ -271,8 +278,9 @@ class RadioembolizationDosimetryWidget(ScriptedLoadableModuleWidget):
         meanInputValue = np.sum(maskedArray) / maskedArray.size
 
         # Constants for Y-90 dosimetry
-        densityGPerML = 1.05  # g/mL for liver tissue
-        conversionFactor = 50  # Gy per MBq per g of tissue
+        conversionFactor = self.conversionFactorSpinBox.value
+        lungMassg = self.lungMassSpinBox.value
+        densityGPerML = self.liverDensitySpinBox.value
 
         # Calculate mean output dose
         meanOutputDoseGy = (activityMBq / (totalVolumeML * densityGPerML)) * conversionFactor
@@ -329,8 +337,6 @@ class RadioembolizationDosimetryWidget(ScriptedLoadableModuleWidget):
 
         logging.info("Dosimetric calculations completed.")
          # Estimate lung absorbed dose
-        lungMassg = 1000  # Assumed lung mass g
-        conversionFactor = 50  # Gy per MBq per g of tissue
         lungDoseGy = (ncorr_activityMBq * lungShuntFractionPercent * 0.01 * conversionFactor) / lungMassg
    
         # Update segment dose table
@@ -430,9 +436,12 @@ class RadioembolizationDosimetryWidget(ScriptedLoadableModuleWidget):
         #SET ACTIVITY TO 1000 MBQ
         activityMBq=1000
 
+        # Constants for Y-90 dosimetry
+        conversionFactor = self.conversionFactorSpinBox.value
+        lungMassg = self.lungMassSpinBox.value
+        densityGPerML = self.liverDensitySpinBox.value
 
-
-        NsegmentID = self.normalSegmentSelector.currentSegmentID()
+        NsegmentID = self.targetSegmentSelector.currentSegmentID()
         
         
         # Adjust activity based on lung shunt fraction
@@ -444,9 +453,7 @@ class RadioembolizationDosimetryWidget(ScriptedLoadableModuleWidget):
         # Calculate mean input value within the liver segment
         meanInputValue = np.sum(maskedArray) / maskedArray.size
 
-        # Constants for Y-90 dosimetry
-        densityGPerML = 1.05  # g/mL for liver tissue
-        conversionFactor = 50  # Gy per MBq per g of tissue
+
 
         # Calculate mean output dose
         meanOutputDoseGy = (activityMBq / (totalVolumeML * densityGPerML)) * conversionFactor
@@ -484,21 +491,16 @@ class RadioembolizationDosimetryWidget(ScriptedLoadableModuleWidget):
         # Remove temporary label map node
         slicer.mrmlScene.RemoveNode(segmentLabelMapNode)
         slicer.mrmlScene.RemoveNode(maskedVolumeNode)
+        slicer.mrmlScene.RemoveNode(labelMapVolumeNode)
 
 
         permittedMBq = 1000
-        if self.ndoseSlider.value>0:
-            permittedMBq = ((self.ndoseSlider.value/NDOSE)*1000)
-        lungMassg = 1000  # Assumed lung mass g
-        conversionFactor = 50  # Gy per MBq per g of tissue
-        LDOSE = (1000 * lungShuntFractionPercent * 0.01 * conversionFactor) / lungMassg
-        if self.ldoseSlider.value>0:
-            if permittedMBq > (self.ldoseSlider.value/LDOSE)*1000:
-                permittedMBq = (self.ldoseSlider.value/LDOSE)*1000
-            else:
-                permittedMBq = permittedMBq
+        if self.targetdoseSlider.value>0:
+            permittedMBq = ((self.targetdoseSlider.value/NDOSE)*1000)
                 
         self.activitySlider.value = permittedMBq
+
+
         self.calculateDose(spectVolumeNode, segmentationNode, liverSegmentID, permittedMBq, outputVolumeNode, lungShuntFractionPercent)
         
  
