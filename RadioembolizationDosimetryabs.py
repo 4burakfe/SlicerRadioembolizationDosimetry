@@ -90,6 +90,16 @@ class RadioembolizationDosimetryabsWidget(ScriptedLoadableModuleWidget):
         self.hourSlider.setToolTip("Hours after treatment")
         formLayout.addRow("Hours after treatment: ", self.hourSlider)
 
+
+        # Half-Life SpinBox
+        self.halfLifeSpinBox = qt.QDoubleSpinBox()
+        self.halfLifeSpinBox.setRange(0.1, 200.0)  # Allow reasonable half-lives
+        self.halfLifeSpinBox.setValue(64.2)         # Default for Y-90
+        self.halfLifeSpinBox.setSingleStep(0.1)
+        self.halfLifeSpinBox.setToolTip("Specify the radionuclide's physical half-life in hours.")
+        formLayout.addRow("Half-Life (hours):", self.halfLifeSpinBox)
+
+
         # Conversion Factor (Gy/MBq/g)
         self.conversionFactorSpinBox = qt.QDoubleSpinBox()
         self.conversionFactorSpinBox.setRange(0.0, 100.0)
@@ -229,7 +239,7 @@ class RadioembolizationDosimetryabsWidget(ScriptedLoadableModuleWidget):
         totalActivityTextBox.setText(f"{activityMBq:.2f} MBq")
 
         # Decay correction
-        activityMBq = activityMBq * (2.0 ** (hourelapsed / 64.2))
+        activityMBq = activityMBq * (2.0 ** (hourelapsed / self.halfLifeSpinBox.value))
         # Update total activity text box
         dectotalActivityTextBox.setText(f"{activityMBq:.2f} MBq")
 
