@@ -66,13 +66,12 @@
 **Steps**:
 1. Load SPECT and corresponding CT volume.
 2. Load or create ROI around liver region.
-3. Perform cropping for both SPECT/CT and diagnostic reference volume.
-4. Select registration method:
+3. Select registration method:
    - Rigid
    - Affine
    - Deformable (BSpline)
-5. Click **Register Images**.
-6. Registration results are automatically visualized with overlay and appropriate colormaps.
+4. Click **Register Images**.
+5. Registration results are automatically visualized with overlay and appropriate colormaps.
 
 ---
 
