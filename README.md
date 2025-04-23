@@ -2,7 +2,7 @@
 
 ![Banner](banner.png)
 
-![Screenshot](Screenshot.jpg)
+
 
 **Taranis** is an open-source suite of Python modules for voxel-based liver radioembolization dosimetry, developed for use within [3D Slicer](https://www.slicer.org/). It enables lung shunt fraction estimation, predictive dose planning, and post-treatment quantification using PET or SPECT images. Taranis is designed for researchers and developers exploring personalized dosimetry workflows.
 
@@ -33,6 +33,7 @@
 ### 📌 RadioembolizationDosimetry – Patient Relative
 **Purpose**: Predict dose distributions using known activity and user-defined physical parameters.
 
+![Screenshot](Screenshot2.jpg)
 **Steps**:
 1. Load SPECT/PET image and liver segmentation.
 2. Define:
@@ -50,7 +51,7 @@
 
 ### 📌 RadioembolizationDosimetryabs – Absolute Quantification
 **Purpose**: Estimate absorbed dose from post-treatment PET/SPECT images using decay correction.
-
+![Screenshot](Screenshot1.jpg)
 **Steps**:
 1. Load post-treatment PET/SPECT image and segmentation.
 2. Input:
