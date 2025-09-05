@@ -186,8 +186,16 @@ class RadioembolizationDosimetryabsWidget(ScriptedLoadableModuleWidget):
         hourelapsed = self.hourSlider.value
         outputVolumeNode = self.outputVolumeSelector.currentNode()
 
-        if not spectVolumeNode or not segmentationNode or not outputVolumeNode:
-            slicer.util.errorDisplay("Please select valid input and output nodes.")
+        missingInputs = []
+        if not spectVolumeNode:
+            missingInputs.append("Input PET Volume")
+        if not segmentationNode:
+            missingInputs.append("Segmentation")
+        if not outputVolumeNode:
+            missingInputs.append("Output Volume")
+        if missingInputs:
+            message = "Please select the following required inputs:\n" + "\n".join(missingInputs)
+            slicer.util.errorDisplay(message)
             return
 
         sliceWidget = slicer.app.layoutManager().sliceWidget(slicer.app.layoutManager().sliceViewNames()[0])

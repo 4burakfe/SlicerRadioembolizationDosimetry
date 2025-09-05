@@ -25,6 +25,75 @@ class RadioembolizationDosimetry(ScriptedLoadableModule):
         self.parent.icon = qt.QIcon(iconPath)  # Assign icon to the module
         self.parent = parent
 
+        # Additional initialization step after application startup is complete
+        slicer.app.connect("startupCompleted()", registerSampleData)
+
+#
+# Register sample data sets in Sample Data module
+#
+
+
+def registerSampleData():
+    """Add data sets to Sample Data module."""
+    # It is always recommended to provide sample data for users to make it easy to try the module,
+    # but if no sample data is available then this method (and associated startupCompeted signal connection) can be removed.
+
+    import SampleData
+
+    iconsPath = os.path.join(os.path.dirname(__file__), "Resources/Icons")
+
+    # To ensure that the source code repository remains small (can be downloaded and installed quickly)
+    # it is recommended to store data sets that are larger than a few MB in a Github release.
+
+    # RadioembolizationDosimetry1
+    SampleData.SampleDataLogic.registerCustomSampleDataSource(
+        # Category and sample name displayed in Sample Data module
+        category="RadioembolizationDosimetry",
+        sampleName="RadioembolizationDosimetry1",
+        # Thumbnail should have size of approximately 260x280 pixels and stored in Resources/Icons folder.
+        # It can be created by Screen Capture module, "Capture all views" option enabled, "Number of images" set to "Single".
+        thumbnailFileName=os.path.join(iconsPath, "RadioembolizationDosimetry1.png"),
+        # Download URL and target file name
+        uris=["https://github.com/4burakfe/SlicerRadioembolizationDosimetry_SampleImages/releases/download/TestImages/patient_1_MRI.nrrd",
+              "https://github.com/4burakfe/SlicerRadioembolizationDosimetry_SampleImages/releases/download/TestImages/patient_1_Y90_PET.nrrd",
+              "https://github.com/4burakfe/SlicerRadioembolizationDosimetry_SampleImages/releases/download/TestImages/patient_1_Segmentation.seg.nrrd"],
+        fileNames=["patient_1_MRI.nrrd", "patient_1_Y90_PET.nrrd", "patient_1_Segmentation.seg.nrrd"],
+        # Checksum to ensure file integrity. Can be computed by this command:
+        #  import hashlib; print(hashlib.sha256(open(filename, "rb").read()).hexdigest())
+        checksums=["SHA256:e2c598ae76d85e0b2cc0ebfd643d4f5ebda1d6f3df632c9172696878b858dfbe",
+                   "SHA256:4f1f195ccb0dcd3c4c9fc967ed0c2e4bf9ac5985db02d951d64772d69979e55b",
+                   "SHA256:550ceea296c7eab81f1dc7fb4ccf2f647fe223ba310eb2bd2dd0d0050aca739b"],
+        # This node name will be used when the data set is loaded
+        nodeNames=["Patient 1 MRI",
+                   "Patient 1 Y90 PET",
+                   "Patient 1 Segmentation"],
+    )
+
+    # RadioembolizationDosimetry2
+    SampleData.SampleDataLogic.registerCustomSampleDataSource(
+        # Category and sample name displayed in Sample Data module
+        category="RadioembolizationDosimetry",
+        sampleName="RadioembolizationDosimetry2",
+        # Thumbnail should have size of approximately 260x280 pixels and stored in Resources/Icons folder.
+        # It can be created by Screen Capture module, "Capture all views" option enabled, "Number of images" set to "Single".
+        thumbnailFileName=os.path.join(iconsPath, "RadioembolizationDosimetry2.png"),
+        # Download URL and target file name
+        uris=["https://github.com/4burakfe/SlicerRadioembolizationDosimetry_SampleImages/releases/download/TestImages/patient_2_CT.nrrd",
+              "https://github.com/4burakfe/SlicerRadioembolizationDosimetry_SampleImages/releases/download/TestImages/patient_2_SPECT.nrrd",
+              "https://github.com/4burakfe/SlicerRadioembolizationDosimetry_SampleImages/releases/download/TestImages/patient_2_Segmentation.seg.nrrd"],
+        fileNames=["patient_2_CT.nrrd", "patient_2_SPECT.nrrd", "patient_2_Segmentation.seg.nrrd"],
+        # Checksum to ensure file integrity. Can be computed by this command:
+        #  import hashlib; print(hashlib.sha256(open(filename, "rb").read()).hexdigest())
+        checksums=["SHA256:99600e480dc6e5353953377dbe66f232d8eae28bfa50aa7a61a4f83574ccde47",
+                   "SHA256:5647f8109babdc8655b217da6952cd5aafde3df2598a0dab52b2ad60208dc86b",
+                   "SHA256:49e0eae32ad99464a66ae1fab48a9343d9068b5633e5a6f260640bc9b5666abe"],
+        # This node name will be used when the data set is loaded
+        nodeNames=["Patient 2 CT",
+                   "Patient 2 SPECT",
+                   "Patient 2 Segmentation"],
+    )
+
+
 class RadioembolizationDosimetryWidget(ScriptedLoadableModuleWidget):
     def setup(self):
         ScriptedLoadableModuleWidget.setup(self)
@@ -200,7 +269,7 @@ class RadioembolizationDosimetryWidget(ScriptedLoadableModuleWidget):
 
         
     def onSegmentationNodeChanged(self, node):
-        self.liverSegmentSelector.setSegmentationNode(node)
+        self.liverSegmentSelector.setCurrentNode(node)
 
     def onCalculateButton(self):
         spectVolumeNode = self.spectSelector.currentNode()
@@ -214,10 +283,18 @@ class RadioembolizationDosimetryWidget(ScriptedLoadableModuleWidget):
         sliceCompositeNode = sliceWidget.mrmlSliceCompositeNode()
         backgroundVolumeid = slicer.app.layoutManager().sliceWidget("Red").mrmlSliceCompositeNode().GetBackgroundVolumeID()
 
-        if not spectVolumeNode or not segmentationNode or not liverSegmentID or not outputVolumeNode:
-            slicer.util.errorDisplay("Please select valid input and output nodes, and ensure the liver segment is specified.")
+        missingInputs = []
+        if not spectVolumeNode:
+            missingInputs.append("Input SPECT/PET Volume")
+        if not segmentationNode:
+            missingInputs.append("Segmentation")
+        if not liverSegmentID:
+            missingInputs.append("Whole Liver Segment")
+        if not outputVolumeNode:
+            missingInputs.append("Output Volume")
+        if missingInputs:
+            slicer.util.errorDisplay("Please select " + ", ".join(missingInputs) + ".")
             return
-
 
         # Perform dosimetric calculations
         self.calculateDose(spectVolumeNode, segmentationNode, liverSegmentID, activityMBq, outputVolumeNode, lungShuntFractionPercent)

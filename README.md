@@ -14,10 +14,12 @@ Sample images to test the modules can be found in here: https://github.com/4bura
 
 ## 📦 Modules Included
 
-- `LSFcalc`: Lung Shunt Fraction Calculator
-- `RadioembolizationDosimetry`: Patient-relative predictive dosimetry
-- `RadioembolizationDosimetryabs`: Post-treatment absolute quantification dosimetry
-- `easy_reg`: Registration of SPECT/CT to diagnostic CT/MRI
+All modules are available under `Nuclear Medicine` category.
+
+- `LSF Calculator`: Lung Shunt Fraction Calculator
+- `Taranis - Dosimetry (Patient Relative)`: Patient-relative predictive dosimetry
+- `Taranis - Dosimetry (Absolute Quantification)`: Post-treatment absolute quantification dosimetry
+- `EasyReg`: Registration of SPECT/CT to diagnostic CT/MRI
 
 ---
 
