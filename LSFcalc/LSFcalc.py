@@ -22,7 +22,7 @@ class LSFcalc(ScriptedLoadableModule):
         """
         # **✅ Set the module icon**
         # **✅ Set the module icon**
-        iconPath = os.path.join(os.path.dirname(__file__), "Resources\\taranis_logo.png")
+        iconPath = os.path.join(os.path.dirname(__file__), "Resources\\Icons\\taranis_logo.png")
         self.parent.icon = qt.QIcon(iconPath)  # Assign icon to the module
         self.parent = parent
 
@@ -40,7 +40,7 @@ class LSFcalcWidget(ScriptedLoadableModuleWidget):
         
         # **✅ Load the banner image**
         moduleDir = os.path.dirname(__file__)  # Get module directory
-        bannerPath = os.path.join(moduleDir, "Resources\\banner.png")  # Change to your banner file
+        bannerPath = os.path.join(moduleDir, "Resources\\Icons\\banner.png")  # Change to your banner file
 
         if os.path.exists(bannerPath):
             bannerLabel = qt.QLabel()
