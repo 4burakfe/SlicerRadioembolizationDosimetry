@@ -342,6 +342,11 @@ class RadioembolizationDosimetryAbsoluteWidget(DosimetryWidgetBase):
         self.conversionFactorSpinBox.setSingleStep(0.1)
         self.conversionFactorSpinBox.setToolTip("Energy deposited per unit activity, J/GBq (= Gy*kg/GBq = Gy*g/MBq).")
         generalLayout.addRow("Conversion Factor (J/GBq):", self.conversionFactorSpinBox)
+        self.physicsNoteLabel = qt.QLabel("")
+        self.physicsNoteLabel.setWordWrap(True)
+        self.physicsNoteLabel.setStyleSheet("color: #d97706; font-weight: bold;")
+        self.physicsNoteLabel.setVisible(False)
+        generalLayout.addRow(self.physicsNoteLabel)
 
         self.liverDensitySpinBox = qt.QDoubleSpinBox()
         self.liverDensitySpinBox.setRange(0.01, 10.0)
@@ -427,8 +432,11 @@ class RadioembolizationDosimetryAbsoluteWidget(DosimetryWidgetBase):
         self.halfLifeSpinBox.setRange(0.1, 200.0)
         self.halfLifeSpinBox.setValue(64.2)
         self.halfLifeSpinBox.setSingleStep(0.1)
-        self.halfLifeSpinBox.setToolTip("Physical half-life in hours (Y-90: ~64.1 h, Ho-166: ~26.8 h).")
+        self.halfLifeSpinBox.setToolTip("Physical half-life in hours (Y-90: 64.2 h, default; Ho-166: 26.8 h; "
+                                        "Re-188: 17.0 h).")
         absLayout.addRow("Half-Life (hours):", self.halfLifeSpinBox)
+        self.conversionFactorSpinBox.connect("valueChanged(double)", self._updatePhysicsNote)
+        self.halfLifeSpinBox.connect("valueChanged(double)", self._updatePhysicsNote)
 
         self.totalActivityTextBox = qt.QLineEdit()
         self.totalActivityTextBox.setReadOnly(True)
@@ -536,8 +544,9 @@ class RadioembolizationDosimetryAbsoluteWidget(DosimetryWidgetBase):
         infoTextBox.setPlainText(
             "This module enables post-treatment dosimetry with quantitative SPECT and PET images.\n"
             "This module is NOT a medical device. It is for research purposes only.\n"
-            "Default conversion factor is for Y-90 which equals to 49.67 J/GBq\n"
-            "Conversion factor for Ho-166 is 14.85 J/GBq (half-life ~26.8 h)\n"
+            "Default conversion factor and half-life are for Y-90: 49.67 J/GBq, 64.2 h.\n"
+            "For reference (local deposition): Ho-166 15.87 J/GBq, half-life 26.8 h; Re-188 about 10.8 J/GBq, "
+            "half-life 17.0 h. Other values are flagged in the dose checks: the Y-90 dose thresholds may not apply.\n"
             "Written by: Burak Demir, MD, FEBNM \n"
             "This module is provided open-source for the nuclear medicine community. If you find it helpful for your research, please consider citing:\n"
             "- Demir B, Soydal C, Mesci I, Celebioglu EC, Bilgic MS, Kuru Oz D, Kucuk NO. Utility of respiratory motion correction and effects on dosimetry in imaging with integrated Y-90 PET/MRI after radioembolization of liver tumors. Phys Med. 2026 Feb;142:105717. doi: 10.1016/j.ejmp.2026.105717. Epub 2026 Jan 5. PMID: 41494332.\n"
@@ -831,7 +840,8 @@ class RadioembolizationDosimetryAbsoluteWidget(DosimetryWidgetBase):
             lungDosesGy=[(f"'{row['name']}'", float(row["dose"])) for row in lungRows],
             extraUptakeFraction=countsOutsideMaskFraction(concentration, liverOrLungs),
             lungsSegmented=bool(lungIDs), outsidePerfusedFraction=outsidePerfused,
-            hoursAfterTreatment=inputs["hours"])
+            hoursAfterTreatment=inputs["hours"], conversionFactor=inputs["conversionFactor"],
+            halfLifeHours=inputs["halfLife"])
         notes, qcNote = self._withDoseChecks(notes, qcNote, checks)
 
         segmentation = inputs["segmentation"].GetSegmentation()

@@ -149,7 +149,7 @@ See [Segment categories and colours](#segment-categories-and-colours). The whole
 #### 3. Absolute quantification settings
 - **Image unit** (Bq/mL, kBq/mL or MBq/mL; pre-selected from image metadata when available — SUV images are not supported)
 - **Hours after treatment**: time from administration to the time the image is decay-corrected to (usually scan start). Set 0 if the image is already decay-corrected to administration time. Filled in (to be checked) when the module is opened from the Taranis workflow with a known administration time.
-- **Half-life (hours)**: 64.2 h for Y-90 (default), ~26.8 h for Ho-166
+- **Half-life (hours)**: 64.2 h for Y-90 (default); for reference 26.8 h for Ho-166 and 17.0 h for Re-188
 - Click **Calculate**. Total activity in the image field of view (at scan time and decay-corrected) is displayed, and the fraction of image activity outside the whole liver is reported.
 
 ---
@@ -175,7 +175,7 @@ See [Segment categories and colours](#segment-categories-and-colours). The whole
 | Others and uncategorized | gray |
 
 #### Calculation and display settings
-- **Conversion Factor (J/GBq)**: 49.67 for Y-90 (default), 14.85 for Ho-166
+- **Conversion Factor (J/GBq)**: 49.67 for Y-90 (default); for reference 15.87 for Ho-166 (60 Gy for 3.78 GBq/kg) and about 10.8 for Re-188 (mean beta energy ~0.76 MeV). A value other than the Y-90 default (or, in the absolute module, a half-life other than 64.2 h) is shown in orange under the field and becomes a dose-check warning: the Y-90 microsphere types and dose thresholds may not apply.
 - **Liver Density (g/mL)**: default 1.05
 - **Lung Density (g/mL)** (absolute module): default 0.30, used for the lung voxels outside the whole liver; *Estimate lung density from CT* is offered when lungs are categorized
 - **Isodose set**: *Glass microspheres* or *Resin microspheres* (see below)
@@ -381,6 +381,7 @@ microsphere type is taken from the isodose set (the Taranis case fills it in):
 | More than *EXTRA_UPTAKE_FRACTION* (20 %) of the image counts outside the whole liver and the lungs (lungs included when not segmented): free Tc-99m, reconstruction and noise, segmentation errors? | W |
 | More than *OUTSIDE_PERFUSED_FRACTION* (20 %) of the whole-liver counts outside the perfused volumes (absolute: segments marked as perfused volumes in Taranis) | W |
 | Hours after treatment is 0 (absolute): forgotten? Correct only for an image decay-corrected to the administration | W |
+| Conversion factor (both) or half-life (absolute) differs by more than *PHYSICS_TOLERANCE* (1 %) from the Y-90 defaults (49.67 J/GBq, 64.2 h); names the isotope if the values match Ho-166 or Re-188 (*ISOTOPES*) | W (also shown under the field) |
 
 Both modules:
 

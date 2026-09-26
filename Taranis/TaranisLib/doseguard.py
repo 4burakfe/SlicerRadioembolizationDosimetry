@@ -23,6 +23,49 @@ EXTRA_UPTAKE_FRACTION = 0.20                         # image counts outside the 
 OUTSIDE_PERFUSED_FRACTION = 0.20                     # whole-liver counts outside the perfused volumes
 MAX_NAMES = 6                                        # segment names listed in one message
 
+# Physics of the dose calculation: Taranis's defaults are Y-90 values; other isotopes only for reference / research
+Y90_CONVERSION_FACTOR = 49.67      # J/GBq (= Gy*kg/GBq), energy absorbed locally per GBq fully decayed
+Y90_HALF_LIFE_H = 64.2
+# isotope: (conversion factor J/GBq, half-life h). Ho-166: 60 Gy for 3.78 GBq/kg (MIRD formula of the Ho-166
+# microsphere studies); Re-188: mean beta energy ~0.76 MeV, half-life 17.0 h.
+ISOTOPES = {"Y-90": (Y90_CONVERSION_FACTOR, Y90_HALF_LIFE_H), "Ho-166": (15.87, 26.8), "Re-188": (10.8, 17.0)}
+PHYSICS_TOLERANCE = 0.01          # relative difference still counted as the same value
+
+
+def _matches(value, reference):
+    return value is not None and reference and abs(value - reference) <= PHYSICS_TOLERANCE * reference
+
+
+def isotopeFor(conversionFactor=None, halfLifeHours=None):
+    """Name of the isotope whose values these are (the given ones), or ""."""
+    for name, (factor, halfLife) in ISOTOPES.items():
+        if (conversionFactor is None or _matches(conversionFactor, factor)) \
+                and (halfLifeHours is None or _matches(halfLifeHours, halfLife)):
+            return name
+    return ""
+
+
+def physicsNote(conversionFactor, halfLifeHours=None):
+    """Text when the conversion factor (and half-life, absolute mode) differ from Taranis's Y-90 defaults, or ""."""
+    changed = []
+    if not _matches(conversionFactor, Y90_CONVERSION_FACTOR):
+        changed.append(f"conversion factor {conversionFactor:g} J/GBq (Y-90: {Y90_CONVERSION_FACTOR:g})")
+    if halfLifeHours is not None and not _matches(halfLifeHours, Y90_HALF_LIFE_H):
+        changed.append(f"half-life {halfLifeHours:g} h (Y-90: {Y90_HALF_LIFE_H:g} h)")
+    if not changed:
+        return ""
+    isotope = isotopeFor(conversionFactor, halfLifeHours)
+    if isotope:
+        what = f"the values of {isotope}"
+    elif isotopeFor(conversionFactor) and halfLifeHours is not None and isotopeFor(None, halfLifeHours):
+        what = (f"the conversion factor of {isotopeFor(conversionFactor)} with the half-life of "
+                f"{isotopeFor(None, halfLifeHours)}: check both")
+    else:
+        what = "values of no isotope known to Taranis: check them"
+    return ("Non-default physics: " + ", ".join(changed) + f" – {what}. The Y-90 defaults, microsphere types and "
+            "dose-check thresholds (tumour, normal tissue, lung) may not apply.")
+
+
 TUMOUR_ROLES = ("tumor", "viable")
 NORMAL_ROLE = "normal"
 
@@ -63,7 +106,8 @@ def referenceNormal(segments):
 
 
 def doseChecks(segments, microspheres=None, lsfPercent=None, lungDosesGy=(), extraUptakeFraction=None,
-               lungsSegmented=True, outsidePerfusedFraction=None, relative=False, hoursAfterTreatment=None):
+               lungsSegmented=True, outsidePerfusedFraction=None, relative=False, hoursAfterTreatment=None,
+               conversionFactor=None, halfLifeHours=None):
     """[(severity, text)] of the dose checks.
 
     segments: [{name, role ("tumor", "viable", "normal", ...), dose (mean Gy), volume (mL), scope (normal tissue:
@@ -74,8 +118,13 @@ def doseChecks(segments, microspheres=None, lsfPercent=None, lungDosesGy=(), ext
     there is no lung segment (then the lungs are part of that fraction).
     outsidePerfusedFraction: part of the whole-liver counts outside the perfused volumes (None: no perfused volumes).
     relative: patient-relative mode (that liver gets 0 Gy). hoursAfterTreatment: absolute mode only.
+    conversionFactor (J/GBq) / halfLifeHours (absolute mode): a warning when they differ from the Y-90 defaults.
     """
     issues = []
+    if conversionFactor is not None:
+        note = physicsNote(conversionFactor, halfLifeHours)
+        if note:
+            issues.append((W.SEVERITY_WARNING, note))
     device = MICROSPHERE_NAMES.get(microspheres, "")
 
     # Normal liver

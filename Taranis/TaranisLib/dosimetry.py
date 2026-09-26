@@ -2663,6 +2663,17 @@ class DosimetryWidgetBase(ScriptedLoadableModuleWidget):
 
     # -- dose checks ---------------------------------------------------------------------------------------
 
+    def _updatePhysicsNote(self, *args):
+        """Orange note under the conversion factor when it (or the half-life, absolute module) is not the Y-90
+        default; the same text is a dose-check warning after the calculation."""
+        label = getattr(self, "physicsNoteLabel", None)
+        if label is None:
+            return
+        halfLife = getattr(self, "halfLifeSpinBox", None)
+        note = DG.physicsNote(self.conversionFactorSpinBox.value, halfLife.value if halfLife is not None else None)
+        label.setText(note)
+        label.setVisible(bool(note))
+
     def _publishDoseChecks(self, checks, then=None):
         """Store the dose checks with the results (the Taranis toolbar reads them from the parameter node), then,
         after the results layout is built, show the warnings in a dialog and call then()."""

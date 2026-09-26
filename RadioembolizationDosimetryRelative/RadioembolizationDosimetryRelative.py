@@ -470,6 +470,11 @@ class RadioembolizationDosimetryRelativeWidget(DosimetryWidgetBase):
         self.conversionFactorSpinBox.setSingleStep(0.1)
         self.conversionFactorSpinBox.setToolTip("Energy deposited per unit activity, J/GBq (= Gy*kg/GBq = Gy*g/MBq).")
         generalLayout.addRow("Conversion Factor (J/GBq):", self.conversionFactorSpinBox)
+        self.physicsNoteLabel = qt.QLabel("")
+        self.physicsNoteLabel.setWordWrap(True)
+        self.physicsNoteLabel.setStyleSheet("color: #d97706; font-weight: bold;")
+        self.physicsNoteLabel.setVisible(False)
+        generalLayout.addRow(self.physicsNoteLabel)
 
         self.liverDensitySpinBox = qt.QDoubleSpinBox()
         self.liverDensitySpinBox.setRange(0.01, 10.0)
@@ -588,6 +593,7 @@ class RadioembolizationDosimetryRelativeWidget(DosimetryWidgetBase):
         self.addPerfusedVolumeButton.connect("clicked(bool)", self.addPerfusedVolumeRow)
         self.lungShuntSlider.connect("valueChanged(double)", self._updateDoseEstimates)
         self.conversionFactorSpinBox.connect("valueChanged(double)", self._updateDoseEstimates)
+        self.conversionFactorSpinBox.connect("valueChanged(double)", self._updatePhysicsNote)
         self.liverDensitySpinBox.connect("valueChanged(double)", self._updateDoseEstimates)
         self.isodosePresetComboBox.connect("currentIndexChanged(int)", self.onIsodosePresetChanged)
         self.isodoseSliceToggleButton.connect("toggled(bool)", self.onIsodoseSliceToggled)
@@ -615,8 +621,9 @@ class RadioembolizationDosimetryRelativeWidget(DosimetryWidgetBase):
         infoTextBox.setPlainText(
             "This module enables predictive (patient-relative) dosimetry with SPECT and PET images.\n"
             "This module is NOT a medical device. It is for research purposes only.\n"
-            "Default conversion factor is for Y-90 which equals to 49.67 J/GBq\n"
-            "Conversion factor for Ho-166 is 14.85 J/GBq (half-life ~26.8 h)\n"
+            "Default conversion factor and half-life are for Y-90: 49.67 J/GBq, 64.2 h.\n"
+            "For reference (local deposition): Ho-166 15.87 J/GBq, half-life 26.8 h; Re-188 about 10.8 J/GBq, "
+            "half-life 17.0 h. Other values are flagged in the dose checks: the Y-90 dose thresholds may not apply.\n"
             "Written by: Burak Demir, MD, FEBNM \n"
             "This module is provided open-source for the nuclear medicine community. If you find it helpful for your research, please consider citing:\n"
             "- Demir B, Soydal C, Mesci I, Celebioglu EC, Bilgic MS, Kuru Oz D, Kucuk NO. Utility of respiratory motion correction and effects on dosimetry in imaging with integrated Y-90 PET/MRI after radioembolization of liver tumors. Phys Med. 2026 Feb;142:105717. doi: 10.1016/j.ejmp.2026.105717. Epub 2026 Jan 5. PMID: 41494332.\n"
@@ -1006,7 +1013,7 @@ class RadioembolizationDosimetryRelativeWidget(DosimetryWidgetBase):
             microspheres=DG.microspheresFromText(inputs["isodosePreset"]),
             lsfPercent=inputs["lungShuntPercent"], lungDosesGy=[("Estimated lung dose", result["lungDoseGy"])],
             extraUptakeFraction=result["countsOutsideLiverAndLungs"], lungsSegmented=result["lungsSegmented"],
-            outsidePerfusedFraction=outsidePerfused, relative=True)
+            outsidePerfusedFraction=outsidePerfused, relative=True, conversionFactor=inputs["conversionFactor"])
         notes, qcNote = self._withDoseChecks(notes, "\n".join(qcLines), checks)
         self._finishCalculation(inputs, stats, result["voxelVolumeML"], firstRows, parameters, notes,
                                 qcNote, "Taranis - Patient Relative Quantification")

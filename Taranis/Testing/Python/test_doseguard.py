@@ -93,6 +93,21 @@ class DoseGuardTest(unittest.TestCase):
         self.assertEqual(texts(DG.doseChecks([], None, hoursAfterTreatment=20.0)), "")
         self.assertEqual(texts(DG.doseChecks([], None)), "")   # patient-relative: not applicable
 
+    def test_non_default_physics(self):
+        self.assertEqual(DG.physicsNote(49.67, 64.2), "")
+        self.assertEqual(DG.physicsNote(49.9), "")                     # within 1 %
+        note = DG.physicsNote(15.87, 26.8)
+        self.assertIn("conversion factor 15.87 J/GBq (Y-90: 49.67)", note)
+        self.assertIn("half-life 26.8 h", note)
+        self.assertIn("values of Ho-166", note)
+        self.assertIn("values of Re-188", DG.physicsNote(10.8, 17.0))
+        self.assertIn("conversion factor of Ho-166 with the half-life of Re-188", DG.physicsNote(15.87, 17.0))
+        self.assertIn("no isotope known", DG.physicsNote(30.0))
+        self.assertIn("half-life 30 h", DG.physicsNote(49.67, 30.0))
+        issues = DG.doseChecks([], DG.GLASS, conversionFactor=15.87, halfLifeHours=26.8)
+        self.assertIn("Non-default physics", texts(issues))
+        self.assertEqual(texts(DG.doseChecks([], DG.GLASS, conversionFactor=49.67, halfLifeHours=64.2)), "")
+
     def test_long_lists_are_shortened(self):
         tumours = [seg(f"T{i}", "tumor", 10.0) for i in range(10)]
         self.assertIn("and 4 more", texts(DG.doseChecks(tumours, DG.RESIN)))
