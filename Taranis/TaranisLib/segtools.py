@@ -2,8 +2,13 @@
 from uptake and the geometry check. Masks are read and written on a grid with the voxel size and orientation of
 the primary image of the case, extended to cover every segment and every case image: segments reaching beyond the
 primary image (e.g. the lungs of a SPECT/CT when the primary image is a liver MRI) are never cropped. The hub's tools
+<<<<<<< Updated upstream
 use a tight grid: only the region of the voxels set in the segments (every tool reads and writes inside existing
 segments), which needs far less memory than grids covering whole CT / SPECT volumes."""
+=======
+use a tight grid: only the bounds of the segmentation (every tool reads and writes inside existing segments), which
+needs far less memory than grids covering whole CT / SPECT volumes."""
+>>>>>>> Stashed changes
 
 import json
 
@@ -26,7 +31,11 @@ LUNGS_MIN_ML = 1500.0
 
 
 MAX_GRID_VOXELS = 250e6     # larger extended grids fall back to the primary image grid
+<<<<<<< Updated upstream
 TIGHT_MARGIN_VOXELS = 2     # tight grids (hub tools): margin around the voxels set in the segments
+=======
+TIGHT_MARGIN_VOXELS = 2     # tight grids (hub tools): margin around the bounds of the segmentation
+>>>>>>> Stashed changes
 
 
 def ownLayer(segmentationNode, segmentID):
@@ -120,6 +129,7 @@ def gridExtent(referenceVolume, boundsList, includeReference=True, marginVoxels=
     return lower.astype(int), (upper - lower + 1).astype(int)
 
 
+<<<<<<< Updated upstream
 def segmentationDataBounds(segmentationNode):
     """RAS bounds (voxel corners) of the voxels actually set in the segmentation's labelmap layers, or None (no
     voxels, or a segmentation under a transform: then its full bounds are used). Much smaller than the images when
@@ -161,6 +171,21 @@ def gridVolume(referenceVolume, volumes=(), segmentationNode=None, name="Taranis
             lower, dims = gridExtent(referenceVolume, [dataBounds], includeReference=False,
                                      marginVoxels=TIGHT_MARGIN_VOXELS)
             return _gridNode(referenceVolume, lower, dims, name)
+=======
+def gridVolume(referenceVolume, volumes=(), segmentationNode=None, name="Taranis grid", tight=False):
+    """Hidden temporary volume: voxel size and orientation of referenceVolume, extent covering it, the volumes and
+    the segments (the caller removes it). tight: only the bounds of the segmentation (all its labelmap layers, plus a
+    margin) – every segment fits entirely (a write replaces the whole segment, so nothing may lie outside the grid),
+    without the whole CT / SPECT volumes around it."""
+    if tight and segmentationNode is not None:
+        bounds = [0.0] * 6
+        segmentationNode.GetRASBounds(bounds)
+        if bounds[0] <= bounds[1] and bounds[2] <= bounds[3] and bounds[4] <= bounds[5]:
+            lower, dims = gridExtent(referenceVolume, [bounds], includeReference=False,
+                                     marginVoxels=TIGHT_MARGIN_VOXELS)
+            if float(np.prod(dims)) <= MAX_GRID_VOXELS:
+                return _gridNode(referenceVolume, lower, dims, name)
+>>>>>>> Stashed changes
     boundsList = []
     for node in list(volumes) + [segmentationNode]:
         if node is None:
@@ -266,10 +291,56 @@ class SegmentGrid:
         return result
 
     def write(self, segmentID, mask):
+<<<<<<< Updated upstream
+=======
+        """Replace the segment with the mask. Refused if the segment has voxels outside this grid (they would be
+        lost: the whole segment is replaced)."""
+        outside = self._voxelsOutside(segmentID)
+        if outside:
+            raise RuntimeError(f"'{self.name(segmentID)}' reaches beyond the working grid ({outside} voxels "
+                               "outside); it was not changed.")
+>>>>>>> Stashed changes
         ownLayer(self.node, segmentID)   # on a shared layer the write would take voxels from the other segments
         slicer.util.updateSegmentBinaryLabelmapFromArray(mask.astype(np.uint8), self.node, segmentID, self.reference)
         self._cache[segmentID] = mask.astype(bool)
 
+<<<<<<< Updated upstream
+=======
+    def _voxelsOutside(self, segmentID):
+        """Voxels of the segment (in its own labelmap) that lie outside this grid; 0 if it cannot be checked."""
+        segment = self.node.GetSegmentation().GetSegment(segmentID)
+        image = segment.GetRepresentation(slicer.vtkSegmentationConverter.GetBinaryLabelmapRepresentationName()) \
+            if segment is not None else None
+        if image is None or image.GetPointData() is None or image.GetPointData().GetScalars() is None \
+                or self.node.GetParentTransformNode() is not None:
+            return 0
+        extent = image.GetExtent()
+        if extent[0] > extent[1] or extent[2] > extent[3] or extent[4] > extent[5]:
+            return 0
+        from vtk.util.numpy_support import vtk_to_numpy
+        shape = (extent[5] - extent[4] + 1, extent[3] - extent[2] + 1, extent[1] - extent[0] + 1)
+        label = segment.GetLabelValue() if hasattr(segment, "GetLabelValue") else 1
+        inside = vtk_to_numpy(image.GetPointData().GetScalars()).reshape(shape) == label
+        k = np.flatnonzero(inside.any(axis=(1, 2)))
+        j = np.flatnonzero(inside.any(axis=(0, 2)))
+        i = np.flatnonzero(inside.any(axis=(0, 1)))
+        if len(i) == 0:
+            return 0
+        # voxel centres of the segment -> grid voxel indices
+        matrix = vtk.vtkMatrix4x4()
+        image.GetImageToWorldMatrix(matrix)
+        imageToWorld = np.array([[matrix.GetElement(r, c) for c in range(4)] for r in range(4)])
+        worldToGrid = np.linalg.inv(_matrix(self.reference))
+        corners = np.array([[a, b, c, 1.0] for a in (i.min(), i.max()) for b in (j.min(), j.max())
+                            for c in (k.min(), k.max())], dtype=float)
+        corners[:, :3] += np.array(extent[0::2], dtype=float)
+        gridIjk = (worldToGrid @ imageToWorld @ corners.T)[:3].T
+        dims = np.array(self.shape[::-1], dtype=float)   # (i, j, k)
+        if np.all(gridIjk >= -0.5 - 1e-3) and np.all(gridIjk <= dims - 0.5 + 1e-3):
+            return 0
+        return int(np.count_nonzero(inside))   # the bounding box pokes out: report the segment size
+
+>>>>>>> Stashed changes
     def add(self, name, role, mask, candidate=False):
         segmentation = self.node.GetSegmentation()
         color = W.SEGMENT_ROLES[role][2] if role in W.SEGMENT_ROLES else (0.6, 0.6, 0.6)
