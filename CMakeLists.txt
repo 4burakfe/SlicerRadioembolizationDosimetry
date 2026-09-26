@@ -7,9 +7,9 @@ project(RadioembolizationDosimetry)
 set(EXTENSION_HOMEPAGE "https://github.com/4burakfe/SlicerRadioembolizationDosimetry")
 set(EXTENSION_CATEGORY "Nuclear Medicine")
 set(EXTENSION_CONTRIBUTORS "Burak Demir")
-set(EXTENSION_DESCRIPTION "Taranis - Radioembolization Dosimetry Suite. A collection of integrated modules and workflows that allows users to perform voxel-based dosimetry with patient-relative and absolute calibration methods for treatments of liver tumors with Y-90 microspheres. Supports registration, LSF calculation, segmentation with many tools.")
+set(EXTENSION_DESCRIPTION "Taranis - Radioembolization Dosimetry Suite. A collection of integrated modules and workflows that allow users to perform voxel-based dosimetry with patient-relative and absolute calibration methods for treatments of liver tumors with Y-90 microspheres. Supports registration, LSF calculation, segmentation with many tools.")
 set(EXTENSION_ICONURL "https://github.com/4burakfe/SlicerRadioembolizationDosimetry/blob/3e18fb523c923a330f4e347263ff3bbae9c5eae8/taranis_logo.png?raw=true")
-set(EXTENSION_SCREENSHOTURLS "https://github.com/4burakfe/SlicerRadioembolizationDosimetry/blob/main/Screenshot1.jpg?raw=true")
+set(EXTENSION_SCREENSHOTURLS "https://github.com/4burakfe/SlicerRadioembolizationDosimetry/blob/main/Screenshot1.jpg?raw=true https://github.com/4burakfe/SlicerRadioembolizationDosimetry/blob/main/Screenshot2.jpg?raw=true")
 set(EXTENSION_DEPENDS "NA") # Specified as a list or "NA" if no dependencies
 
 #-----------------------------------------------------------------------------
