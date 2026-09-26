@@ -101,11 +101,7 @@ def _dataMB(dataObject):
 def _segmentationMB(segmentationNode):
     """(MB, text): binary labelmap layers (each counted once) and closed surfaces of a segmentation."""
     segmentation = segmentationNode.GetSegmentation()
-<<<<<<< Updated upstream
-    seen, labelmapMB, surfaceMB = set(), 0.0, 0.0
-=======
     seen, labelmapMB, surfaceMB = {}, 0.0, 0.0
->>>>>>> Stashed changes
     labelmapName = slicer.vtkSegmentationConverter.GetBinaryLabelmapRepresentationName()
     surfaceName = slicer.vtkSegmentationConverter.GetClosedSurfaceRepresentationName()
     for index in range(segmentation.GetNumberOfSegments()):
@@ -114,11 +110,7 @@ def _segmentationMB(segmentationNode):
             data = segment.GetRepresentation(name)
             if data is None or id(data) in seen:
                 continue
-<<<<<<< Updated upstream
-            seen.add(id(data))
-=======
             seen[id(data)] = data   # keep the wrapper alive: a freed wrapper's id can be reused by another layer
->>>>>>> Stashed changes
             if name == labelmapName:
                 labelmapMB += _dataMB(data)
             else:

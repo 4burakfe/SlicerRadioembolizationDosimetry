@@ -64,6 +64,14 @@ All modules are available under `Nuclear Medicine` category.
    The step becomes *Outdated* if images, registration or segments change after the calculation.
 6. **Report**: case summary with every warning; saves the dosimetry module's RTF report and the scene.
 
+*Segmentation step*: fusion and reference views, 3D view with the lungs, segment roles, AI segmentation and tools.
+
+![Segmentation step of the Taranis hub](ss_segment.jpg)
+
+*LSF step*: lung shunt fraction from the MAA SPECT counts, lung mass from the CT and the estimated lung dose.
+
+![Lung shunt fraction step of the Taranis hub](ss_lsf.jpg)
+
 **Views of the modules**: EasyReg, the segmentation step, the LSF calculator and the dosimetry modules each switch to their own layout when opened, with their own view nodes, and keep the renderings of other modules out of them (e.g. the Epona MIP does not appear in the dosimetry 3D views, and isodose / segment models do not appear in the Epona MIP view). Segment work in the Segmentation step is done on a grid that covers all case images, so e.g. SPECT/CT lungs above a liver MRI are not cropped.
 
 **Settings** (Taranis module): toolbar at startup, and the **AI models folder** (searched first by the Segmentation step and the LSF calculator; then the Taranis download folder and the LSF calculator's folder).
@@ -85,7 +93,7 @@ All modules are available under `Nuclear Medicine` category.
 ### 📌 Taranis - Patient Relative Dosimetry
 **Purpose**: Predictive voxel-based dosimetry before treatment. The activity planned for each perfused volume (vascular territory of an injection position) is distributed inside that perfused volume in proportion to image counts, and the dose maps of all perfused volumes are added.
 
-![Screenshot](Screenshot1.jpg)
+![Patient-relative dosimetry: results layout with segment models, isodose surfaces, DVH and annotated slice views](ss_relative.jpg)
 
 #### 1. Images and segments
 - **Input SPECT/PET Volume** (e.g. Tc-99m MAA SPECT)
@@ -128,7 +136,7 @@ In the results, segments are tagged with the perfused volume(s) they belong to o
 - with a Taranis case in the scene: the input is the case's dosimetry image, its type allows absolute dosimetry (Y-90 PET, or calibrated Y-90 SPECT; never MAA SPECT) and it is not in counts or SUV;
 - without a case: the image carries activity-concentration units (Bq/mL) in its metadata. An image without metadata (e.g. loaded from a NRRD file) can be used by assigning it as the dosimetry image of a Taranis case.
 
-![Screenshot](Screenshot2.jpg)
+![Absolute dosimetry: Y-90 PET on MRI, isodose lines and dose checks](ss_absolut.jpg)
 
 #### 1. Images and segments
 - **Input quantitative PET/SPECT** (e.g. Y-90 PET)

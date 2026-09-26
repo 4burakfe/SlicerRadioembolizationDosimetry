@@ -2102,14 +2102,8 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     # -- Tools --
 
     def _grid(self):
-<<<<<<< Updated upstream
-        """Primary-image voxel grid around the voxels of the segments (tight: every tool works inside existing
-        segments, so nothing is cropped; falls back to the grid extended to all case images and segments). Use
-        with 'with'."""
-=======
         """Primary-image voxel grid covering the segmentation (tight: every tool works inside existing segments;
         falls back to the grid extended to all case images and segments). Use with 'with'."""
->>>>>>> Stashed changes
         case = self.controller.case
         return segtools.SegmentGrid(case.roleNode(R.ROLE_SEGMENTATION), case.primaryVolume(),
                                     segtools.caseVolumes(case), tight=True)
@@ -2935,15 +2929,9 @@ class TaranisTest(ScriptedLoadableModuleTest):
             grid.remove(segmentID)                           # keep the rest of the test as before
         grid.close()
 
-<<<<<<< Updated upstream
-        # tight grid (hub tools): only around the voxels of the segments, same masks
-        with segtools.SegmentGrid(segmentationNode, ct, tight=True) as tightGrid:
-            self.assertLess(int(np.prod(tightGrid.shape)), 20 ** 3)
-=======
         # tight grid (hub tools): only the bounds of the segmentation, same masks
         with segtools.SegmentGrid(segmentationNode, ct, tight=True) as tightGrid:
             self.assertLessEqual(max(tightGrid.shape), 20 + 2 * segtools.TIGHT_MARGIN_VOXELS)
->>>>>>> Stashed changes
             self.assertEqual(int(tightGrid.mask(liverID).sum()), int(liver.sum()))
             self.assertEqual(int(tightGrid.mask(candidateID).sum()), int(perfused.sum()))
             segtools.makeNormalLiver(tightGrid)
@@ -2969,8 +2957,6 @@ class TaranisTest(ScriptedLoadableModuleTest):
             self.assertEqual(before - after, round(removed / extended.voxelML))
         with segtools.SegmentGrid(segmentationNode, ct, [chestCT]) as reread:
             self.assertEqual(int(reread.mask(lungsID).sum()), after)   # nothing lost outside the liver image
-<<<<<<< Updated upstream
-=======
         # the hub's tight grid covers the lungs beyond the primary image (accepting AI lungs removes the liver from
         # them on this grid): writing does not crop them
         with segtools.SegmentGrid(segmentationNode, ct, tight=True) as tightGrid:
@@ -2989,7 +2975,6 @@ class TaranisTest(ScriptedLoadableModuleTest):
                 primaryOnly.write(lungsID, np.zeros(primaryOnly.shape, bool))
         with segtools.SegmentGrid(segmentationNode, ct, [chestCT]) as reread:
             self.assertEqual(int(reread.mask(lungsID).sum()), after)   # the refused write changed nothing
->>>>>>> Stashed changes
         self.assertTrue(segtools.extendSegmentationGeometry(segmentationNode, ct, [ct, chestCT]))
 
     def test_segmentationLayout(self):
