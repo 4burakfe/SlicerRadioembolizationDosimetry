@@ -1,11 +1,9 @@
 #-----------------------------------------------------------------------------
-set(MODULE_NAME easy_reg)
+set(MODULE_NAME RadioembolizationDosimetryAbsolute)
 
 #-----------------------------------------------------------------------------
 set(MODULE_PYTHON_SCRIPTS
   ${MODULE_NAME}.py
-  EasyRegLib/__init__.py
-  EasyRegLib/functional.py
   )
 
 set(MODULE_PYTHON_RESOURCES

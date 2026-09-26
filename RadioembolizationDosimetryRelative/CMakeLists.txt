@@ -1,5 +1,5 @@
 #-----------------------------------------------------------------------------
-set(MODULE_NAME RadioembolizationDosimetryabs)
+set(MODULE_NAME RadioembolizationDosimetryRelative)
 
 #-----------------------------------------------------------------------------
 set(MODULE_PYTHON_SCRIPTS

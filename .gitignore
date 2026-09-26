@@ -1,1 +1,11 @@
 *.pyc
+__pycache__/
+
+# AI models: downloaded from the GitHub release (with SHA256 checks), too large for the repository
+*.pth
+LSFcalc/CTLUNGswin12_segmenter.txt
+LSFcalc/Liver_SwinUNETR24.txt
+LSFcalc/Tumor_SwinUNETR24.txt
+
+# local working files
+Claude outputs/
