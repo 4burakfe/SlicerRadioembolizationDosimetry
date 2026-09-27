@@ -98,7 +98,7 @@ class RadioembolizationDosimetryAbsolute(ScriptedLoadableModule):
         parent.acknowledgementText = """
         This file was developed by Burak Demir.
         """
-        iconPath = os.path.join(os.path.dirname(__file__), "Resources", "taranis_logo.png")
+        iconPath = os.path.join(os.path.dirname(__file__), "Resources", "Icons", "RadioembolizationDosimetryAbsolute.png")
         self.parent.icon = qt.QIcon(iconPath)
 
         slicer.app.connect("startupCompleted()", registerSampleData)

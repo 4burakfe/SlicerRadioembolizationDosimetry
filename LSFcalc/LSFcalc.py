@@ -511,7 +511,7 @@ class LSFcalc(ScriptedLoadableModule):
         parent.acknowledgementText = """
         This file was developed by Burak Demir.
         """
-        iconPath = os.path.join(os.path.dirname(__file__), "Resources", "taranis_logo.png")
+        iconPath = os.path.join(os.path.dirname(__file__), "Resources", "Icons", "LSFcalc.png")
         self.parent.icon = qt.QIcon(iconPath)
         self.parent = parent
         slicer.app.connect("startupCompleted()", registerLsfLayout)

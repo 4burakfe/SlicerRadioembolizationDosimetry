@@ -552,7 +552,7 @@ class easy_reg(ScriptedLoadableModule):
         parent.acknowledgementText = """
         This file was developed by Burak Demir.
         """
-        iconPath = os.path.join(os.path.dirname(__file__), "Resources", "taranis_logo.png")
+        iconPath = os.path.join(os.path.dirname(__file__), "Resources", "Icons", "easy_reg.png")
         self.parent.icon = qt.QIcon(iconPath)
         self.parent = parent
         slicer.app.connect("startupCompleted()", registerFusionLayout)
