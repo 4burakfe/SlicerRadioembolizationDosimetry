@@ -251,6 +251,8 @@ def installResultsLayoutRegistration(*args):
 class RadioembolizationDosimetryRelativeWidget(DosimetryWidgetBase):
 
     WIDGET_SETTINGS = [
+        ("DoseMethod", "doseMethodComboBox", "text"),   # first: voxel S locks the conversion factor
+        ("DoseNuclide", "nuclideComboBox", "text"),
         ("ClipNegativeValues", "clipNegativeCheckBox", "bool"),
         ("LungShuntPercent", "lungShuntSlider", "number"),
         ("LungMassG", "lungMassSpinBox", "number"),
@@ -345,6 +347,9 @@ class RadioembolizationDosimetryRelativeWidget(DosimetryWidgetBase):
         parametersCollapsibleButton.text = "Parameters"
         self.layout.addWidget(parametersCollapsibleButton)
         parametersLayout = qt.QVBoxLayout(parametersCollapsibleButton)
+
+        # ---- Dose calculation method (local deposition or experimental voxel S) ----
+        self._buildDoseMethodBox(parametersLayout)
 
         # ---- Images and whole liver ----
         inputBox = qt.QGroupBox("Images and segments")
@@ -633,6 +638,8 @@ class RadioembolizationDosimetryRelativeWidget(DosimetryWidgetBase):
         infoTextBox.setToolTip("Module information and instructions.")
         self.layout.addWidget(infoTextBox)
 
+        self._onDoseMethodChanged()   # description and physics lock of the selected method
+
         # ---- Settings are kept in the module's parameter node, which is saved with the scene ----
         self._connectSettingsSignals()
         self._connectPreviewSignals()
@@ -787,12 +794,17 @@ class RadioembolizationDosimetryRelativeWidget(DosimetryWidgetBase):
             label.setText(f"{activityMBq:.2f} MBq will result in {doseGy:.1f} Gy absorbed dose "
                           f"for perfused volume {number} ({name}).")
             label.setStyleSheet(doseEstimateStyleSheet(isodoseColorForDose(doseGy, levels)))
+            voxelS = self.currentDoseMethod() == DK.METHOD_VOXEL_S
             label.setToolTip(
                 "Single-compartment estimate: D = A x (1 - LSF) x CF / (density x V)\n"
                 f"A = {activityMBq:.2f} MBq, LSF = {100 * lungShuntFraction:.1f} %, CF = {conversionFactor:.2f} J/GBq, "
                 f"density = {density:.2f} g/mL, V = {volumeML:.1f} mL (whole segment)\n"
-                "Equals the mean dose of the perfused volume in the voxel-based calculation when the segment "
-                "lies inside the whole-liver segment. Colour: isodose level reached (current isodose set).")
+                + ("Voxel S (experimental) is selected: the calculated mean dose of the perfused volume will be "
+                   "lower, because beta energy leaves the volume at its edges (a few %, more in small volumes).\n"
+                   if voxelS else
+                   "Equals the mean dose of the perfused volume in the voxel-based calculation when the segment "
+                   "lies inside the whole-liver segment. ")
+                + "Colour: isodose level reached (current isodose set).")
 
     # -- segmentation edits (keep the estimates current) --------------------
 
@@ -925,6 +937,7 @@ class RadioembolizationDosimetryRelativeWidget(DosimetryWidgetBase):
             "conversionFactor": self.conversionFactorSpinBox.value,
             "density": self.liverDensitySpinBox.value,
             "isodosePreset": presetName, "isodoseLevels": levels,
+            **self._doseMethodInputs(),   # voxel S: physics of the kernel's radionuclide
         }
 
     # -- button handlers ---------------------------------------------------
@@ -936,13 +949,20 @@ class RadioembolizationDosimetryRelativeWidget(DosimetryWidgetBase):
             return
         result = None
         with slicer.util.tryWithErrorDisplay("Dose calculation failed.", waitCursor=True):
-            result = self.logic.computeRelativeDose(
+            computed = self.logic.computeRelativeDose(
                 inputs["spect"], inputs["segmentation"], inputs["liverID"], inputs["perfused"],
                 inputs["lungShuntPercent"], inputs["conversionFactor"], inputs["density"], inputs["lungMass"],
                 clipNegativeValues=inputs["clipNegative"],
                 tumorSegmentIDs=[sid for sid, c in inputs["categories"].items()
                                  if c in (CATEGORY_TUMOR, CATEGORY_VIABLE)],
                 lungSegmentIDs=[sid for sid, c in inputs["categories"].items() if c == CATEGORY_LUNGS])
+            # Voxel S (experimental): the LDM map (activity only inside the perfused volumes) is convolved with the
+            # dose point kernel scaled to the liver density: energy also reaches the voxels around the perfused
+            # volumes. The lungs are not calculated in this mode (lung dose from the lung shunt).
+            computed["ldmDose"] = computed["dose"]
+            computed["dose"], computed["kernelInfo"] = self.logic.applyDoseMethod(
+                computed["ldmDose"], inputs["spect"], inputs["doseMethod"], inputs["nuclide"], inputs["density"])
+            result = computed   # only when every step succeeded
         if result is None:
             return
         # Counts outside the perfused volumes: advisory only, among the dose checks shown after the calculation
@@ -957,10 +977,11 @@ class RadioembolizationDosimetryRelativeWidget(DosimetryWidgetBase):
 
         applySegmentColors(inputs["segmentation"], inputs["liverID"], {pv["segmentID"] for pv in inputs["perfused"]},
                            inputs["categories"])
+        voxelS = result.get("kernelInfo") is not None
         stats = self.logic.segmentStatistics(
             result["dose"], inputs["segmentation"], inputs["spect"], result["voxelVolumeML"],
             inputs["conversionFactor"], inputs["density"], result["dosedMask"], result["territoryMasks"],
-            inputs["liverID"], inputs["categories"])
+            inputs["liverID"], inputs["categories"], activityDoseArray=result["ldmDose"] if voxelS else None)
         firstRows = [("Estimated Lung Dose", "Lung", formatNumber(result["lungDoseGy"]), "",
                       formatNumber(inputs["lungMass"]), "")]
 
@@ -980,14 +1001,25 @@ class RadioembolizationDosimetryRelativeWidget(DosimetryWidgetBase):
                                          f"; {result['negativeVoxelsInLiver']} inside the whole liver")
         if result["negativeVoxels"]:
             qcLines.append(negativeNote)
+        energyOutside = None
+        if voxelS:
+            energyOutside = DK.energyOutsideFraction(result["dose"], result["dosedMask"])
+            if np.isfinite(energyOutside):
+                qcLines.append(f"Voxel S (experimental): {100 * energyOutside:.1f}% of the delivered beta energy is "
+                               "deposited outside the perfused volumes (liver around them and neighbouring tissue "
+                               "get a few mm of dose; not 0 Gy there).")
+            for number, _, mask in result["territoryMasks"]:
+                qcLines.append(f"Perfused volume {number}: mean dose {DK.meanInMask(result['dose'], mask):.2f} Gy "
+                               f"voxel S vs {DK.meanInMask(result['ldmDose'], mask):.2f} Gy local deposition.")
         notes = [RELATIVE_MODE_WARNING.replace("\u26a0 ", "WARNING - ")] + qcLines
         if not result["negativeVoxels"]:
             notes.append(negativeNote)
 
         segmentation = inputs["segmentation"].GetSegmentation()
         lsf = inputs["lungShuntPercent"] / 100.0
-        parameters = [
-            ("Mode", "Patient relative"),
+        parameters = [("Mode", "Patient relative")]
+        parameters += DK.reportParameters(inputs["doseMethod"], inputs["nuclide"], result.get("kernelInfo"))
+        parameters += [
             ("Input volume", inputs["spect"].GetName()),
             ("Reference volume", inputs["reference"].GetName()),
             ("Segmentation", inputs["segmentation"].GetName()),
@@ -1013,10 +1045,13 @@ class RadioembolizationDosimetryRelativeWidget(DosimetryWidgetBase):
             microspheres=DG.microspheresFromText(inputs["isodosePreset"]),
             lsfPercent=inputs["lungShuntPercent"], lungDosesGy=[("Estimated lung dose", result["lungDoseGy"])],
             extraUptakeFraction=result["countsOutsideLiverAndLungs"], lungsSegmented=result["lungsSegmented"],
-            outsidePerfusedFraction=outsidePerfused, relative=True, conversionFactor=inputs["conversionFactor"])
+            outsidePerfusedFraction=outsidePerfused, relative=True, conversionFactor=inputs["conversionFactor"],
+            voxelS=voxelS, energyOutsidePerfusedFraction=energyOutside)
         notes, qcNote = self._withDoseChecks(notes, "\n".join(qcLines), checks)
         self._finishCalculation(inputs, stats, result["voxelVolumeML"], firstRows, parameters, notes,
                                 qcNote, "Taranis - Patient Relative Quantification")
+        if self.lastResult:   # stored with the results by _publishDoseChecks below
+            self.lastResult["methodLines"] = DK.reportLines(inputs["doseMethod"], inputs["nuclide"])
         self._publishDoseChecks(checks)
 
     def _finishCalculation(self, inputs, stats, voxelVolumeML, firstRows, parameters, notes, qcNote, title):
@@ -1127,6 +1162,10 @@ class RadioembolizationDosimetryRelativeWidget(DosimetryWidgetBase):
 
     def _clearModuleResults(self):
         pass
+
+    def _onDoseMethodChangedModule(self):
+        if getattr(self, "perfusedRows", None):
+            self._updateDoseEstimates()   # tooltip: LDM estimate vs voxel S
 
     def _previewPerfusedIDs(self):
         return self._perfusedSegmentIDs()
@@ -1268,13 +1307,15 @@ class RadioembolizationDosimetryRelativeLogic(DosimetryLogicBase):
         }
 
     def segmentStatistics(self, doseArray, segmentationNode, referenceVolumeNode, voxelVolumeML,
-                          conversionFactor, densityGPerML, dosedMask, territoryMasks, liverSegmentID, categories):
+                          conversionFactor, densityGPerML, dosedMask, territoryMasks, liverSegmentID, categories,
+                          activityDoseArray=None):
         """One dict per segment, plus 'All tumors (combined)' (union of the tumor segments, id None) when tumors
         are categorized; ordered by role. Keys: id, name, displayName (name + perfused volume numbers), label
         (displayName + outside flag), role, roleLabel, color, dose, volume, activity, outside (fraction outside
         all perfused volumes) and doses (sorted voxel doses, empty if the segment is not modelled).
         territoryMasks: [(number, segmentID, mask)]. A segment is tagged with the numbers of the perfused
-        volumes it is or overlaps; the whole-liver segment only when it is itself a perfused volume."""
+        volumes it is or overlaps; the whole-liver segment only when it is itself a perfused volume.
+        activityDoseArray: the LDM map when doseArray is a voxel S map (activities from local deposition)."""
         segmentation = segmentationNode.GetSegmentation()
         perfusedIDs = {segmentID for _, segmentID, _ in territoryMasks}
         results = []
@@ -1294,21 +1335,24 @@ class RadioembolizationDosimetryRelativeLogic(DosimetryLogicBase):
             results.append(self._statisticsEntry(
                 doseArray, mask, voxelVolumeML, conversionFactor, densityGPerML, dosedMask, territoryMasks,
                 segmentID, name, role, tuple(segmentation.GetSegment(segmentID).GetColor()),
-                tagOverlaps=segmentID != liverSegmentID))
+                tagOverlaps=segmentID != liverSegmentID, activityDoseArray=activityDoseArray))
         if tumorMask is not None:
             results.append(self._statisticsEntry(
                 doseArray, tumorMask, voxelVolumeML, conversionFactor, densityGPerML, dosedMask, territoryMasks,
-                None, COMBINED_TUMORS_NAME, "tumors", COLOR_TUMOR, tagOverlaps=True))
+                None, COMBINED_TUMORS_NAME, "tumors", COLOR_TUMOR, tagOverlaps=True,
+                activityDoseArray=activityDoseArray))
         if viableMask is not None:
             results.append(self._statisticsEntry(
                 doseArray, viableMask, voxelVolumeML, conversionFactor, densityGPerML, dosedMask, territoryMasks,
-                None, COMBINED_VIABLE_NAME, "viables", COLOR_VIABLE, tagOverlaps=True))
+                None, COMBINED_VIABLE_NAME, "viables", COLOR_VIABLE, tagOverlaps=True,
+                activityDoseArray=activityDoseArray))
         return sortResults(results)
 
     @staticmethod
     def _statisticsEntry(doseArray, mask, voxelVolumeML, conversionFactor, densityGPerML, dosedMask, territoryMasks,
-                         segmentID, name, role, color, tagOverlaps):
-        dose, volume, activity = segmentDoseStatistics(doseArray, mask, voxelVolumeML, conversionFactor, densityGPerML)
+                         segmentID, name, role, color, tagOverlaps, activityDoseArray=None):
+        dose, volume, activity = segmentDoseStatistics(doseArray, mask, voxelVolumeML, conversionFactor, densityGPerML,
+                                                       activityDoseArray)
         outside = None
         numbers = tuple(n for n, sid, _ in territoryMasks if segmentID is not None and sid == segmentID)
         modelled = volume > 0
@@ -1332,6 +1376,7 @@ class RadioembolizationDosimetryRelativeTest(ScriptedLoadableModuleTest):
 
     def runTest(self):
         self.test_uniformLiverDose()
+        self.test_voxelSPerfusedVolume()
         self.test_perfusedVolumesAreAdded()
         self.test_overlappingPerfusedVolumesRejected()
         self.test_segmentLabels()
@@ -1357,6 +1402,23 @@ class RadioembolizationDosimetryRelativeTest(ScriptedLoadableModuleTest):
         assert np.all(dose[~liver] == 0)
         assert abs(countsOutsideMaskFraction(counts, liver) - (1 - liver.mean())) < 1e-12
         self.delayDisplay("Relative: uniform liver dose OK")
+
+    def test_voxelSPerfusedVolume(self):
+        """Voxel S (experimental): the delivered energy is conserved but part of it leaves the perfused volume, so its
+        mean dose is below the single-compartment value; the activity read from the LDM map is unchanged."""
+        counts = np.ones((30, 30, 30))
+        pv = np.zeros(counts.shape, bool)
+        pv[8:22, 8:22, 8:22] = True
+        vox, A, CF, rho = 4.42 ** 3 / 1000.0, 1000.0, 49.67, 1.05
+        ldm = computeMultiTerritoryDoseMap(counts, [pv], [A], vox, CF, rho)
+        dose, _ = DK.applyDoseMethod(ldm, (4.42, 4.42, 4.42), DK.METHOD_VOXEL_S)
+        assert abs(dose.sum() - ldm.sum()) < 1e-6 * ldm.sum()
+        outside = DK.energyOutsideFraction(dose, pv)
+        assert 0.03 < outside < 0.20
+        assert abs(dose[pv].mean() - ldm[pv].mean() * (1 - outside)) < 1e-6 * ldm[pv].mean()
+        _, _, activity = segmentDoseStatistics(dose, pv, vox, CF, rho, activityDoseArray=ldm)
+        assert abs(activity - A) < 1e-9 * A
+        self.delayDisplay("Relative: voxel S perfused volume OK")
 
     def test_perfusedVolumesAreAdded(self):
         """Each territory gets only its own activity; the total map is the sum of the per-territory maps."""

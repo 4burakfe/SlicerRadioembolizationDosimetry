@@ -21,6 +21,7 @@ import slicer
 from slicer.ScriptedLoadableModule import *
 
 from . import doseguard as DG
+from . import dosekernel as DK
 from . import workflow as _W
 
 # Isodose presets share one colour sequence (lowest -> highest level)
@@ -253,14 +254,19 @@ def countsOutsideMaskFraction(counts, mask):
     return float(positive[~mask].sum(dtype=np.float64)) / total
 
 
-def segmentDoseStatistics(doseArray, segmentMask, voxelVolumeML, conversionFactor, densityGPerML):
-    """Return (mean dose Gy, volume mL, activity MBq). Dose/activity are NaN for empty masks."""
+def segmentDoseStatistics(doseArray, segmentMask, voxelVolumeML, conversionFactor, densityGPerML,
+                          activityDoseArray=None):
+    """Return (mean dose Gy, volume mL, activity MBq). Dose/activity are NaN for empty masks.
+    activityDoseArray: the local deposition (LDM) dose map the activity is calculated from, when doseArray is not
+    one (voxel S: the energy of a voxel is spread to its neighbours, the activity stays where it is)."""
     nVoxels = int(np.count_nonzero(segmentMask))
     volumeML = nVoxels * voxelVolumeML
     if nVoxels == 0:
         return float("nan"), 0.0, float("nan")
     meanDoseGy = float(np.mean(doseArray[segmentMask], dtype=np.float64))
-    activityMBq = meanDoseGy * volumeML * densityGPerML / conversionFactor
+    activityDoseGy = meanDoseGy if activityDoseArray is None else \
+        float(np.mean(activityDoseArray[segmentMask], dtype=np.float64))
+    activityMBq = activityDoseGy * volumeML * densityGPerML / conversionFactor
     return meanDoseGy, volumeML, activityMBq
 
 
@@ -1906,6 +1912,7 @@ class DosimetryWidgetBase(ScriptedLoadableModuleWidget):
         import sys
         try:
             importlib.reload(DG)
+            importlib.reload(DK)
             importlib.reload(sys.modules[__name__])
         except Exception as e:
             logging.warning(f"Could not reload the shared dosimetry code: {e}")
@@ -2421,6 +2428,7 @@ class DosimetryWidgetBase(ScriptedLoadableModuleWidget):
                     applyWidgetSetting(getattr(self, attributeName), kind, value)
                 except (ValueError, TypeError) as e:
                     logging.warning(f"Could not restore setting '{key}' = '{value}': {e}")
+            self._onDoseMethodChanged()   # physics locked to the kernel's radionuclide (voxel S)
             restoreDisplay = self._restoreResults(parameterNode)
         except Exception as e:
             logging.warning(f"Could not restore the settings saved in the scene: {e}")
@@ -2616,6 +2624,7 @@ class DosimetryWidgetBase(ScriptedLoadableModuleWidget):
         if not fileName.lower().endswith(extension):
             fileName += extension
         sections = [
+            ("Dose calculation method", self.lastResult.get("methodLines") or []),   # empty: older results
             ("D values (minimum dose to the hottest x % of the volume)", self.lastResult["sections"]["D values"]),
             ("V values (% of the volume receiving at least x Gy)", self.lastResult["sections"]["V values"]),
             ("Custom DVH metrics", self.lastResult["sections"]["Custom DVH metrics"]),
@@ -2673,6 +2682,101 @@ class DosimetryWidgetBase(ScriptedLoadableModuleWidget):
         note = DG.physicsNote(self.conversionFactorSpinBox.value, halfLife.value if halfLife is not None else None)
         label.setText(note)
         label.setVisible(bool(note))
+
+    # -- dose calculation method: local deposition or (experimental) voxel S ------------------------------------
+
+    def _buildDoseMethodBox(self, parentLayout):
+        """'Dose calculation method' box: method, radionuclide of the kernel (voxel S only) and a description."""
+        box = qt.QGroupBox("Dose calculation method")
+        layout = qt.QFormLayout(box)
+        self.doseMethodComboBox = qt.QComboBox()
+        for method in DK.METHODS:
+            self.doseMethodComboBox.addItem(DK.METHOD_LABELS[method], method)
+        self.doseMethodComboBox.setToolTip(
+            "Local deposition (LDM): the decay energy of a voxel is absorbed in that voxel.\n"
+            "Voxel S value / dose point kernel (experimental): the energy is spread to the neighbouring voxels with a "
+            "radionuclide kernel built for the image's voxel size.")
+        layout.addRow("Method:", self.doseMethodComboBox)
+        self.nuclideLabel = qt.QLabel("Radionuclide:")
+        self.nuclideComboBox = qt.QComboBox()
+        for nuclide, properties in DK.NUCLIDES.items():
+            self.nuclideComboBox.addItem(properties["label"], nuclide)
+        self.nuclideComboBox.setToolTip("Radionuclide of the dose point kernel (only Y-90 for now). Its conversion "
+                                        "factor and half-life are used and cannot be changed.")
+        layout.addRow(self.nuclideLabel, self.nuclideComboBox)
+        self.doseMethodInfoLabel = qt.QLabel()
+        self.doseMethodInfoLabel.setWordWrap(True)
+        self.doseMethodInfoLabel.setTextFormat(qt.Qt.RichText)
+        layout.addRow(self.doseMethodInfoLabel)
+        parentLayout.addWidget(box)
+        self.doseMethodComboBox.connect("currentIndexChanged(int)", self._onDoseMethodChanged)
+        self.nuclideComboBox.connect("currentIndexChanged(int)", self._onDoseMethodChanged)
+
+    def currentDoseMethod(self):
+        combo = getattr(self, "doseMethodComboBox", None)
+        method = combo.currentData if combo is not None else None
+        return method if method in DK.METHODS else DK.METHOD_LDM
+
+    def currentNuclide(self):
+        combo = getattr(self, "nuclideComboBox", None)
+        nuclide = combo.currentData if combo is not None else None
+        return nuclide if nuclide in DK.NUCLIDES else DK.DEFAULT_NUCLIDE
+
+    def setDoseMethod(self, method, nuclide=None):
+        """Select a method (and kernel radionuclide), e.g. from the Taranis case."""
+        index = self.doseMethodComboBox.findData(method)
+        if index >= 0:
+            self.doseMethodComboBox.setCurrentIndex(index)
+        if nuclide:
+            index = self.nuclideComboBox.findData(nuclide)
+            if index >= 0:
+                self.nuclideComboBox.setCurrentIndex(index)
+        self._onDoseMethodChanged()
+
+    def _onDoseMethodChanged(self, *args):
+        if getattr(self, "doseMethodComboBox", None) is None:
+            return
+        method, nuclide = self.currentDoseMethod(), self.currentNuclide()
+        voxelS = method == DK.METHOD_VOXEL_S
+        self.nuclideLabel.setVisible(voxelS)
+        self.nuclideComboBox.setVisible(voxelS)
+        self.doseMethodInfoLabel.setText(DK.methodDescriptionHtml(method, nuclide))
+        self._applyPhysicsLock()
+        self._updatePhysicsNote()
+        self._onDoseMethodChangedModule()
+
+    def _onDoseMethodChangedModule(self):
+        pass   # module-specific updates (e.g. the dose estimates of the patient-relative module)
+
+    def _applyPhysicsLock(self):
+        """Voxel S: conversion factor and half-life fixed to the kernel's radionuclide (not editable)."""
+        voxelS = self.currentDoseMethod() == DK.METHOD_VOXEL_S
+        nuclide = DK.NUCLIDES[self.currentNuclide()]
+        if not hasattr(self, "_physicsToolTips"):
+            self._physicsToolTips = {}
+        for attributeName, value, unit in (("conversionFactorSpinBox", nuclide["conversionFactor"], "J/GBq"),
+                                           ("halfLifeSpinBox", nuclide["halfLifeH"], "h")):
+            widget = getattr(self, attributeName, None)
+            if widget is None:
+                continue
+            self._physicsToolTips.setdefault(attributeName, widget.toolTip)
+            if voxelS:
+                widget.setValue(value)
+                widget.setToolTip(f"Locked to {nuclide['label']} ({value:g} {unit}) while the voxel S method is "
+                                  "selected: the dose point kernel is for this radionuclide.")
+            else:
+                widget.setToolTip(self._physicsToolTips[attributeName])
+            widget.setEnabled(not voxelS)
+
+    def _doseMethodInputs(self):
+        """{"doseMethod", "nuclide"} for _collectInputs; with voxel S also the locked physics of the radionuclide."""
+        method, nuclide = self.currentDoseMethod(), self.currentNuclide()
+        inputs = {"doseMethod": method, "nuclide": nuclide}
+        if method == DK.METHOD_VOXEL_S:
+            inputs["conversionFactor"] = DK.NUCLIDES[nuclide]["conversionFactor"]
+            if getattr(self, "halfLifeSpinBox", None) is not None:
+                inputs["halfLife"] = DK.NUCLIDES[nuclide]["halfLifeH"]
+        return inputs
 
     def _publishDoseChecks(self, checks, then=None):
         """Store the dose checks with the results (the Taranis toolbar reads them from the parameter node), then,
@@ -2756,6 +2860,14 @@ class DosimetryLogicBase(ScriptedLoadableModuleLogic):
         self.outlinedSegmentationNode = None  # segmentation shown by the last calculation
         self.lastLegendLevels = []  # [(level Gy, rgb)] of the isodose legend (saved with the results)
         self.preferredLayoutID = RESULTS_LAYOUT_ID  # results layout used when none is shown (set by the GUI)
+
+    @staticmethod
+    def applyDoseMethod(ldmDoseArray, volumeNode, method, nuclide=DK.DEFAULT_NUCLIDE, densityGPerML=1.0, regions=()):
+        """(dose array, kernel info or None) of the chosen method from the LDM dose map on volumeNode's grid,
+        calculated with densityGPerML for every voxel. regions: [(mask, density, name)] with their own density (the
+        lungs in absolute mode). Voxel S (experimental): convolution with kernels built now for the volume's voxel
+        spacing and scaled to the tissue densities (see dosekernel.voxelSDoseMap)."""
+        return DK.applyDoseMethod(ldmDoseArray, volumeNode.GetSpacing(), method, nuclide, densityGPerML, regions)
 
     def setupResultsLayout(self, layoutID=None, placeSecondaryWindow=False):
         """Switch to a results layout: single monitor (3x2) or dual monitor. Default: the results layout already
@@ -3485,6 +3597,7 @@ __all__ = [
     "applySegmentColors",
     "sortResults",
     "DG",
+    "DK",
     "SEGMENT_ROLE_TAG",
     "segmentTagValue",
     "normalScope",

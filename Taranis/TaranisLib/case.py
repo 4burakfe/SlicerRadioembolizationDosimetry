@@ -9,6 +9,7 @@ import qt
 import slicer
 
 from . import roles as R
+from . import dosekernel as DK
 
 CASE_ATTRIBUTE = "Taranis.Case"
 CASE_VERSION = "1"
@@ -20,6 +21,8 @@ P_ID = "CaseID"
 P_CREATED = "Created"
 P_MODE = "Mode"
 P_MICROSPHERES = "Microspheres"
+P_DOSE_METHOD = "DoseMethod"                         # dosekernel.METHOD_LDM / METHOD_VOXEL_S (experimental)
+P_DOSE_NUCLIDE = "DoseNuclide"                       # radionuclide of the voxel S kernel (Y-90)
 P_TREATMENT_DATETIME = "TreatmentDateTime"
 P_CURRENT_STEP = "CurrentStep"
 P_LSF_VALUE = "LSF.Value"
@@ -161,6 +164,16 @@ class TaranisCase:
     @property
     def microspheres(self):
         return self.param(P_MICROSPHERES, R.MICROSPHERES_GLASS)
+
+    @property
+    def doseMethod(self):
+        method = self.param(P_DOSE_METHOD, DK.METHOD_LDM)
+        return method if method in DK.METHODS else DK.METHOD_LDM
+
+    @property
+    def doseNuclide(self):
+        nuclide = self.param(P_DOSE_NUCLIDE, DK.DEFAULT_NUCLIDE)
+        return nuclide if nuclide in DK.NUCLIDES else DK.DEFAULT_NUCLIDE
 
     def lsfValue(self):
         text = self.param(P_LSF_VALUE)

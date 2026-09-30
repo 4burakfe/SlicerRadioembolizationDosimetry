@@ -166,6 +166,8 @@ def installResultsLayoutRegistration(*args):
 class RadioembolizationDosimetryAbsoluteWidget(DosimetryWidgetBase):
 
     WIDGET_SETTINGS = [
+        ("DoseMethod", "doseMethodComboBox", "text"),   # first: voxel S locks the conversion factor and half-life
+        ("DoseNuclide", "nuclideComboBox", "text"),
         ("ClipNegativeValues", "clipNegativeCheckBox", "bool"),
         ("ImageUnit", "unitComboBox", "text"),  # after the input volume, which may preselect a unit
         ("HoursAfterTreatment", "hourSlider", "number"),
@@ -260,6 +262,9 @@ class RadioembolizationDosimetryAbsoluteWidget(DosimetryWidgetBase):
         parametersCollapsibleButton.text = "Parameters"
         self.layout.addWidget(parametersCollapsibleButton)
         parametersLayout = qt.QVBoxLayout(parametersCollapsibleButton)
+
+        # ---- Dose calculation method (local deposition or experimental voxel S) ----
+        self._buildDoseMethodBox(parametersLayout)
 
         # ---- Images and segments ----
         generalBox = qt.QGroupBox("Images and segments")
@@ -556,6 +561,8 @@ class RadioembolizationDosimetryAbsoluteWidget(DosimetryWidgetBase):
         infoTextBox.setToolTip("Module information and instructions.")
         self.layout.addWidget(infoTextBox)
 
+        self._onDoseMethodChanged()   # description and physics lock of the selected method
+
         # ---- Settings are kept in the module's parameter node, which is saved with the scene ----
         self._connectSettingsSignals()
         self._connectPreviewSignals()
@@ -740,6 +747,7 @@ class RadioembolizationDosimetryAbsoluteWidget(DosimetryWidgetBase):
             "unitLabel": unitLabel, "toMBqPerML": toMBqPerML,
             "hours": self.hourSlider.value, "halfLife": self.halfLifeSpinBox.value,
         })
+        inputs.update(self._doseMethodInputs())   # voxel S: physics of the kernel's radionuclide
 
         if problems:
             slicer.util.errorDisplay("\n".join(problems))
@@ -776,6 +784,7 @@ class RadioembolizationDosimetryAbsoluteWidget(DosimetryWidgetBase):
             inputs["conversionFactor"], inputs["density"], clipNegativeValues=inputs["clipNegative"])
         lungIDs = [sid for sid, c in inputs["categories"].items() if c == CATEGORY_LUNGS]
         lungVoxels = 0
+        regions = []
         if lungIDs:
             # dose = concentration x factor / density: voxels of the lungs (not also in the whole liver) get the lung
             # density instead of the liver density
@@ -785,7 +794,17 @@ class RadioembolizationDosimetryAbsoluteWidget(DosimetryWidgetBase):
             lungMask &= ~segmentMaskOnVolumeGrid(inputs["segmentation"], inputs["liverID"], inputs["spect"])
             lungVoxels = int(np.count_nonzero(lungMask))
             if lungVoxels:
-                doseArray[lungMask] *= inputs["density"] / inputs["lungDensity"]
+                regions = [(lungMask, inputs["lungDensity"], "lungs")]
+        # LDM: the lung voxels are rescaled to the lung density. Voxel S (experimental): the decays outside the lungs
+        # spread with the kernel scaled to the liver density, the decays in the lungs with the kernel scaled to the
+        # lung density; each voxel's energy is divided by its own mass. The activity of the segments is always read
+        # from the LDM map.
+        baseArray = doseArray   # LDM with the liver density everywhere
+        doseArray, kernelInfo = self.logic.applyDoseMethod(baseArray, inputs["spect"], inputs["doseMethod"],
+                                                           inputs["nuclide"], inputs["density"], regions)
+        voxelS = kernelInfo is not None
+        ldmArray = doseArray if not voxelS else self.logic.applyDoseMethod(
+            baseArray, inputs["spect"], DK.METHOD_LDM, inputs["nuclide"], inputs["density"], regions)[0]
         self.totalActivityTextBox.setText(f"{totalAtScan:.2f} MBq")
         self.dectotalActivityTextBox.setText(f"{totalAtAdmin:.2f} MBq")
         writeDoseVolume(inputs["output"], inputs["spect"], doseArray)
@@ -799,15 +818,20 @@ class RadioembolizationDosimetryAbsoluteWidget(DosimetryWidgetBase):
         applySegmentColors(inputs["segmentation"], inputs["liverID"], (), inputs["categories"])
         stats = self.logic.segmentStatistics(doseArray, inputs["segmentation"], inputs["spect"], voxelVolumeML,
                                              inputs["conversionFactor"], inputs["density"],
-                                             inputs["liverID"], inputs["categories"])
-        for s in stats:  # lung activity from the lung density (dose x mass / conversion factor)
-            if s["role"] == CATEGORY_LUNGS and np.isfinite(s["dose"]):
-                s["activity"] = s["dose"] * s["volume"] * inputs["lungDensity"] / inputs["conversionFactor"]
+                                             inputs["liverID"], inputs["categories"],
+                                             activityDoseArray=ldmArray if voxelS else None)
+        for s in stats:  # lung activity from the lung density (LDM dose x mass / conversion factor)
+            if s["role"] == CATEGORY_LUNGS and np.isfinite(s["activityDose"]):
+                s["activity"] = s["activityDose"] * s["volume"] * inputs["lungDensity"] / inputs["conversionFactor"]
 
         # Same (prepared) values as the dose map, so the QC numbers are consistent with it
         outsideFraction = countsOutsideMaskFraction(concentration, liverMask)
-        notes = [ABSOLUTE_MODE_INFO]
+        notes = [ABSOLUTE_MODE_INFO if not voxelS else
+                 ABSOLUTE_MODE_INFO.replace("(local deposition)", "(voxel S dose point kernel, experimental)")]
         qcLines = []
+        if voxelS:
+            qcLines.append(f"Voxel S (experimental): whole-liver mean dose {DK.meanInMask(doseArray, liverMask):.2f} Gy "
+                           f"(local deposition: {DK.meanInMask(ldmArray, liverMask):.2f} Gy).")
         if np.isfinite(outsideFraction):
             qcLines.append(f"{100 * outsideFraction:.1f}% of the image activity lies outside the whole-liver segment "
                            "(it is included in the dose map).")
@@ -841,12 +865,13 @@ class RadioembolizationDosimetryAbsoluteWidget(DosimetryWidgetBase):
             extraUptakeFraction=countsOutsideMaskFraction(concentration, liverOrLungs),
             lungsSegmented=bool(lungIDs), outsidePerfusedFraction=outsidePerfused,
             hoursAfterTreatment=inputs["hours"], conversionFactor=inputs["conversionFactor"],
-            halfLifeHours=inputs["halfLife"])
+            halfLifeHours=inputs["halfLife"], voxelS=voxelS)
         notes, qcNote = self._withDoseChecks(notes, qcNote, checks)
 
         segmentation = inputs["segmentation"].GetSegmentation()
-        parameters = [
-            ("Mode", "Absolute quantification"),
+        parameters = [("Mode", "Absolute quantification")]
+        parameters += DK.reportParameters(inputs["doseMethod"], inputs["nuclide"], kernelInfo)
+        parameters += [
             ("Input volume", inputs["spect"].GetName()),
             ("Reference volume", inputs["reference"].GetName()),
             ("Segmentation", inputs["segmentation"].GetName()),
@@ -866,6 +891,8 @@ class RadioembolizationDosimetryAbsoluteWidget(DosimetryWidgetBase):
         parameters.append(("Isodose set", inputs["isodosePreset"]))
         self._finishCalculation(inputs, stats, voxelVolumeML, liverMask, [], parameters, notes, qcNote,
                                 "Taranis - Absolute Quantification")
+        if self.lastResult:   # stored with the results by _publishDoseChecks below
+            self.lastResult["methodLines"] = DK.reportLines(inputs["doseMethod"], inputs["nuclide"])
         # dose check warnings first, then the lung density question
         self._publishDoseChecks(checks, then=(lambda: self._warnLungDose(inputs, lungRows)) if lungRows else None)
 
@@ -1001,6 +1028,11 @@ class RadioembolizationDosimetryAbsoluteWidget(DosimetryWidgetBase):
     # -- custom DVH metrics ------------------------------------------------
 
 
+    def _onDoseMethodChangedModule(self):
+        voxelS = self.currentDoseMethod() == DK.METHOD_VOXEL_S
+        self.modeInfoLabel.setText(ABSOLUTE_MODE_INFO if not voxelS else ABSOLUTE_MODE_INFO.replace(
+            "(local deposition)", "(voxel S dose point kernel, experimental: see Dose calculation method)"))
+
     def _saveModuleSettings(self, parameterNode):
         pass  # all settings of this module are in NODE_SETTINGS / WIDGET_SETTINGS
 
@@ -1044,10 +1076,12 @@ class RadioembolizationDosimetryAbsoluteLogic(DosimetryLogicBase):
                 concentration, negativeVoxels)
 
     def segmentStatistics(self, doseArray, segmentationNode, referenceVolumeNode, voxelVolumeML,
-                          conversionFactor, densityGPerML, liverSegmentID, categories):
+                          conversionFactor, densityGPerML, liverSegmentID, categories, activityDoseArray=None):
         """One dict per segment, plus 'All tumors (combined)' (union of the tumor segments, id None) when
         tumors are categorized; ordered by role. Keys: id, name, displayName, label, role, roleLabel, color,
-        dose, volume, activity and doses (sorted voxel doses, empty if not on the image grid)."""
+        dose, volume, activity, activityDose (mean dose of the map the activity comes from) and doses (sorted
+        voxel doses, empty if not on the image grid). activityDoseArray: the LDM map when doseArray is a voxel S
+        map (activities from local deposition)."""
         segmentation = segmentationNode.GetSegmentation()
         results = []
         tumorMask = None
@@ -1064,31 +1098,36 @@ class RadioembolizationDosimetryAbsoluteLogic(DosimetryLogicBase):
             elif role == CATEGORY_VIABLE:
                 viableMask = mask.copy() if viableMask is None else (viableMask | mask)
             results.append(self._statisticsEntry(doseArray, mask, voxelVolumeML, conversionFactor, densityGPerML,
-                                                 segmentID, name, role, tuple(segmentation.GetSegment(segmentID).GetColor())))
+                                                 segmentID, name, role, tuple(segmentation.GetSegment(segmentID).GetColor()),
+                                                 activityDoseArray))
         if tumorMask is not None:
             results.append(self._statisticsEntry(doseArray, tumorMask, voxelVolumeML, conversionFactor, densityGPerML,
-                                                 None, COMBINED_TUMORS_NAME, "tumors", COLOR_TUMOR))
+                                                 None, COMBINED_TUMORS_NAME, "tumors", COLOR_TUMOR, activityDoseArray))
         if viableMask is not None:
             results.append(self._statisticsEntry(doseArray, viableMask, voxelVolumeML, conversionFactor, densityGPerML,
-                                                 None, COMBINED_VIABLE_NAME, "viables", COLOR_VIABLE))
+                                                 None, COMBINED_VIABLE_NAME, "viables", COLOR_VIABLE, activityDoseArray))
         return sortResults(results)
 
     @staticmethod
-    def _statisticsEntry(doseArray, mask, voxelVolumeML, conversionFactor, densityGPerML, segmentID, name, role, color):
-        dose, volume, activity = segmentDoseStatistics(doseArray, mask, voxelVolumeML, conversionFactor, densityGPerML)
+    def _statisticsEntry(doseArray, mask, voxelVolumeML, conversionFactor, densityGPerML, segmentID, name, role, color,
+                         activityDoseArray=None):
+        dose, volume, activity = segmentDoseStatistics(doseArray, mask, voxelVolumeML, conversionFactor, densityGPerML,
+                                                       activityDoseArray)
+        activityDose = activity * conversionFactor / (volume * densityGPerML) if volume > 0 else float("nan")
         modelled = volume > 0
         if not modelled:
             logging.warning(f"Segment '{name}' has no voxels on the image grid.")
         doses = np.sort(doseArray[mask]) if modelled else np.zeros(0)
         return {"id": segmentID, "name": name, "displayName": name, "label": name,
                 "role": role, "roleLabel": RESULT_ROLES[role][0], "color": color,
-                "dose": dose, "volume": volume, "activity": activity, "doses": doses}
+                "dose": dose, "volume": volume, "activity": activity, "activityDose": activityDose, "doses": doses}
 
 class RadioembolizationDosimetryAbsoluteTest(ScriptedLoadableModuleTest):
     """Synthetic-data checks of the dose math ("Reload and Test" in developer mode)."""
 
     def runTest(self):
         self.test_absoluteDose()
+        self.test_voxelSDose()
         self.test_labelStacking()
         self.test_negativeVoxelValues()
         self.test_categories()
@@ -1103,6 +1142,30 @@ class RadioembolizationDosimetryAbsoluteTest(ScriptedLoadableModuleTest):
         assert np.allclose(dose, 49.67 / 1.05)
         assert np.allclose(computeAbsoluteDoseMap(conc, 1e-6, 2.0, 49.67, 1.05), 2 * dose)
         self.delayDisplay("Absolute: dose math OK")
+
+    def test_voxelSDose(self):
+        """Voxel S (experimental): uniform activity gives the LDM dose inside, the energy is conserved, a hot voxel
+        is spread to its neighbours, and LDM leaves the map unchanged."""
+        ldm = np.zeros((30, 30, 30))
+        ldm[5:25, 5:25, 5:25] = computeAbsoluteDoseMap(np.full((20, 20, 20), 1e6), 1e-6, 1.0, 49.67, 1.05)
+        dose, info = DK.applyDoseMethod(ldm, (4.0, 4.0, 3.0), DK.METHOD_VOXEL_S)
+        assert abs(dose[15, 15, 15] - 49.67 / 1.05) < 1e-6
+        assert abs(dose.sum() - ldm.sum()) < 1e-6 * ldm.sum()
+        assert info["shape"] == (11, 9, 9)   # (z, y, x): thinner slices -> more voxels along z
+        same, none = DK.applyDoseMethod(ldm, (4.0, 4.0, 3.0), DK.METHOD_LDM)
+        assert same is ldm and none is None
+        # Lungs: their decays use the lung-density kernel, lung voxels the lung mass; energy conserved
+        big = np.zeros((70, 40, 40))
+        big[10:60, 10:30, 10:30] = 100.0 / 1.05
+        lungs = np.zeros(big.shape, bool)
+        lungs[35:] = True
+        dose, info = DK.applyDoseMethod(big, (4.0, 4.0, 4.0), DK.METHOD_VOXEL_S, densityGPerML=1.05,
+                                        regions=[(lungs, 0.3, "lungs")])
+        density = np.where(lungs, 0.3, 1.05)
+        assert abs((dose * density).sum() - (big * 1.05).sum()) < 1e-6 * (big * 1.05).sum()
+        assert abs(dose[48, 20, 20] - 100.0 / 0.3) < 1e-6 and abs(dose[20, 20, 20] - 100.0 / 1.05) < 1e-6
+        assert info["regions"][0]["shape"][0] > info["shape"][0]   # longer ranges in the lungs
+        self.delayDisplay("Absolute: voxel S dose OK")
 
     def test_categories(self):
         categories = {"t1": CATEGORY_TUMOR, "n1": CATEGORY_NORMAL, "liver": CATEGORY_TUMOR}

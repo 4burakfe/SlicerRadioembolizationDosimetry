@@ -23,8 +23,10 @@ from slicer.util import VTKObservationMixin
 import TaranisLib
 from TaranisLib import roles as R
 from TaranisLib import workflow as W
+from TaranisLib import dosekernel as DK
 from TaranisLib.case import (TaranisCase, candidateVolumes, volumeInfo, settingBool, settingText, setSetting,
-                             SETTING_SHOW_AT_STARTUP, SETTING_MODELS_FOLDER, P_MICROSPHERES,
+                             SETTING_SHOW_AT_STARTUP, SETTING_MODELS_FOLDER, P_MICROSPHERES, P_DOSE_METHOD,
+                             P_DOSE_NUCLIDE,
                              P_TREATMENT_DATETIME, P_LSF_SKIPPED, P_REGISTRATION_SKIPPED, P_REGISTRATION_CHECKED,
                              P_NAME, P_ID, P_LSF_LUNG_MASS, P_PLANNED_ACTIVITY)
 from TaranisLib.controller import (WorkflowController, setSegmentRole, segmentIDs, segmentRole,
@@ -996,6 +998,24 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.microspheresCombo.setToolTip("Selects the isodose set used in the dosimetry modules.")
         self.microspheresCombo.connect("currentIndexChanged(int)", self.onMicrospheresChanged)
         treatmentLayout.addRow("Microspheres:", self.microspheresCombo)
+        self.doseMethodCombo = qt.QComboBox()
+        for method in DK.METHODS:
+            self.doseMethodCombo.addItem(DK.METHOD_LABELS[method], method)
+        self.doseMethodCombo.setToolTip(
+            "Dose calculation method used in the dosimetry modules.\n"
+            "Local deposition (LDM): the decay energy of a voxel is absorbed in that voxel (standard).\n"
+            "Voxel S value / dose point kernel (experimental): the energy is spread to the neighbouring voxels.")
+        self.doseMethodCombo.connect("currentIndexChanged(int)", self.onDoseMethodChanged)
+        treatmentLayout.addRow("Dose calculation:", self.doseMethodCombo)
+        self.doseNuclideLabel = qt.QLabel("Radionuclide:")
+        self.doseNuclideCombo = qt.QComboBox()
+        for nuclide, properties in DK.NUCLIDES.items():
+            self.doseNuclideCombo.addItem(properties["label"], nuclide)
+        self.doseNuclideCombo.setToolTip("Radionuclide of the dose point kernel (only Y-90 for now).")
+        self.doseNuclideCombo.connect("currentIndexChanged(int)", self.onDoseNuclideChanged)
+        treatmentLayout.addRow(self.doseNuclideLabel, self.doseNuclideCombo)
+        self.doseMethodNoteLabel = styledLabel("", "color: #d97706;")
+        treatmentLayout.addRow("", self.doseMethodNoteLabel)
         dateRow = qt.QHBoxLayout()
         self.treatmentKnownCheckBox = qt.QCheckBox("Known")
         self.treatmentDateEdit = qt.QDateTimeEdit()
@@ -1043,6 +1063,20 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         index = max(0, self.microspheresCombo.findData(case.microspheres))
         if self.microspheresCombo.currentIndex != index:
             self.microspheresCombo.setCurrentIndex(index)
+        for combo, value in ((self.doseMethodCombo, case.doseMethod), (self.doseNuclideCombo, case.doseNuclide)):
+            index = max(0, combo.findData(value))
+            if combo.currentIndex != index:
+                combo.setCurrentIndex(index)
+        voxelS = case.doseMethod == DK.METHOD_VOXEL_S
+        self.doseNuclideLabel.setVisible(voxelS)
+        self.doseNuclideCombo.setVisible(voxelS)
+        self.doseMethodNoteLabel.setVisible(voxelS)
+        self.doseMethodNoteLabel.text = (
+            "Experimental: the energy of each voxel is spread with the "
+            f"{DK.NUCLIDES[case.doseNuclide]['label']} dose point kernel ({DK.KERNEL_REFERENCE_SHORT}). The "
+            "conversion factor and half-life are locked to this radionuclide in the dosimetry modules. Published "
+            "dose thresholds were mostly derived with local deposition: compare with an LDM calculation."
+            if voxelS else "")
         treatment = case.param(P_TREATMENT_DATETIME)
         self.treatmentKnownCheckBox.checked = bool(treatment)
         self.treatmentDateEdit.enabled = bool(treatment)
@@ -1094,6 +1128,14 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def onMicrospheresChanged(self, index):
         if not self._updating and self.controller.isActive:
             self.controller.case.setParam(P_MICROSPHERES, self.microspheresCombo.currentData)
+
+    def onDoseMethodChanged(self, index):
+        if not self._updating and self.controller.isActive:
+            self.controller.case.setParam(P_DOSE_METHOD, self.doseMethodCombo.currentData)
+
+    def onDoseNuclideChanged(self, index):
+        if not self._updating and self.controller.isActive:
+            self.controller.case.setParam(P_DOSE_NUCLIDE, self.doseNuclideCombo.currentData)
 
     def onTreatmentDateChanged(self, *args):
         if self._updating or not self.controller.isActive:
@@ -2572,6 +2614,8 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             index = widget.isodosePresetComboBox.findText(preset)
             if index >= 0:
                 widget.isodosePresetComboBox.setCurrentIndex(index)
+        if hasattr(widget, "setDoseMethod"):
+            trySet("the dose calculation method", widget.setDoseMethod, case.doseMethod, case.doseNuclide)
         self._showDosimetryNotice(widget, mode, roleOf)
 
     def _showDosimetryNotice(self, widget, mode, roleOf):
@@ -2584,6 +2628,12 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if preset := R.MICROSPHERE_LABELS.get(case.microspheres):
             filled.append(f"isodose set ({preset})")
         check, fields = [], []
+        if hasattr(widget, "setDoseMethod"):
+            filled.append(f"dose calculation method ({DK.METHOD_SHORT_LABELS[case.doseMethod]})")
+            if case.doseMethod == DK.METHOD_VOXEL_S:
+                check.append(f"<b>Voxel S (experimental)</b> with the {DK.NUCLIDES[case.doseNuclide]['label']} "
+                             "dose point kernel: the conversion factor and half-life are locked to it. Compare with "
+                             "an LDM calculation before interpreting the doses.")
         if mode == R.MODE_RELATIVE:
             perfused = [s for s, role in roleOf.items() if role == W.SEGMENT_PERFUSED]
             if perfused:
@@ -2696,7 +2746,8 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         html.append("</ul>")
         if snapshot.mode:
             html.append(f"<p>Mode: {R.MODE_LABELS[snapshot.mode]} &middot; "
-                        f"{R.MICROSPHERE_LABELS.get(case.microspheres, '')}</p>")
+                        f"{R.MICROSPHERE_LABELS.get(case.microspheres, '')} &middot; "
+                        f"Dose calculation: {DK.METHOD_SHORT_LABELS[case.doseMethod]}</p>")
         html.append("<h4>Steps</h4><table cellspacing='4'>")
         for number, (key, label) in enumerate(W.STEPS, start=1):
             status = controller.status(key)

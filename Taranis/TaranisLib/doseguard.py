@@ -21,6 +21,7 @@ LSF_HIGH_PERCENT = 20.0
 LUNG_DOSE_LIMIT_GY = 30.0                            # single session
 EXTRA_UPTAKE_FRACTION = 0.20                         # image counts outside the whole liver and the lungs
 OUTSIDE_PERFUSED_FRACTION = 0.20                     # whole-liver counts outside the perfused volumes
+VOXEL_S_OUTSIDE_WARNING_FRACTION = 0.10              # voxel S: beta energy deposited outside the perfused volumes
 MAX_NAMES = 6                                        # segment names listed in one message
 
 # Physics of the dose calculation: Taranis's defaults are Y-90 values; other isotopes only for reference / research
@@ -105,9 +106,35 @@ def referenceNormal(segments):
     return dose, f"{what} {names}"
 
 
+def voxelSChecks(relative=False, energyOutsidePerfusedFraction=None, lungsCalculated=False):
+    """[(severity, text)] of the experimental voxel S (dose point kernel) method.
+
+    energyOutsidePerfusedFraction: patient-relative mode, part of the delivered beta energy deposited outside the
+    perfused volumes after the convolution. lungsCalculated: absolute mode with lung segments (lung doses reported)."""
+    issues = [(W.SEVERITY_WARNING,
+               "Experimental voxel S (dose point kernel) calculation: not validated for clinical use. Published dose "
+               "thresholds, including those of these checks, were mostly derived with local deposition (LDM) or the "
+               "partition model: compare with an LDM calculation before interpreting the doses.")]
+    if relative and _finite(energyOutsidePerfusedFraction):
+        severity = (W.SEVERITY_WARNING if energyOutsidePerfusedFraction > VOXEL_S_OUTSIDE_WARNING_FRACTION
+                    else W.SEVERITY_INFO)
+        issues.append((severity,
+                       f"Voxel S: {100 * energyOutsidePerfusedFraction:.1f}% of the delivered beta energy is deposited "
+                       "outside the perfused volumes (up to about 11 mm beyond their edges), so their mean doses are "
+                       "lower than with LDM / the partition model (most in small, e.g. segmental, volumes). This is "
+                       "physical; the energy is not put back into the perfused volumes."))
+    if lungsCalculated:
+        issues.append((W.SEVERITY_INFO,
+                       "Voxel S: decays in the lung segments use a kernel scaled to the lung density (about 3 times "
+                       "longer ranges). The mean lung dose is reliable; doses within a few cm of the liver-lung "
+                       "interface are approximate (electrons crossing it keep the range of the tissue they started "
+                       "in)."))
+    return issues
+
+
 def doseChecks(segments, microspheres=None, lsfPercent=None, lungDosesGy=(), extraUptakeFraction=None,
                lungsSegmented=True, outsidePerfusedFraction=None, relative=False, hoursAfterTreatment=None,
-               conversionFactor=None, halfLifeHours=None):
+               conversionFactor=None, halfLifeHours=None, voxelS=False, energyOutsidePerfusedFraction=None):
     """[(severity, text)] of the dose checks.
 
     segments: [{name, role ("tumor", "viable", "normal", ...), dose (mean Gy), volume (mL), scope (normal tissue:
@@ -119,8 +146,13 @@ def doseChecks(segments, microspheres=None, lsfPercent=None, lungDosesGy=(), ext
     outsidePerfusedFraction: part of the whole-liver counts outside the perfused volumes (None: no perfused volumes).
     relative: patient-relative mode (that liver gets 0 Gy). hoursAfterTreatment: absolute mode only.
     conversionFactor (J/GBq) / halfLifeHours (absolute mode): a warning when they differ from the Y-90 defaults.
+    voxelS: the experimental voxel S method was used (see voxelSChecks); energyOutsidePerfusedFraction: its
+    patient-relative energy fraction outside the perfused volumes.
     """
     issues = []
+    if voxelS:
+        issues.extend(voxelSChecks(relative, energyOutsidePerfusedFraction,
+                                   lungsCalculated=not relative and lungsSegmented and bool(lungDosesGy)))
     if conversionFactor is not None:
         note = physicsNote(conversionFactor, halfLifeHours)
         if note:

@@ -10,6 +10,7 @@ set(MODULE_PYTHON_SCRIPTS
   TaranisLib/memory.py
   TaranisLib/controller.py
   TaranisLib/doseguard.py
+  TaranisLib/dosekernel.py
   TaranisLib/dosimetry.py
   TaranisLib/ai.py
   TaranisLib/roles.py
@@ -26,6 +27,7 @@ set(MODULE_PYTHON_RESOURCES
   Resources/Icons/${MODULE_NAME}.png
   Resources/Icons/Epona.png
   Resources/banner.png
+  Resources/DoseKernels/90Y_64.10H_beta.io_processed.csv
   )
 
 #-----------------------------------------------------------------------------
