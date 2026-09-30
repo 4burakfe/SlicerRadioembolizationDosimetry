@@ -125,10 +125,8 @@ def voxelSChecks(relative=False, energyOutsidePerfusedFraction=None, lungsCalcul
                        "physical; the energy is not put back into the perfused volumes."))
     if lungsCalculated:
         issues.append((W.SEVERITY_INFO,
-                       "Voxel S: decays in the lung segments use a kernel scaled to the lung density (about 3 times "
-                       "longer ranges). The mean lung dose is reliable; doses within a few cm of the liver-lung "
-                       "interface are approximate (electrons crossing it keep the range of the tissue they started "
-                       "in)."))
+                       "Voxel S: the lung segments are calculated with local deposition (LDM) and the lung density, "
+                       "as usual; the kernel is not applied to the lungs."))
     return issues
 
 

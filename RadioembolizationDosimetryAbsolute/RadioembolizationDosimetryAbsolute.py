@@ -784,7 +784,7 @@ class RadioembolizationDosimetryAbsoluteWidget(DosimetryWidgetBase):
             inputs["conversionFactor"], inputs["density"], clipNegativeValues=inputs["clipNegative"])
         lungIDs = [sid for sid, c in inputs["categories"].items() if c == CATEGORY_LUNGS]
         lungVoxels = 0
-        regions = []
+        lungMask = None
         if lungIDs:
             # dose = concentration x factor / density: voxels of the lungs (not also in the whole liver) get the lung
             # density instead of the liver density
@@ -794,17 +794,14 @@ class RadioembolizationDosimetryAbsoluteWidget(DosimetryWidgetBase):
             lungMask &= ~segmentMaskOnVolumeGrid(inputs["segmentation"], inputs["liverID"], inputs["spect"])
             lungVoxels = int(np.count_nonzero(lungMask))
             if lungVoxels:
-                regions = [(lungMask, inputs["lungDensity"], "lungs")]
-        # LDM: the lung voxels are rescaled to the lung density. Voxel S (experimental): the decays outside the lungs
-        # spread with the kernel scaled to the liver density, the decays in the lungs with the kernel scaled to the
-        # lung density; each voxel's energy is divided by its own mass. The activity of the segments is always read
-        # from the LDM map.
-        baseArray = doseArray   # LDM with the liver density everywhere
-        doseArray, kernelInfo = self.logic.applyDoseMethod(baseArray, inputs["spect"], inputs["doseMethod"],
-                                                           inputs["nuclide"], inputs["density"], regions)
+                doseArray[lungMask] *= inputs["density"] / inputs["lungDensity"]
+        # Voxel S (experimental): the LDM map is convolved with the kernel scaled to the liver density; the lungs stay
+        # at local deposition. The activity of the segments is always read from the LDM map.
+        ldmArray = doseArray
+        doseArray, kernelInfo = self.logic.applyDoseMethod(ldmArray, inputs["spect"], inputs["doseMethod"],
+                                                           inputs["nuclide"], inputs["density"],
+                                                           localMask=lungMask if lungVoxels else None)
         voxelS = kernelInfo is not None
-        ldmArray = doseArray if not voxelS else self.logic.applyDoseMethod(
-            baseArray, inputs["spect"], DK.METHOD_LDM, inputs["nuclide"], inputs["density"], regions)[0]
         self.totalActivityTextBox.setText(f"{totalAtScan:.2f} MBq")
         self.dectotalActivityTextBox.setText(f"{totalAtAdmin:.2f} MBq")
         writeDoseVolume(inputs["output"], inputs["spect"], doseArray)
@@ -1154,17 +1151,17 @@ class RadioembolizationDosimetryAbsoluteTest(ScriptedLoadableModuleTest):
         assert info["shape"] == (11, 9, 9)   # (z, y, x): thinner slices -> more voxels along z
         same, none = DK.applyDoseMethod(ldm, (4.0, 4.0, 3.0), DK.METHOD_LDM)
         assert same is ldm and none is None
-        # Lungs: their decays use the lung-density kernel, lung voxels the lung mass; energy conserved
-        big = np.zeros((70, 40, 40))
-        big[10:60, 10:30, 10:30] = 100.0 / 1.05
+        # Lungs: local deposition with the lung density (voxel S not applied to them)
+        big = np.zeros((40, 30, 30))
+        big[5:35, 5:25, 5:25] = 100.0 / 1.05
         lungs = np.zeros(big.shape, bool)
-        lungs[35:] = True
-        dose, info = DK.applyDoseMethod(big, (4.0, 4.0, 4.0), DK.METHOD_VOXEL_S, densityGPerML=1.05,
-                                        regions=[(lungs, 0.3, "lungs")])
-        density = np.where(lungs, 0.3, 1.05)
-        assert abs((dose * density).sum() - (big * 1.05).sum()) < 1e-6 * (big * 1.05).sum()
-        assert abs(dose[48, 20, 20] - 100.0 / 0.3) < 1e-6 and abs(dose[20, 20, 20] - 100.0 / 1.05) < 1e-6
-        assert info["regions"][0]["shape"][0] > info["shape"][0]   # longer ranges in the lungs
+        lungs[20:] = True
+        big[lungs] *= 1.05 / 0.3
+        dose, info = DK.applyDoseMethod(big, (4.0, 4.0, 4.0), DK.METHOD_VOXEL_S, densityGPerML=1.05, localMask=lungs)
+        assert np.array_equal(dose[lungs], big[lungs])                  # lungs: LDM
+        assert abs(dose[10, 15, 15] - 100.0 / 1.05) < 1e-6              # liver interior: as LDM
+        assert dose[19, 15, 15] < 100.0 / 1.05                         # the lungs do not spread into the liver
+        assert info["localDepositionVoxels"] == int(lungs.sum())
         self.delayDisplay("Absolute: voxel S dose OK")
 
     def test_categories(self):

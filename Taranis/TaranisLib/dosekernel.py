@@ -54,6 +54,17 @@ DEFAULT_NUCLIDE = NUCLIDE_Y90
 KERNEL_REFERENCE = ("Graves SA, Flynn RT, Hyer DE. Dose point kernels for 2,174 radionuclides. Med Phys. "
                     "2019;46(11):5284-5293. doi:10.1002/mp.13789. PMCID: PMC7685392.")
 KERNEL_REFERENCE_SHORT = "Graves et al., Med Phys 2019 (doi:10.1002/mp.13789)"
+# Density scaling / density correction of dose kernels and the lung in Y-90 radioembolization
+DENSITY_REFERENCES = [
+    "Woo MK, et al. The validity of the density scaling method in primary electron transport for photon and electron "
+    "beams. Med Phys. 1990;17(2):187.",
+    "Dieudonne A, et al. Study of the impact of tissue density heterogeneities on 3-dimensional abdominal dosimetry: "
+    "comparison between dose kernel convolution and direct Monte Carlo methods. J Nucl Med. 2013;54(2):236.",
+    "Mikell JK, et al. Comparing voxel-based absorbed dosimetry methods in tumors, liver, lung, and at the liver-lung "
+    "interface for 90Y microsphere selective internal radiation therapy. EJNMMI Phys. 2015;2:16.",
+    "Tiwari A, et al. The impact of tissue type and density on dose point kernels for patient-specific voxel-wise "
+    "dosimetry: a Monte Carlo investigation. Radiat Res. 2020;193(6):531.",
+]
 
 # -- Kernel construction ------------------------------------------------------------------------------------------------
 
@@ -195,72 +206,34 @@ def convolveSame(values, kernel):
     return result
 
 
-def _regionList(regions, shape):
-    """[(mask, density, name)] of the non-empty regions; they must not overlap."""
-    result = []
-    used = np.zeros(shape, dtype=bool)
-    for region in regions or ():
-        mask, density = region[0], float(region[1])
-        name = region[2] if len(region) > 2 else f"region {len(result) + 1}"
-        if mask.shape != tuple(shape):
-            raise ValueError(f"The mask of {name} does not have the shape of the dose map.")
-        if not (density > 0 and np.isfinite(density)):
-            raise ValueError(f"Invalid density {density} g/mL for {name}.")
-        if not mask.any():
-            continue
-        if np.any(used & mask):
-            raise ValueError("Density regions must not overlap.")
-        used |= mask
-        result.append((mask, density, name))
-    return result
-
-
-def voxelSDoseMap(ldmDose, spacingXYZ, nuclide=DEFAULT_NUCLIDE, densityGPerML=1.0, regions=(),
+def voxelSDoseMap(ldmDose, spacingXYZ, nuclide=DEFAULT_NUCLIDE, densityGPerML=1.0, localMask=None,
                   samples=KERNEL_SAMPLES, seed=KERNEL_SEED):
-    """(voxel S dose map, kernel info) from an LDM dose map (numpy z, y, x) calculated with densityGPerML for every
-    voxel (dose x density = energy per volume), and the volume's GetSpacing().
+    """(voxel S dose map, kernel info) from an LDM dose map (numpy z, y, x) and the volume's GetSpacing(). The kernel
+    is scaled to densityGPerML, the density the LDM map was calculated with (energy / (density x volume)).
 
-    regions: [(mask, density[, name])], e.g. the lungs in absolute mode. The decays in a region spread with a kernel
-    scaled to its density, all other decays with the kernel of densityGPerML; the energy absorbed in a voxel is then
-    divided by its own mass (the region's density inside a region). The total energy is conserved. Electrons that
-    cross a region boundary keep the range of the tissue they started in (approximation at interfaces)."""
+    localMask: voxels kept at local deposition, e.g. the lungs in absolute mode (their own density already applied in
+    ldmDose): their decays are not spread and their dose is the LDM dose. Energy of the other decays that would
+    reach them is left out (a few mm at the interface)."""
     ldmDose = np.asarray(ldmDose, dtype=np.float64)
-    regionList = _regionList(regions, ldmDose.shape)
     kernel, info = kernelForSpacing(spacingXYZ, nuclide, densityGPerML, samples=samples, seed=seed)
-    if not regionList:
+    if localMask is None or not np.any(localMask):
         return convolveSame(ldmDose, kernel), info
-    inRegion = np.zeros(ldmDose.shape, dtype=bool)
-    for mask, _, _ in regionList:
-        inRegion |= mask
-    dose = convolveSame(np.where(inRegion, 0.0, ldmDose), kernel)
-    info["regions"] = []
-    for mask, density, name in regionList:
-        regionKernel, regionInfo = kernelForSpacing(spacingXYZ, nuclide, density, samples=samples, seed=seed)
-        dose += convolveSame(np.where(mask, ldmDose, 0.0), regionKernel)
-        regionInfo["name"] = name
-        info["regions"].append(regionInfo)
-    for mask, density, _ in regionList:
-        dose[mask] *= densityGPerML / density   # energy / region mass
+    if localMask.shape != ldmDose.shape:
+        raise ValueError("The local deposition mask does not have the shape of the dose map.")
+    dose = convolveSame(np.where(localMask, 0.0, ldmDose), kernel)
+    dose[localMask] = ldmDose[localMask]
+    info["localDepositionVoxels"] = int(np.count_nonzero(localMask))
     return dose, info
 
 
-def applyDoseMethod(ldmDose, spacingXYZ, method, nuclide=DEFAULT_NUCLIDE, densityGPerML=1.0, regions=()):
-    """(dose map, kernel info or None) of the method from an LDM map calculated with densityGPerML everywhere.
-
-    regions: [(mask, density[, name])] with their own density (e.g. the lungs, absolute mode). LDM: the region voxels
-    are rescaled to their density (a copy; the LDM map itself is returned when there are no regions). Voxel S: see
-    voxelSDoseMap. The input map is never modified."""
+def applyDoseMethod(ldmDose, spacingXYZ, method, nuclide=DEFAULT_NUCLIDE, densityGPerML=1.0, localMask=None):
+    """(dose map, kernel info or None): the LDM map itself for LDM, voxelSDoseMap for voxel S. The input map is never
+    modified."""
     if method == METHOD_VOXEL_S:
-        return voxelSDoseMap(ldmDose, spacingXYZ, nuclide, densityGPerML, regions)
+        return voxelSDoseMap(ldmDose, spacingXYZ, nuclide, densityGPerML, localMask)
     if method != METHOD_LDM:
         raise ValueError(f"Unknown dose calculation method '{method}'.")
-    regionList = _regionList(regions, np.shape(ldmDose))
-    if not regionList:
-        return ldmDose, None
-    dose = np.array(ldmDose, dtype=np.float64)
-    for mask, density, _ in regionList:
-        dose[mask] *= densityGPerML / density
-    return dose, None
+    return ldmDose, None
 
 
 def energyOutsideFraction(doseArray, mask):
@@ -294,20 +267,19 @@ def voxelSDescription(nuclide=DEFAULT_NUCLIDE, samples=KERNEL_SAMPLES, radiusMM=
         f"resampled) from the {label} dose point kernel in water: {samples:,} simulated decays at random positions "
         f"in one voxel, the distance drawn from the energy deposited in each 0.1 mm shell, a random direction; fixed "
         f"random seed (reproducible), mirror-averaged, truncated at {radiusMM:g} mm (in water) and normalised to 1 "
-        f"(total energy as in LDM). The kernel is scaled to the tissue density: ranges are inversely proportional to "
-        f"the density, so it is built for voxels 'voxel size x density' large (liver density for all voxels; in "
-        f"absolute mode with lung segments, the decays in the lungs use a second kernel scaled to the lung density, "
-        f"about 3 times longer ranges). The energy absorbed in a voxel is divided by that voxel's mass. The "
-        f"conversion factor and the half-life are locked to the {label} values.")
+        f"(total energy as in LDM). Density: electron ranges are inversely proportional to the density, so the kernel "
+        f"is scaled to the liver density (built for voxels 'voxel size x density' large) and the energy absorbed in "
+        f"a voxel is divided by its mass. Lungs (absolute mode, lung segments): local deposition with the lung "
+        f"density, as in LDM. The conversion factor and the half-life are locked to the {label} values.")
 
 
 VOXEL_S_WARNINGS = [
     "Experimental: not validated for clinical use. Published dose thresholds were mostly derived with LDM or the "
     "partition model: compare with an LDM calculation.",
-    "Lungs (absolute mode, lung segments): the mean lung dose is reliable (energy absorbed in the lungs / lung mass), "
-    "but doses within a few cm of the liver-lung interface are approximate: electrons crossing the boundary keep the "
-    "range of the tissue they started in, and the image blur and breathing at the dome matter even more. "
-    "Patient-relative mode does not calculate the lungs (lung dose from the lung shunt, as before).",
+    "Lungs are not calculated with the voxel S method: local deposition (LDM) with the lung density in absolute mode "
+    "(lung segments), lung dose from the lung shunt in patient-relative mode. A single kernel cannot follow electrons "
+    "across the liver-lung interface, and lung uptake on post-treatment images is usually diffuse and dominated by "
+    "noise, breathing and spill-over from the liver dome.",
     "Patient-relative mode: energy spreads up to about 11 mm beyond the perfused volumes, so their mean doses are "
     "lower than with LDM / the partition model, most in small (e.g. segmental) volumes.",
     "Voxel S does not correct the SPECT/PET blur (partial volume effect), which is usually wider than the beta range.",
@@ -323,9 +295,10 @@ def methodDescriptionHtml(method, nuclide=DEFAULT_NUCLIDE):
     if method != METHOD_VOXEL_S:
         return _html(LDM_DESCRIPTION)
     items = "".join(f"<li>{_html(w)}</li>" for w in VOXEL_S_WARNINGS)
+    density = "".join(f"<br>&bull; {_html(r)}" for r in DENSITY_REFERENCES)
     return (f"{_html(voxelSDescription(nuclide))}"
             f"<ul style='margin-top:4px; margin-bottom:4px; color:#d97706;'>{items}</ul>"
-            f"<i>Kernel data: {_html(KERNEL_REFERENCE)}</i>")
+            f"<i>Kernel data: {_html(KERNEL_REFERENCE)}<br>Density scaling and correction:{density}</i>")
 
 
 def reportParameters(method, nuclide=DEFAULT_NUCLIDE, info=None):
@@ -336,8 +309,8 @@ def reportParameters(method, nuclide=DEFAULT_NUCLIDE, info=None):
         rows.append(("Dose point kernel", f"{label} beta, water ({KERNEL_REFERENCE_SHORT})"))
         if info:
             rows.append(("Voxel S kernel", _kernelText(info)))
-            for regionInfo in info.get("regions", []):
-                rows.append((f"Voxel S kernel ({regionInfo.get('name', 'region')} sources)", _kernelText(regionInfo)))
+            if info.get("localDepositionVoxels"):
+                rows.append(("Lungs", "local deposition with the lung density (voxel S not applied)"))
     return rows
 
 
@@ -355,4 +328,5 @@ def reportLines(method, nuclide=DEFAULT_NUCLIDE):
     if method != METHOD_VOXEL_S:
         return [LDM_DESCRIPTION]
     return ([voxelSDescription(nuclide)] + [f"Caution: {w}" for w in VOXEL_S_WARNINGS]
-            + [f"Kernel data: {KERNEL_REFERENCE}"])
+            + [f"Kernel data: {KERNEL_REFERENCE}"]
+            + [f"Density scaling and correction: {r}" for r in DENSITY_REFERENCES])

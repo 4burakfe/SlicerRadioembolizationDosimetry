@@ -129,54 +129,37 @@ class DensityScalingTest(unittest.TestCase):
             self.assertAlmostEqual(info["radiusMM"], DK.KERNEL_RADIUS_MM / rho)
             self.assertEqual(info["spacingXYZ"], (4.0, 4.0, 3.0))
 
-    def test_lung_kernel_is_wider(self):
+    def test_lower_density_wider_kernel(self):
         liver, liverInfo = DK.kernelForSpacing((4.42,) * 3, densityGPerML=1.05, samples=FAST)
-        lung, lungInfo = DK.kernelForSpacing((4.42,) * 3, densityGPerML=0.3, samples=FAST)
-        self.assertEqual(lung.shape, (19, 19, 19))                    # about 37 mm reach in lung
-        self.assertAlmostEqual(lungInfo["selfFraction"], 0.13, delta=0.01)
+        low, lowInfo = DK.kernelForSpacing((4.42,) * 3, densityGPerML=0.3, samples=FAST)
+        self.assertEqual(low.shape, (19, 19, 19))                    # about 37 mm reach at 0.3 g/mL
         self.assertAlmostEqual(liverInfo["selfFraction"], 0.416, delta=0.01)
+        self.assertLess(lowInfo["selfFraction"], liverInfo["selfFraction"])
         with self.assertRaises(ValueError):
             DK.kernelForSpacing((4.0, 4.0, 4.0), densityGPerML=0.0)
 
-    def test_two_density_regions(self):
-        """Absolute mode with lungs: lung decays spread with the lung kernel, the rest with the liver kernel; each
-        voxel's energy is divided by its own mass. Uniform activity: LDM of each tissue far from the interface, total
-        energy conserved."""
-        liverDensity, lungDensity = 1.05, 0.3
-        concentration = np.zeros((90, 50, 50))   # margins wider than the lung range (37 mm): no energy lost
-        concentration[12:78, 12:38, 12:38] = 1.0
-        lung = np.zeros(concentration.shape, bool)
-        lung[45:, :, :] = True
-        ldm = concentration * 100.0 / liverDensity           # LDM map with the liver density everywhere
-        expectedLdm = ldm.copy()
-        expectedLdm[lung] *= liverDensity / lungDensity
-        spacing = (4.0, 4.0, 4.0)
-        dose, info = DK.voxelSDoseMap(ldm, spacing, densityGPerML=liverDensity,
-                                      regions=[(lung, lungDensity, "lungs")], samples=FAST)
-        density = np.where(lung, lungDensity, liverDensity)
-        self.assertAlmostEqual((dose * density).sum(), (ldm * liverDensity).sum(), delta=1e-9 * ldm.sum())
-        self.assertAlmostEqual(dose[28, 25, 25], expectedLdm[28, 25, 25], places=6)   # liver, > 11 mm from edges
-        self.assertAlmostEqual(dose[61, 25, 25], expectedLdm[61, 25, 25], places=6)   # lung, > 37 mm from edges
-        # near the interface the lung decays reach further into the liver than the liver decays into the lung
-        self.assertGreater(dose[40, 25, 25], 0.0)
-        self.assertEqual([r["name"] for r in info["regions"]], ["lungs"])
-        ldmDose, none = DK.applyDoseMethod(ldm, spacing, DK.METHOD_LDM, densityGPerML=liverDensity,
-                                           regions=[(lung, lungDensity)])
-        self.assertIsNone(none)
-        self.assertTrue(np.allclose(ldmDose, expectedLdm))
-        self.assertEqual(ldm[61, 25, 25], 100.0 / liverDensity)   # input unchanged
+    def test_lungs_local_deposition(self):
+        """Absolute mode with lungs: lung voxels keep the LDM dose (lung density), lung decays are not spread, the
+        rest is convolved with the liver kernel."""
+        ldm = np.zeros((50, 30, 30))
+        ldm[5:45, 5:25, 5:25] = 100.0 / 1.05
+        lungs = np.zeros(ldm.shape, bool)
+        lungs[25:] = True
+        ldm[lungs] *= 1.05 / 0.3                              # the caller applies the lung density (as for LDM)
+        before = ldm.copy()
+        dose, info = DK.voxelSDoseMap(ldm, (4.0, 4.0, 4.0), densityGPerML=1.05, localMask=lungs, samples=FAST)
+        self.assertTrue(np.array_equal(dose[lungs], ldm[lungs]))
+        self.assertAlmostEqual(dose[12, 15, 15], 100.0 / 1.05, places=6)   # liver, > 11 mm from the edges
+        self.assertLess(dose[24, 15, 15], 100.0 / 1.05)                  # nothing comes back from the lungs
+        self.assertEqual(info["localDepositionVoxels"], int(lungs.sum()))
+        self.assertTrue(np.array_equal(ldm, before))                     # input unchanged
         rows = dict(DK.reportParameters(DK.METHOD_VOXEL_S, DK.NUCLIDE_Y90, info))
-        self.assertIn("density 0.30 g/mL", rows["Voxel S kernel (lungs sources)"])
+        self.assertIn("local deposition", rows["Lungs"])
         self.assertIn("density 1.05 g/mL", rows["Voxel S kernel"])
-
-    def test_overlapping_regions_rejected(self):
-        a = np.zeros((5, 5, 5), bool)
-        a[:3] = True
-        b = np.zeros((5, 5, 5), bool)
-        b[2:] = True
+        same, _ = DK.applyDoseMethod(ldm, (4.0,) * 3, DK.METHOD_LDM, densityGPerML=1.05, localMask=lungs)
+        self.assertIs(same, ldm)
         with self.assertRaises(ValueError):
-            DK.applyDoseMethod(np.ones((5, 5, 5)), (4.0,) * 3, DK.METHOD_LDM, densityGPerML=1.05,
-                               regions=[(a, 0.3), (b, 0.5)])
+            DK.voxelSDoseMap(ldm, (4.0,) * 3, localMask=np.ones((2, 2, 2), bool), samples=1000)
 
 
 class ConvolutionTest(unittest.TestCase):
@@ -246,6 +229,8 @@ class TextsTest(unittest.TestCase):
         lines = DK.reportLines(DK.METHOD_VOXEL_S)
         self.assertIn("4,000,000", lines[0])
         self.assertTrue(any("10.1002/mp.13789" in line for line in lines))
+        self.assertEqual(sum(line.startswith("Density scaling and correction:") for line in lines), 4)
+        self.assertIn("Mikell", DK.methodDescriptionHtml(DK.METHOD_VOXEL_S))
         self.assertEqual(DK.reportLines(DK.METHOD_LDM), [DK.LDM_DESCRIPTION])
         self.assertIn("EXPERIMENTAL", DK.methodDescriptionHtml(DK.METHOD_VOXEL_S))
         self.assertNotIn("<li>", DK.methodDescriptionHtml(DK.METHOD_LDM))
@@ -272,10 +257,11 @@ class VoxelSChecksTest(unittest.TestCase):
 
     def test_lung_note_in_absolute_mode(self):
         issues = DG.doseChecks([], DG.GLASS, lungDosesGy=[("'Lungs'", 5.0)], voxelS=True)
-        self.assertTrue(any(s == W.SEVERITY_INFO and "scaled to the lung density" in t for s, t in issues))
+        self.assertTrue(any(s == W.SEVERITY_INFO and "local deposition (LDM) and the lung density" in t
+                            for s, t in issues))
         relative = DG.doseChecks([], DG.GLASS, lungDosesGy=[("Estimated lung dose", 5.0)], relative=True,
                                  voxelS=True)
-        self.assertFalse(any("lung density" in t for _, t in relative))   # lungs not calculated
+        self.assertFalse(any("lung segments" in t for _, t in relative))   # lungs not calculated
 
 
 if __name__ == "__main__":

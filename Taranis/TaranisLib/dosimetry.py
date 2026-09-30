@@ -779,9 +779,28 @@ def voxelVolumeMLFromNode(volumeNode):
 from .memory import removeTemporaryLabelmap, collectSoon   # noqa: E402  (Slicer-only helpers)
 
 
+def segmentIsEmpty(segmentationNode, segmentID):
+    """True for an existing segment without any voxel (e.g. added but never painted). Exporting such a segment onto
+    an image grid fails, which used to stop the whole dose calculation."""
+    segment = segmentationNode.GetSegmentation().GetSegment(segmentID)
+    if segment is None:
+        return False   # a missing segment is a different error: reported by the export
+    try:
+        return not segmentVolumeML(segmentationNode, segmentID)   # None (no labelmap data) or 0 voxels
+    except Exception as e:
+        logging.warning(f"Could not check whether segment '{segment.GetName()}' is empty: {e}")
+        return False
+
+
 def segmentMaskOnVolumeGrid(segmentationNode, segmentID, referenceVolumeNode):
     """Boolean numpy mask of one segment resampled onto the reference volume grid.
+    An empty segment gives an all-False mask (it is then reported as having no voxels, dose n/a).
     The temporary labelmap node is always removed, even if export fails."""
+    if segmentIsEmpty(segmentationNode, segmentID):
+        name = segmentationNode.GetSegmentation().GetSegment(segmentID).GetName()
+        logging.warning(f"Segment '{name}' is empty: it has no voxels on the image grid.")
+        dimensions = referenceVolumeNode.GetImageData().GetDimensions()   # (i, j, k)
+        return np.zeros(tuple(reversed(dimensions)), dtype=bool)          # numpy (k, j, i), as arrayFromVolume
     labelmapNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLabelMapVolumeNode")
     labelmapNode.SetHideFromEditors(True)
     try:
@@ -2862,12 +2881,12 @@ class DosimetryLogicBase(ScriptedLoadableModuleLogic):
         self.preferredLayoutID = RESULTS_LAYOUT_ID  # results layout used when none is shown (set by the GUI)
 
     @staticmethod
-    def applyDoseMethod(ldmDoseArray, volumeNode, method, nuclide=DK.DEFAULT_NUCLIDE, densityGPerML=1.0, regions=()):
-        """(dose array, kernel info or None) of the chosen method from the LDM dose map on volumeNode's grid,
-        calculated with densityGPerML for every voxel. regions: [(mask, density, name)] with their own density (the
-        lungs in absolute mode). Voxel S (experimental): convolution with kernels built now for the volume's voxel
-        spacing and scaled to the tissue densities (see dosekernel.voxelSDoseMap)."""
-        return DK.applyDoseMethod(ldmDoseArray, volumeNode.GetSpacing(), method, nuclide, densityGPerML, regions)
+    def applyDoseMethod(ldmDoseArray, volumeNode, method, nuclide=DK.DEFAULT_NUCLIDE, densityGPerML=1.0,
+                        localMask=None):
+        """(dose array, kernel info or None) of the chosen method from the LDM dose map on volumeNode's grid.
+        Voxel S (experimental): convolution with a kernel built now for the volume's voxel spacing, scaled to
+        densityGPerML (liver). localMask: voxels kept at local deposition (the lungs in absolute mode)."""
+        return DK.applyDoseMethod(ldmDoseArray, volumeNode.GetSpacing(), method, nuclide, densityGPerML, localMask)
 
     def setupResultsLayout(self, layoutID=None, placeSecondaryWindow=False):
         """Switch to a results layout: single monitor (3x2) or dual monitor. Default: the results layout already
@@ -3561,6 +3580,7 @@ __all__ = [
     "writePdfReport",
     "segmentVolumeML",
     "voxelVolumeMLFromNode",
+    "segmentIsEmpty",
     "segmentMaskOnVolumeGrid",
     "segmentLabelText",
     "_volumeDisplayNode",
