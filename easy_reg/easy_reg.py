@@ -12,9 +12,10 @@ from slicer.ScriptedLoadableModule import *
 from slicer.util import VTKObservationMixin
 
 from EasyRegLib import functional as F
+from EasyRegLib import sitkreg as SR
 
 
-MODULE_VERSION = "2.0"
+MODULE_VERSION = "2.1"
 
 # (name, BRAINSFit transformType chain, result is linear, description)
 # Each chain starts with the simpler stages, so the later stages start from a good alignment.
@@ -50,13 +51,46 @@ FUNCTIONAL_VIEWS = [("Reference", "reference", None), ("SPECT / PET", "spect", N
 def isRigidMethod(method):
     return bool(method) and not any(name in method for name in NON_RIGID_METHODS)
 
-# (label, BRAINSFit samplingPercentage)
+# (label, BRAINSFit samplingPercentage). The multi-resolution engine uses the same labels with a fixed number of
+# metric samples per level (sitkreg.QUALITY_SAMPLES).
 QUALITY_PRESETS = [("Fast", 0.002), ("Standard", 0.01), ("Thorough", 0.05)]
-# (label, BRAINSFit initializeTransformMode)
+INIT_SEARCH_MODE = "search"
+# (label, BRAINSFit initializeTransformMode or INIT_SEARCH_MODE)
 INITIALIZATION_MODES = [
     ("Align centres of the images / ROIs", "useGeometryAlign"),
     ("Keep current position", "Off"),
+    ("Search head-feet position (scans of different length)", INIT_SEARCH_MODE),
 ]
+
+# Registration engines
+ENGINE_MULTIRES = "multires"
+ENGINE_BRAINSFIT = "brainsfit"
+ENGINES = [
+    (ENGINE_MULTIRES, "Multi-resolution (SimpleITK)",
+     "Coarse to fine (about 16, 8, 4 ... mm down to the final resolution), CT values clipped, fixed random seed "
+     "(same result every time), and the result is kept only if it improves the match. Runs inside Slicer: the "
+     "window is busy while it runs (progress below, Cancel works)."),
+    (ENGINE_BRAINSFIT, "Classic (BRAINSFit)",
+     "The previous engine: one resolution, runs in the background. Kept for comparison."),
+]
+DEFAULT_ENGINE = ENGINE_MULTIRES
+ENGINE_ATTRIBUTE = "EasyReg.Engine"                   # engine that made a registration transform
+FINAL_SPACING_ATTRIBUTE = "EasyReg.FinalSpacingMm"    # final resolution of a multi-resolution registration
+METRIC_ATTRIBUTE = "EasyReg.Metric"                   # "initial final" mutual information (multi-resolution)
+PROGRESS_INTERVAL_S = 0.1                              # the window is refreshed at most this often while registering
+
+
+def qualityLabelFor(samplingPercentage):
+    """Quality label whose BRAINSFit sampling percentage is closest to samplingPercentage."""
+    return min(QUALITY_PRESETS, key=lambda preset: abs(preset[1] - samplingPercentage))[0]
+
+
+def qualityText(label, engine):
+    if engine == ENGINE_MULTIRES:
+        return f"{label} ({SR.QUALITY_SAMPLES[label] // 1000}k samples per level)"
+    return f"{label} ({100 * dict(QUALITY_PRESETS)[label]:g}% of voxels sampled)"
+
+
 OVERLAY_CT_COLORMAP = "Inferno"
 SPECT_COLORMAP = "Inferno"  # SPECT/PET in the fusion views
 
@@ -95,10 +129,14 @@ INFO_TEXT = (
     "Registers a SPECT/CT (or PET/CT) to a diagnostic CT or MRI.\n"
     "1. Select the CT of the SPECT/CT (moving image), the SPECT itself and the reference CT/MRI (fixed image). "
     "The SPECT, and optionally a segmentation made on the SPECT/CT, follow the CT.\n"
-    "2. Optional but recommended: create an ROI around the liver in each image. Only temporary copies are "
+    "2. Optional: create an ROI around the liver in each image. Only temporary copies are "
     "cropped for the registration; your images are never modified.\n"
-    "3. Choose the method and press Register. If the CT already has a transform (a previous rigid run or a "
-    "manual pre-alignment), the registration starts from it.\n"
+    "3. Choose the engine, the method, the quality and (multi-resolution engine) the final resolution, then press "
+    "Register. The multi-resolution engine (default) registers coarse to fine, from about 16 mm down to the final "
+    "resolution (2 mm recommended for SPECT/CT; 1 mm for CBCT or small ROIs), and keeps the result only if it "
+    "improves the match. For scans of different length choose the start position 'Search head-feet position'. "
+    "The Classic (BRAINSFit) engine is kept for comparison. If the CT already has a transform (a previous rigid "
+    "run or a manual pre-alignment), the registration starts from it.\n"
     "4. After registration the views switch to a 4x2 fusion layout (axial top, coronal bottom): SPECT on "
     "its CT, SPECT on reference, reference only, SPECT/CT CT (inferno) on reference. Scrolling, zooming and "
     "panning are synchronised within each row. Evaluate the alignment (liver dome, liver edges, spine, "
@@ -669,7 +707,8 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         # ---- 2. Registration region ----
         regionBox = ctk.ctkCollapsibleButton()
-        regionBox.text = "2. Registration region (optional, recommended)"
+        regionBox.text = "2. Registration region (optional)"
+        regionBox.collapsed = True
         self.layout.addWidget(regionBox)
         regionLayout = qt.QFormLayout(regionBox)
         regionInfo = qt.QLabel(
@@ -701,6 +740,9 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.registerBox = registerBox
         registerLayout = qt.QFormLayout(registerBox)
 
+        self.engineComboBox = self._makeEngineComboBox()
+        registerLayout.addRow("Engine: ", self.engineComboBox)
+
         self.methodGroup = qt.QButtonGroup()
         self.methodButtons = {}
         methodColumn = qt.QVBoxLayout()
@@ -714,10 +756,14 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         registerLayout.addRow("Method: ", methodColumn)
 
         self.qualityComboBox = qt.QComboBox()
-        for label, percentage in QUALITY_PRESETS:
-            self.qualityComboBox.addItem(f"{label} ({100 * percentage:g}% of voxels sampled)", label)
+        for label, _ in QUALITY_PRESETS:
+            self.qualityComboBox.addItem(label, label)
         self.qualityComboBox.setToolTip("More samples are more robust but slower.")
         registerLayout.addRow("Quality: ", self.qualityComboBox)
+
+        self.finalSpacingComboBox = self._makeFinalSpacingComboBox()
+        self.finalSpacingLabel = qt.QLabel("Final resolution: ")
+        registerLayout.addRow(self.finalSpacingLabel, self.finalSpacingComboBox)
 
         self.initializationComboBox = qt.QComboBox()
         for label, mode in INITIALIZATION_MODES:
@@ -726,8 +772,12 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             "Starting position when the CT has no transform yet.\n"
             "Align centres: works well when both images (or both ROIs) cover the same region.\n"
             "Keep current position: use when the images are already roughly aligned.\n"
+            "Search head-feet position (multi-resolution engine): the image centres are aligned, then head-feet "
+            "positions over +-20 cm (and left-right / anterior-posterior over +-3 cm) are compared on 8 mm images and "
+            "the best one is the start. For scans of different length, e.g. an abdominal SPECT/CT and a "
+            "chest-abdomen-pelvis CT.\n"
             "If the CT already has a transform (previous registration or manual pre-alignment in the "
-            "Transforms module), the registration always starts from it.")
+            "Transforms module), the registration starts from it (the search is then made around it).")
         registerLayout.addRow("Start position: ", self.initializationComboBox)
 
         self.hardenRigidCheckBox = qt.QCheckBox("Harden rigid result automatically")
@@ -831,11 +881,16 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.maskMarginSpinBox.value = DEFAULT_MASK_MARGIN_MM
         self.maskMarginSpinBox.setToolTip("The liver segment is grown by this margin; only this region is compared.")
         refineLayout.addRow("Liver mask margin: ", self.maskMarginSpinBox)
+        self.refineEngineComboBox = self._makeEngineComboBox()
+        refineLayout.addRow("Engine: ", self.refineEngineComboBox)
         self.refineQualityComboBox = qt.QComboBox()
-        for label, percentage in QUALITY_PRESETS:
-            self.refineQualityComboBox.addItem(f"{label} ({100 * percentage:g}% of voxels sampled)", label)
+        for label, _ in QUALITY_PRESETS:
+            self.refineQualityComboBox.addItem(label, label)
         self.refineQualityComboBox.setCurrentIndex(len(QUALITY_PRESETS) - 1)
         refineLayout.addRow("Quality: ", self.refineQualityComboBox)
+        self.refineFinalSpacingComboBox = self._makeFinalSpacingComboBox()
+        self.refineFinalSpacingLabel = qt.QLabel("Final resolution: ")
+        refineLayout.addRow(self.refineFinalSpacingLabel, self.refineFinalSpacingComboBox)
         refineButtons = qt.QHBoxLayout()
         self.refineButton = qt.QPushButton("Refine rigidly inside the liver")
         self.refineButton.setToolTip(
@@ -922,6 +977,11 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.showReferenceButton.connect("clicked()", self.showReference)
         self.methodGroup.connect("buttonClicked(QAbstractButton*)", self.updateParameterNodeFromGUI)
         self.qualityComboBox.connect("currentIndexChanged(int)", self.updateParameterNodeFromGUI)
+        self.finalSpacingComboBox.connect("currentIndexChanged(int)", self.updateParameterNodeFromGUI)
+        self.refineFinalSpacingComboBox.connect("currentIndexChanged(int)", self.updateParameterNodeFromGUI)
+        self.refineQualityComboBox.connect("currentIndexChanged(int)", self.updateParameterNodeFromGUI)
+        for comboBox in (self.engineComboBox, self.refineEngineComboBox):
+            comboBox.connect("currentIndexChanged(int)", lambda index, comboBox=comboBox: self.onEngineChanged(comboBox))
         self.initializationComboBox.connect("currentIndexChanged(int)", self.updateParameterNodeFromGUI)
         self.hardenRigidCheckBox.connect("toggled(bool)", self.updateParameterNodeFromGUI)
         self.registerButton.connect("clicked()", self.onRegisterButton)
@@ -953,6 +1013,63 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.addObserver(slicer.mrmlScene, slicer.mrmlScene.StartCloseEvent, self.onSceneStartClose)
         self.addObserver(slicer.mrmlScene, slicer.mrmlScene.EndCloseEvent, self.onSceneEndClose)
         self.initializeParameterNode()
+
+    @staticmethod
+    def _makeEngineComboBox():
+        comboBox = qt.QComboBox()
+        for index, (key, label, toolTip) in enumerate(ENGINES):
+            comboBox.addItem(label, key)
+            comboBox.setItemData(index, toolTip, qt.Qt.ToolTipRole)
+        comboBox.setToolTip("\n\n".join(f"{label}: {toolTip}" for _, label, toolTip in ENGINES))
+        return comboBox
+
+    @staticmethod
+    def _makeFinalSpacingComboBox():
+        comboBox = qt.QComboBox()
+        for label, spacing in SR.FINAL_SPACING_CHOICES:
+            comboBox.addItem(label, f"{spacing:g}")
+        comboBox.setCurrentIndex(comboBox.findData(f"{SR.DEFAULT_FINAL_SPACING_MM:g}"))
+        comboBox.setToolTip(
+            "Voxel size of the last (finest) step of the multi-resolution registration; the steps before it run at "
+            "about 16, 8, 4 ... mm.\n"
+            "4 mm: fastest, enough for whole-body PET/CT and a first alignment.\n"
+            "2 mm: recommended for SPECT/CT to a diagnostic CT/MRI (the SPECT voxels are about 4-5 mm).\n"
+            "1 mm: for CBCT or small ROIs around the liver. Without ROIs the resolution is coarsened automatically "
+            "when the images would not fit in memory.\n"
+            "A finer final step does not make a SPECT/PET sharper: an image is never resampled below its own voxel "
+            "size. The run time depends little on it (a fixed number of samples per step).")
+        return comboBox
+
+    def currentEngine(self):
+        return self.engineComboBox.currentData or DEFAULT_ENGINE
+
+    def onEngineChanged(self, comboBox):
+        if self._updatingGUI:
+            return
+        other = self.refineEngineComboBox if comboBox is self.engineComboBox else self.engineComboBox
+        wasBlocked = other.blockSignals(True)
+        other.setCurrentIndex(other.findData(comboBox.currentData))
+        other.blockSignals(wasBlocked)
+        self.updateParameterNodeFromGUI()
+
+    def _refreshEngineWidgets(self):
+        engine = self.currentEngine()
+        multires = engine == ENGINE_MULTIRES
+        for comboBox in (self.qualityComboBox, self.refineQualityComboBox):
+            for index in range(comboBox.count):
+                comboBox.setItemText(index, qualityText(comboBox.itemData(index), engine))
+        for widget in (self.finalSpacingComboBox, self.finalSpacingLabel, self.refineFinalSpacingComboBox,
+                       self.refineFinalSpacingLabel):
+            widget.enabled = multires
+        searchIndex = self.initializationComboBox.findData(INIT_SEARCH_MODE)
+        try:   # grey out the search for BRAINSFit (QStandardItemModel of the combo box)
+            item = self.initializationComboBox.model().item(searchIndex) if searchIndex >= 0 else None
+            if item is not None:
+                item.setEnabled(multires)
+        except AttributeError:
+            pass   # not greyed out; BRAINSFit replaces the search by 'Align centres' anyway
+        if not multires and self.initializationComboBox.currentData == INIT_SEARCH_MODE:
+            self.initializationComboBox.setCurrentIndex(self.initializationComboBox.findData("useGeometryAlign"))
 
     def _makeNodeSelector(self, nodeType, toolTip, allowNone=False, allowCreate=False):
         selector = slicer.qMRMLNodeComboBox()
@@ -1005,8 +1122,13 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def cleanup(self):
         self.logic.cancel()
+        self._hideHandles()
         self.sliceSync.clear()
         self.removeObservers()
+
+    def exit(self):
+        # the move / rotate handles belong to EasyReg: do not leave them in the views of other modules
+        self._hideHandles()
 
     def enter(self):
         self.initializeParameterNode()
@@ -1023,6 +1145,7 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def onSceneStartClose(self, caller, event):
         self.logic.cancel()
+        self._hideHandles()
         self.sliceSync.clear()
         self.setParameterNode(None)
 
@@ -1072,6 +1195,12 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.movingLandmarksPlace.setCurrentNode(p.GetNodeReference("LandmarksMoving"))
             self._setComboData(self.qualityComboBox, p.GetParameter("Quality"))
             self._setComboData(self.initializationComboBox, p.GetParameter("Initialization"))
+            for comboBox in (self.engineComboBox, self.refineEngineComboBox):
+                self._setComboData(comboBox, p.GetParameter("Engine"))
+            self._setComboData(self.finalSpacingComboBox, p.GetParameter("FinalSpacing"))
+            self._setComboData(self.refineFinalSpacingComboBox, p.GetParameter("RefineFinalSpacing"))
+            self._setComboData(self.refineQualityComboBox, p.GetParameter("RefineQuality"))
+            self._refreshEngineWidgets()
             self.hardenRigidCheckBox.setChecked(p.GetParameter("HardenRigid") == "true")
         finally:
             self._updatingGUI = False
@@ -1089,6 +1218,10 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             p.SetParameter("Method", self.currentMethod())
             p.SetParameter("Quality", self.qualityComboBox.currentData)
             p.SetParameter("Initialization", self.initializationComboBox.currentData)
+            p.SetParameter("Engine", self.currentEngine())
+            p.SetParameter("FinalSpacing", self.finalSpacingComboBox.currentData)
+            p.SetParameter("RefineFinalSpacing", self.refineFinalSpacingComboBox.currentData)
+            p.SetParameter("RefineQuality", self.refineQualityComboBox.currentData)
             p.SetParameter("HardenRigid", "true" if self.hardenRigidCheckBox.checked else "false")
             p.SetParameter("Path", self.currentPath())
             p.SetParameter("LiverSegmentID", self.liverSegmentComboBox.currentData or "")
@@ -1096,6 +1229,7 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             p.SetParameter("MaskMargin", str(self.maskMarginSpinBox.value))
         finally:
             p.EndModify(wasModified)
+        self._refreshEngineWidgets()
         self.updateButtonStates()
 
     @staticmethod
@@ -1313,6 +1447,31 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.showFusionLayout()
         self.updateButtonStates()
 
+    def _hideHandles(self):
+        """Turn the move / rotate handles off on every EasyReg transform and uncheck their button (after hardening,
+        undo, reset, a new registration, or when leaving the module)."""
+        for transformNode in slicer.util.getNodesByClass("vtkMRMLTransformNode"):
+            if transformNode.GetAttribute(TRANSFORM_ATTRIBUTE) != "1":
+                continue
+            display = transformNode.GetDisplayNode()
+            if display is None:
+                continue
+            if display.GetEditorVisibility():
+                display.SetEditorVisibility(False)
+            if hasattr(display, "GetEditorSliceIntersectionVisibility") and display.GetEditorSliceIntersectionVisibility():
+                display.SetEditorSliceIntersectionVisibility(False)
+        if self.handlesButton.checked:
+            wasBlocked = self.handlesButton.blockSignals(True)
+            self.handlesButton.checked = False
+            self.handlesButton.blockSignals(wasBlocked)
+
+    def _showLayoutAfterReset(self):
+        """After Undo / Reset: stay in EasyReg's layout, with the images back in their previous position."""
+        try:
+            self.showFusionLayout()
+        except Exception as e:
+            logging.warning(f"EasyReg: could not show the registration layout: {e}")
+
     def onTransformsModule(self):
         spect, reference = self._checkFunctionalInputs()
         if spect is None:
@@ -1339,17 +1498,32 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         try:
             self._refineCentre = self.logic.liverCentre(liverSegmentation, liverSegmentID, reference) \
                 if liverSegmentation is not None else None
-            self.logic.refineInLiver(
-                reference, spect, liverSegmentation, liverSegmentID, self.maskMarginSpinBox.value,
-                dict(QUALITY_PRESETS)[self.refineQualityComboBox.currentData],
-                followers=self._functionalFollowers(), onFinished=self.onRefineFinished)
         except (ValueError, RuntimeError) as error:
             slicer.util.errorDisplay(str(error))
             return
+        self._hideHandles()   # the refinement replaces the transform the handles are on
+        # progress display first: the multi-resolution engine runs (and finishes) inside the call
         self._startTime = time.time()
         self._statusPrefix = "Rigid refinement inside the liver running"
+        self._progressDetail = ""
         self._updateElapsed()
         self._elapsedTimer.start()
+        self.refineButton.enabled = False
+        self.refineCancelButton.enabled = True
+        try:
+            self.logic.refineInLiver(
+                reference, spect, liverSegmentation, liverSegmentID, self.maskMarginSpinBox.value,
+                dict(QUALITY_PRESETS)[self.refineQualityComboBox.currentData],
+                followers=self._functionalFollowers(), onFinished=self.onRefineFinished, engine=self.currentEngine(),
+                finalSpacingMm=float(self.refineFinalSpacingComboBox.currentData or SR.DEFAULT_FINAL_SPACING_MM),
+                quality=self.refineQualityComboBox.currentData, progress=self._onProgress)
+        except (ValueError, RuntimeError) as error:
+            self._elapsedTimer.stop()
+            self._startTime = None
+            self.functionalStatusLabel.text = ""
+            self.updateButtonStates()
+            slicer.util.errorDisplay(str(error))
+            return
         self.updateButtonStates()
 
     def onRefineFinished(self, result):
@@ -1367,7 +1541,7 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         transform = result["transform"]
         if self._parameterNode is not None:
             self._parameterNode.SetNodeReferenceID("Transform", transform.GetID())
-        text = f"Refinement completed{elapsed}."
+        text = f"Refinement completed{elapsed}." + (f" {result['message']}" if result.get("message") else "")
         warning = ""
         if transform.IsLinear():
             centre = self._refineCentre if self._refineCentre is not None else defaultRoiGeometry(
@@ -1440,6 +1614,7 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 f"Return the images to their original position? The current alignment ({method}) is removed.",
                 windowTitle="EasyReg"):
             return
+        self._hideHandles()
         with slicer.util.WaitCursor():
             restored = self.logic.undoRegistration(transform)
             removeOverlayVolumes()
@@ -1448,7 +1623,7 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self._parameterNode.SetNodeReferenceID("Transform", None)
         self.positionStatusLabel.text = ("Back to the original position: " + ", ".join(restored) + "."
                                          if restored else "EasyReg's transform removed.")
-        self.showSpectCT()
+        self._showLayoutAfterReset()
         self.updateButtonStates()
 
     def updateButtonStates(self):
@@ -1565,7 +1740,22 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             return
 
         method = self.currentMethod()
+        engine = self.currentEngine()
         startsFromTransform = spectCT.GetParentTransformNode() is not None
+        self._hideHandles()   # the registration replaces the transform the handles are on
+        # set up the progress display first: the multi-resolution engine runs (and finishes) inside the call
+        setRoiVisible(self.spectRoiSelector.currentNode(), False)
+        setRoiVisible(self.referenceRoiSelector.currentNode(), False)
+        self._startTime = time.time()
+        self._statusPrefix = f"{method} registration running"
+        if startsFromTransform:
+            self._statusPrefix += " (starting from the current transform of the CT)"
+        self._progressDetail = ""
+        self.progressBar.visible = True
+        self._updateElapsed()
+        self._elapsedTimer.start()
+        self.registerButton.enabled = False
+        self.cancelButton.enabled = True
         try:
             self.logic.startRegistration(
                 fixedVolume=reference, movingVolume=spectCT, method=method,
@@ -1574,30 +1764,40 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 fixedRoi=self.referenceRoiSelector.currentNode(), movingRoi=self.spectRoiSelector.currentNode(),
                 followers=[node for node in (spect, segmentation) if node is not None],
                 hardenRigid=self.hardenRigidCheckBox.checked,
-                onFinished=self.onRegistrationFinished)
+                onFinished=self.onRegistrationFinished, engine=engine,
+                finalSpacingMm=float(self.finalSpacingComboBox.currentData or SR.DEFAULT_FINAL_SPACING_MM),
+                quality=self.qualityComboBox.currentData, progress=self._onProgress)
         except (ValueError, RuntimeError) as error:
+            self._elapsedTimer.stop()
+            self._startTime = None
+            self.progressBar.visible = False
+            self.statusLabel.text = ""
+            self.updateButtonStates()
             slicer.util.errorDisplay(str(error))
             return
-
-        setRoiVisible(self.spectRoiSelector.currentNode(), False)
-        setRoiVisible(self.referenceRoiSelector.currentNode(), False)
-        self._startTime = time.time()
-        self._statusPrefix = f"{method} registration running"
-        if startsFromTransform:
-            self._statusPrefix += " (starting from the current transform of the CT)"
-        self.progressBar.visible = True
-        self._updateElapsed()
-        self._elapsedTimer.start()
         self.updateButtonStates()
 
     def _updateElapsed(self):
         if self._startTime is not None:
             label = self.functionalStatusLabel if self.isFunctional() else self.statusLabel
-            label.text = f"{self._statusPrefix}... {int(time.time() - self._startTime)} s"
+            detail = getattr(self, "_progressDetail", "")
+            label.text = (f"{self._statusPrefix}... {int(time.time() - self._startTime)} s"
+                          + (f"\n{detail}" if detail else ""))
+
+    def _onProgress(self, text):
+        """Progress of the multi-resolution engine (runs inside Slicer): show it and keep the window responsive
+        (Cancel), at most every PROGRESS_INTERVAL_S."""
+        self._progressDetail = text
+        now = time.time()
+        if now - getattr(self, "_lastProgress", 0.0) >= PROGRESS_INTERVAL_S:
+            self._lastProgress = now
+            self._updateElapsed()
+            slicer.app.processEvents()
 
     def onCancelButton(self):
         self.logic.cancel()
-        self.statusLabel.text = "Cancelling..."
+        self._statusPrefix = "Cancelling"
+        (self.functionalStatusLabel if self.isFunctional() else self.statusLabel).text = "Cancelling..."
 
     def onRegistrationFinished(self, result):
         self._elapsedTimer.stop()
@@ -1796,6 +1996,7 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                     "This transform is not rigid. Hardening can resample the images (interpolating the quantitative "
                     "SPECT voxel values) and cannot be undone.\n\nHarden now?"):
                 return
+        self._hideHandles()
         with slicer.util.WaitCursor():
             self.logic.hardenRegistration(transform)
             self._refreshOverlay()
@@ -1806,15 +2007,17 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         transform = self.currentTransform()
         if transform is None:
             return
+        self._hideHandles()
         with slicer.util.WaitCursor():
             restored = self.logic.undoRegistration(transform)
             removeOverlayVolumes()
             self.sliceSync.clear()
         if self._parameterNode is not None:
             self._parameterNode.SetNodeReferenceID("Transform", None)
-        self.statusLabel.text = ("Registration undone: " + ", ".join(restored) + " returned to the previous "
-                                 "position.") if restored else "Registration removed."
-        self.showSpectCT()
+        text = ("Registration undone: " + ", ".join(restored) + " returned to the previous "
+                "position.") if restored else "Registration removed."
+        (self.functionalStatusLabel if self.isFunctional() else self.statusLabel).text = text
+        self._showLayoutAfterReset()
         self.updateButtonStates()
 
     def onFineTuneButton(self):
@@ -1858,7 +2061,9 @@ class easy_regLogic(ScriptedLoadableModuleLogic):
 
     def setDefaultParameters(self, parameterNode):
         defaults = {"Method": "Rigid", "Path": PATH_HYBRID, "Quality": "Standard", "Initialization": "useGeometryAlign",
-                    "HardenRigid": "false", "SplineGridSize": ",".join(str(v) for v in DEFAULT_SPLINE_GRID)}
+                    "HardenRigid": "false", "SplineGridSize": ",".join(str(v) for v in DEFAULT_SPLINE_GRID),
+                    "Engine": DEFAULT_ENGINE, "FinalSpacing": f"{SR.DEFAULT_FINAL_SPACING_MM:g}",
+                    "RefineFinalSpacing": f"{SR.DEFAULT_FINAL_SPACING_MM:g}", "RefineQuality": "Thorough"}
         for name, value in defaults.items():
             if not parameterNode.GetParameter(name):
                 parameterNode.SetParameter(name, value)
@@ -1892,14 +2097,23 @@ class easy_regLogic(ScriptedLoadableModuleLogic):
     def startRegistration(self, fixedVolume, movingVolume, method, samplingPercentage,
                           initializeMode="useGeometryAlign", fixedRoi=None, movingRoi=None, followers=(),
                           splineGridSize=DEFAULT_SPLINE_GRID, hardenRigid=False, onFinished=None, wait=False,
-                          fixedMask=None, preprocessMoving=False, temporaryNodes=None):
-        """Register movingVolume to fixedVolume with BRAINSFit and apply the result to movingVolume and the
-        followers. Runs in the background unless wait=True. onFinished(result) receives
-        {"status": "completed" | "cancelled" | "failed", "message": str, "transform": node or None}."""
+                          fixedMask=None, preprocessMoving=False, temporaryNodes=None, engine=DEFAULT_ENGINE,
+                          finalSpacingMm=SR.DEFAULT_FINAL_SPACING_MM, quality=None, progress=None):
+        """Register movingVolume to fixedVolume and apply the result to movingVolume and the followers.
+        engine ENGINE_MULTIRES: SimpleITK multi-resolution registration (sitkreg), run inside this call; finalSpacingMm
+        is the voxel size of its last level, quality a QUALITY_PRESETS label (default: from samplingPercentage),
+        progress(text) is called while it runs. engine ENGINE_BRAINSFIT: BRAINSFit, in the background unless
+        wait=True. preprocessMoving: the moving image is functional (SPECT/PET). onFinished(result) receives
+        {"status": "completed" | "cancelled" | "failed", "message": str, "transform": node or None}; the same dict is
+        returned when the registration finished inside the call."""
         if self.job is not None:
             raise RuntimeError("A registration is already running.")
-        if not hasattr(slicer.modules, "brainsfit"):
+        if engine not in (ENGINE_MULTIRES, ENGINE_BRAINSFIT):
+            raise ValueError(f"Unknown registration engine '{engine}'.")
+        if engine == ENGINE_BRAINSFIT and not hasattr(slicer.modules, "brainsfit"):
             raise RuntimeError("The BRAINSFit module (General Registration) is not available in this Slicer.")
+        if engine == ENGINE_MULTIRES and not SR.sitkAvailable():
+            raise RuntimeError("SimpleITK is not available in this Slicer: choose the Classic (BRAINSFit) engine.")
         if method not in METHOD_BY_NAME:
             raise ValueError(f"Unknown registration method '{method}'.")
         transformType, linear, _ = METHOD_BY_NAME[method]
@@ -1912,6 +2126,14 @@ class easy_regLogic(ScriptedLoadableModuleLogic):
                                              or initialTransform.GetParentTransformNode() is not None):
             raise ValueError(f"'{movingVolume.GetName()}' is under a deformable or nested transform. Undo the "
                              "previous registration (or harden it) before registering again.")
+
+        if engine == ENGINE_MULTIRES:
+            return self._runMultiresolution(
+                fixedVolume, movingVolume, method, transformType, initializeMode, fixedRoi, movingRoi, followers,
+                hardenRigid, onFinished, fixedMask, preprocessMoving, temporaryNodes, finalSpacingMm,
+                quality or qualityLabelFor(samplingPercentage), progress)
+        if initializeMode == INIT_SEARCH_MODE:
+            initializeMode = "useGeometryAlign"   # the search is only offered by the multi-resolution engine
 
         temporaryNodes = list(temporaryNodes or [])
         try:
@@ -1945,6 +2167,7 @@ class easy_regLogic(ScriptedLoadableModuleLogic):
             transformClass, f"EasyReg {method}: {movingVolume.GetName()} to {fixedVolume.GetName()}")
         outputTransform.SetAttribute(TRANSFORM_ATTRIBUTE, "1")
         outputTransform.SetAttribute(METHOD_ATTRIBUTE, method)
+        outputTransform.SetAttribute(ENGINE_ATTRIBUTE, ENGINE_BRAINSFIT)
         if initialTransform is not None:
             outputTransform.SetAttribute(PREVIOUS_TRANSFORM_ATTRIBUTE, initialTransform.GetID())
 
@@ -1969,8 +2192,88 @@ class easy_regLogic(ScriptedLoadableModuleLogic):
         return None
 
     def cancel(self):
-        if self.job is not None and self.job["cliNode"] is not None:
+        if self.job is None:
+            return
+        if self.job.get("engine") == ENGINE_MULTIRES:
+            self.job["cancelRequested"] = True   # checked by the engine at every iteration
+        elif self.job["cliNode"] is not None:
             self.job["cliNode"].Cancel()
+
+    def _runMultiresolution(self, fixedVolume, movingVolume, method, transformType, initializeMode, fixedRoi,
+                            movingRoi, followers, hardenRigid, onFinished, fixedMask, functionalMoving,
+                            temporaryNodes, finalSpacingMm, quality, progress):
+        """SimpleITK multi-resolution registration (EasyRegLib.sitkreg), inside this call. The images are read in
+        their own (native) coordinates; the moving image's current transform is the starting position."""
+        initialTransform = movingVolume.GetParentTransformNode()
+        self.job = {"method": method, "linear": True, "moving": movingVolume, "followers": list(followers),
+                    "transform": None, "initialTransform": initialTransform,
+                    "temporaryNodes": list(temporaryNodes or []), "hardenRigid": hardenRigid,
+                    "onFinished": onFinished, "cliNode": None, "observer": None, "engine": ENGINE_MULTIRES,
+                    "cancelRequested": False, "fixedName": fixedVolume.GetName()}
+        job = self.job
+        try:
+            images = []
+            for volume, roi, name, functional in ((fixedVolume, fixedRoi, "EasyReg fixed (temporary)", False),
+                                                  (movingVolume, movingRoi, "EasyReg moving (temporary)",
+                                                   functionalMoving)):
+                working, temporary = self.makeWorkingVolume(volume, roi, name)
+                if temporary:
+                    job["temporaryNodes"].append(working)
+                array = slicer.util.arrayFromVolume(working)   # native coordinates (no parent transform)
+                images.append(SR.ImageInput(array, self.nativeIjkToRas(working),
+                                            SR.imageKind(array, functional=functional)))
+            mask = None
+            if fixedMask is not None:
+                mask = (slicer.util.arrayFromVolume(fixedMask) > 0, self.nativeIjkToRas(fixedMask))
+            initialMatrix = self.transformMatrix(initialTransform)
+            initialization = {"Off": SR.INIT_CURRENT, "useGeometryAlign": SR.INIT_CENTRES,
+                              INIT_SEARCH_MODE: SR.INIT_SEARCH}.get(initializeMode, SR.INIT_CURRENT)
+            if initialTransform is not None:
+                # as with BRAINSFit, an existing transform is the start; a search is made around it
+                initialization = SR.INIT_SEARCH_CURRENT if initialization == SR.INIT_SEARCH else SR.INIT_CURRENT
+            kind = SR.AFFINE if "Affine" in transformType else SR.RIGID
+            logging.info(f"EasyReg: starting {method} multi-resolution registration, final resolution "
+                         f"{finalSpacingMm:g} mm, quality {quality}, start {initialization}")
+            result = SR.register(images[0], images[1], initialMatrix, kind, finalSpacingMm, quality, mask,
+                                 initialization, progress=progress, isCancelled=lambda: job["cancelRequested"])
+        except SR.RegistrationCancelled:
+            return self._finishMultiresolution("cancelled")
+        except Exception as error:
+            logging.exception("EasyReg: multi-resolution registration failed")
+            return self._finishMultiresolution("failed", str(error))
+        if job["cancelRequested"]:
+            return self._finishMultiresolution("cancelled")
+        return self._finishMultiresolution("completed", result=result)
+
+    def _finishMultiresolution(self, state, message="", result=None):
+        job, self.job = self.job, None
+        for node in job["temporaryNodes"]:
+            removeNodeIfInScene(node)
+        transform = None
+        if state == "completed":
+            moving = job["moving"]
+            transform = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLLinearTransformNode", f"EasyReg {job['method']}: {moving.GetName()} to {job['fixedName']}")
+            transform.SetAttribute(TRANSFORM_ATTRIBUTE, "1")
+            transform.SetAttribute(METHOD_ATTRIBUTE, job["method"])
+            transform.SetAttribute(ENGINE_ATTRIBUTE, ENGINE_MULTIRES)
+            transform.SetAttribute(FINAL_SPACING_ATTRIBUTE, f"{result['spacing']:g}")
+            transform.SetAttribute(METRIC_ATTRIBUTE, f"{result['initialMetric']:.6g} {result['finalMetric']:.6g}")
+            if job["initialTransform"] is not None:
+                transform.SetAttribute(PREVIOUS_TRANSFORM_ATTRIBUTE, job["initialTransform"].GetID())
+            self.setTransformMatrix(transform, result["matrix"])
+            job["transform"] = transform
+            levels = ", ".join(f"{level:g}" for level in result["levels"])
+            summary = (f"Levels {levels} mm; mutual information {result['initialMetric']:.4f} \u2192 "
+                       f"{result['finalMetric']:.4f}.")
+            message = " ".join(list(result["notes"]) + [summary, self._applyResult(job)])
+            logging.info(f"EasyReg: {message} ({result['seconds']:.1f} s, {result['stop']})")
+        elif state == "failed":
+            logging.error(f"EasyReg: registration failed: {message}")
+        output = {"status": state, "message": message, "transform": transform, "details": result}
+        if job["onFinished"] is not None:
+            job["onFinished"](output)
+        return output
 
     def _onCliModified(self, cliNode, event):
         if self.job is None or cliNode is not self.job["cliNode"] or cliNode.IsBusy():
@@ -2239,7 +2542,8 @@ class easy_regLogic(ScriptedLoadableModuleLogic):
         return labelmapFromArray(grown, referenceVolume, "EasyReg liver mask (temporary)")
 
     def refineInLiver(self, fixedVolume, movingVolume, liverSegmentation, liverSegmentID, marginMm,
-                      samplingPercentage, followers=(), onFinished=None, wait=False):
+                      samplingPercentage, followers=(), onFinished=None, wait=False, engine=DEFAULT_ENGINE,
+                      finalSpacingMm=SR.DEFAULT_FINAL_SPACING_MM, quality=None, progress=None):
         """Rigid mutual-information registration restricted to the dilated liver of the reference, starting from
         the current alignment. Affine / deformable are not offered for functional-only registration."""
         if liverSegmentation is None or not liverSegmentID:
@@ -2253,7 +2557,8 @@ class easy_regLogic(ScriptedLoadableModuleLogic):
             return self.startRegistration(fixedVolume, movingVolume, REFINE_METHOD, samplingPercentage,
                                           initializeMode="Off", fixedRoi=cropRoi, followers=followers,
                                           onFinished=onFinished, wait=wait, fixedMask=fixedMask,
-                                          preprocessMoving=True, temporaryNodes=temporary)
+                                          preprocessMoving=True, temporaryNodes=temporary, engine=engine,
+                                          finalSpacingMm=finalSpacingMm, quality=quality, progress=progress)
         except Exception:
             for node in temporary:
                 removeNodeIfInScene(node)
@@ -2299,11 +2604,17 @@ class easy_regTest(ScriptedLoadableModuleTest):
         self.setUp()
         self.test_rigidRecoversShift()
         self.setUp()
+        self.test_multiresolutionRecoversShift()
+        self.setUp()
+        self.test_multiresolutionSearch()
+        self.setUp()
         self.test_functionalBodyOutline()
         self.setUp()
         self.test_functionalLandmarks()
         self.setUp()
         self.test_functionalRefinement()
+        self.setUp()
+        self.test_functionalRefinement(engine=ENGINE_BRAINSFIT)
         self.setUp()
         self.test_centreOnReference()
         self.delayDisplay("EasyReg tests passed")
@@ -2385,14 +2696,56 @@ class easy_regTest(ScriptedLoadableModuleTest):
         shift = np.array([9.0, -6.0, 6.0])
         fixed = self._phantom("fixed")
         moving = self._phantom("moving", origin=tuple(shift))
-        result = easy_regLogic().startRegistration(fixed, moving, "Rigid", 0.05, initializeMode="Off", wait=True)
+        result = easy_regLogic().startRegistration(fixed, moving, "Rigid", 0.05, initializeMode="Off", wait=True,
+                                                   engine=ENGINE_BRAINSFIT)
         assert result["status"] == "completed", result["message"]
         matrix = vtk.vtkMatrix4x4()
         result["transform"].GetMatrixTransformToParent(matrix)
         translation = np.array([matrix.GetElement(r, 3) for r in range(3)])
         error = np.linalg.norm(translation + shift)
         assert error < 1.5, f"translation {translation}, expected {-shift}"
-        self.delayDisplay(f"Rigid registration recovered the shift (error {error:.2f} mm)")
+        self.delayDisplay(f"Rigid registration (BRAINSFit) recovered the shift (error {error:.2f} mm)")
+
+    def test_multiresolutionRecoversShift(self):
+        if not SR.sitkAvailable():
+            self.delayDisplay("SimpleITK not available: multi-resolution test skipped")
+            return
+        shift = np.array([9.0, -6.0, 6.0])
+        fixed = self._phantom("fixed")
+        moving = self._phantom("moving", origin=tuple(shift))
+        messages = []
+        result = easy_regLogic().startRegistration(fixed, moving, "Rigid", 0.05, initializeMode="Off",
+                                                   engine=ENGINE_MULTIRES, finalSpacingMm=3.0,
+                                                   progress=messages.append)
+        assert result["status"] == "completed", result["message"]
+        transform = result["transform"]
+        translation = self._translation(transform)
+        error = np.linalg.norm(translation + shift)
+        assert error < 1.5, f"translation {translation}, expected {-shift}"
+        assert transform.GetAttribute(ENGINE_ATTRIBUTE) == ENGINE_MULTIRES
+        assert transform.GetAttribute(METHOD_ATTRIBUTE) == "Rigid"   # read by the Taranis workflow
+        assert float(transform.GetAttribute(FINAL_SPACING_ATTRIBUTE)) == 3.0
+        assert moving.GetParentTransformNode() is transform and messages
+        self.delayDisplay(f"Multi-resolution registration recovered the shift (error {error:.2f} mm)")
+
+    def test_multiresolutionSearch(self):
+        """A short moving image 60 mm off in head-feet direction, no ROI: the search finds the start position."""
+        if not SR.sitkAvailable():
+            self.delayDisplay("SimpleITK not available: search test skipped")
+            return
+        fixed = self._phantom("long fixed")
+        array = slicer.util.arrayFromVolume(fixed)
+        # upper slices only: aligning the image centres alone leaves it about 36 mm off
+        short = slicer.util.addVolumeFromArray(np.ascontiguousarray(array[24:40]), name="short moving")
+        short.SetSpacing(3.0, 3.0, 3.0)
+        short.SetOrigin(0.0, 0.0, 24 * 3.0 + 60.0)   # anatomy of slices 24..39, placed 60 mm too high
+        result = easy_regLogic().startRegistration(fixed, short, "Rigid", 0.05, initializeMode=INIT_SEARCH_MODE,
+                                                   engine=ENGINE_MULTIRES, finalSpacingMm=3.0)
+        assert result["status"] == "completed", result["message"]
+        translation = self._translation(result["transform"])
+        error = np.linalg.norm(translation - np.array([0.0, 0.0, -60.0]))
+        assert error < 3.0, f"translation {translation}, expected (0, 0, -60)"
+        self.delayDisplay(f"Head-feet search found the start position (error {error:.1f} mm)")
 
     SPECT_SHIFT = np.array([12.0, -9.0, 15.0])
 
@@ -2479,7 +2832,10 @@ class easy_regTest(ScriptedLoadableModuleTest):
         assert np.allclose(follower.GetNthControlPointPositionWorld(0), (10.0, 10.0, 1310.0), atol=1e-3)
         self.delayDisplay("Centre on reference and reset OK")
 
-    def test_functionalRefinement(self):
+    def test_functionalRefinement(self, engine=ENGINE_MULTIRES):
+        if engine == ENGINE_MULTIRES and not SR.sitkAvailable():
+            self.delayDisplay("SimpleITK not available: multi-resolution refinement test skipped")
+            return
         fixed = self._phantom("reference CT")
         moving = self._spectPhantom("SPECT only", origin=tuple(self.SPECT_SHIFT))
         segmentationNode, liverID = self._liverSegmentation(fixed)
@@ -2487,11 +2843,12 @@ class easy_regTest(ScriptedLoadableModuleTest):
         # start 5-6 mm away from the right position, as after a rough initial alignment
         start = logic.alignmentTransform(moving, fixed, method="Manual")
         logic.setTransformMatrix(start, F.translationMatrix(-self.SPECT_SHIFT + np.array([4.0, -3.0, 3.0])))
-        result = logic.refineInLiver(fixed, moving, segmentationNode, liverID, 20.0, 0.2, wait=True)
+        result = logic.refineInLiver(fixed, moving, segmentationNode, liverID, 20.0, 0.2, wait=True, engine=engine,
+                                     finalSpacingMm=3.0)
         assert result["status"] == "completed", result["message"]
         translation = self._translation(result["transform"])
         error = np.linalg.norm(translation + self.SPECT_SHIFT)
         assert error < 3.0, f"translation {translation}, expected {-self.SPECT_SHIFT}"
         assert result["transform"].GetAttribute(METHOD_ATTRIBUTE) == REFINE_METHOD
         assert not [n for n in slicer.util.getNodesByClass("vtkMRMLLabelMapVolumeNode") if "temporary" in n.GetName()]
-        self.delayDisplay(f"Liver-masked refinement converged (error {error:.1f} mm)")
+        self.delayDisplay(f"Liver-masked refinement ({engine}) converged (error {error:.1f} mm)")

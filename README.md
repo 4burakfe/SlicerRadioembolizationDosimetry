@@ -234,7 +234,11 @@ Models, isodose surfaces and DVH nodes are stored in the Data module folders *Ta
 **SPECT/CT or PET/CT → reference (anatomy to anatomy)**
 1. Select the CT of the hybrid scan (moving), the SPECT/PET (follows the CT) and the reference CT/MRI (fixed).
 2. Optional: ROIs around the liver (only temporary copies are cropped).
-3. Method: Rigid or Affine, then **Register**. (Deformable B-spline registration was removed: far too slow and memory-hungry – over 10 GB even at 0.2 % sampling.)
+3. **Engine**, method and settings, then **Register**:
+   - **Multi-resolution (SimpleITK)**, the default: mutual information, coarse to fine – about 16, 8, 4 … mm down to the **final resolution** you choose (4, 3, **2** (recommended for SPECT/CT to CT/MRI), 1.5 or 1 mm (CBCT, small ROIs)). CT values are clipped to −1000…2000 HU and other anatomical images to their 0.5–99.5 percentiles (metal, dense contrast, CBCT streaks), the random sampling uses a fixed seed (same images and settings → same result) and the result is **kept only if it improves the match** over the starting position (otherwise the start is kept and you are told). *Quality* sets the number of samples per level (20k / 60k / 200k), so the run time depends little on the final resolution; without ROIs a very fine resolution is coarsened automatically when the images would not fit in memory. It runs inside Slicer: the window shows the level and iteration, and *Cancel* works.
+   - **Start position**: *Align centres*, *Keep current position*, or **Search head-feet position** – for scans of different length (e.g. an abdominal SPECT/CT and a chest-abdomen-pelvis CT): after aligning the centres, head-feet offsets over ±20 cm (then ±3 cm left-right / anterior-posterior) are compared on 8 mm images and the best is the start. With an existing transform the search is made around it.
+   - **Classic (BRAINSFit)**: the previous single-resolution engine, run in the background; kept for comparison.
+   - Method: Rigid or Affine (affine starts from the rigid result). Deformable B-spline registration was removed: far too slow and memory-hungry – over 10 GB even at 0.2 % sampling.
 4. Check the 4 × 2 fusion layout, then **Harden transform** (or Undo / fine-tune).
 5. **◀ Previous**, **Registration overview** and **Next ▶** return to the Taranis workflow (Data step, the case's registrations, Segmentation step); *Next* asks for confirmation if the transform is not hardened yet.
 
@@ -244,7 +248,7 @@ Models, isodose surfaces and DVH nodes are stored in the Data module folders *Ta
    - **Align body outlines**: centres the SPECT/PET body outline (scatter/background, threshold in % of the maximum) on the reference body outline; with a liver segment, the uptake centre is placed on the liver centre (head-feet). With lobar or selective injections the uptake is not centred in the liver: check and correct.
    - **Landmarks**: place at least 3 pairs in the same order (R1… on the reference, S1… on the SPECT/PET), e.g. liver dome, porta hepatis, focal uptake ↔ tumour, stomach or kidney activity. The rigid fit reports the RMS distance; the SPECT/PET landmarks move with the image.
    - **By hand**: move/rotate handles in the views, or the Transforms module sliders.
-3. Optional **Refine rigidly inside the liver**: mutual-information rigid registration restricted to the liver segment grown by a margin (default 20 mm), starting from the current alignment. If it moves the liver region by more than 20 mm or 10° you are warned. Affine and deformable registration are not offered on this path.
+3. Optional **Refine rigidly inside the liver**: mutual-information rigid registration restricted to the liver segment grown by a margin (default 20 mm), starting from the current alignment, with the same engine choice and final resolution as above (the multi-resolution engine keeps the result only if it improves the match inside the liver). If it moves the liver region by more than 20 mm or 10° you are warned. Affine and deformable registration are not offered on this path.
 4. The 3 × 2 layout shows reference, SPECT/PET alone and SPECT/PET on reference (axial and coronal). Harden or undo as above. The workflow marks the step as functional-only (warning: verify visually).
 
 ---
@@ -295,6 +299,10 @@ Levels: **E** error · **W** warning · **N** note · **Stop** calculation refus
 | EasyReg: reference image under a transform, moving image under a deformable or nested transform | Stop |
 | EasyReg: liver refinement without an initial alignment | Ask |
 | EasyReg: liver refinement moved the liver region more than *REFINE_WARNING_MM* (20 mm) or rotated more than *REFINE_WARNING_DEGREES* (10°) | W (dialog) |
+| EasyReg (multi-resolution): the result does not improve the mutual information over the starting position – the start is kept | N (status line) |
+| EasyReg (multi-resolution): the final resolution was coarsened because the images would not fit in memory (*MAX_WORKING_VOXELS*) | N (status line) |
+| EasyReg (multi-resolution): the head-feet search found no position where the fields of view overlap enough (*SEARCH_MIN_OVERLAP* 60 %) | N (status line) |
+| EasyReg (multi-resolution): SimpleITK not available | Stop (use the Classic engine) |
 | EasyReg: body outline not usable and no liver segment selected | Stop (with advice) |
 | EasyReg: hardening a non-rigid transform (resamples the quantitative SPECT) | Ask |
 | EasyReg: *Next* while the registration is not hardened | Ask |
@@ -451,7 +459,7 @@ Absolute module:
 ---
 
 ## 🧪 Testing
-The two dosimetry modules share their common code (`Taranis/TaranisLib/dosimetry.py`: segment categories, isodoses, DVH, labels, layouts, report, and the widget/logic methods that were identical); only what differs between them stays in each module. Unit tests of the workflow rules run outside Slicer: `python -m unittest discover -s Taranis/Testing/Python`.
+The two dosimetry modules share their common code (`Taranis/TaranisLib/dosimetry.py`: segment categories, isodoses, DVH, labels, layouts, report, and the widget/logic methods that were identical); only what differs between them stays in each module. Unit tests of the workflow rules run outside Slicer: `python -m unittest discover -s Taranis/Testing/Python`. EasyReg's geometry helpers and registration engine: `python -m unittest discover -s easy_reg/Testing/Python` (the registration tests need SimpleITK and are skipped without it; run them with Slicer's Python, e.g. `PythonSlicer -m unittest discover -s easy_reg/Testing/Python`).
 
 With Slicer's developer mode enabled, click **Reload and Test** in either Taranis module to run built-in checks on synthetic data: dose calculations (including adding the dose maps of multiple perfused volumes, overlap and containment checks and the single-compartment estimate), DVH and D/V metrics, segment categories, negative voxel handling, slice-view label layout and report screenshots.
 

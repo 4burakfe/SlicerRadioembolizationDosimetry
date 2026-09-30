@@ -6,6 +6,7 @@ set(MODULE_PYTHON_SCRIPTS
   ${MODULE_NAME}.py
   EasyRegLib/__init__.py
   EasyRegLib/functional.py
+  EasyRegLib/sitkreg.py
   )
 
 set(MODULE_PYTHON_RESOURCES
