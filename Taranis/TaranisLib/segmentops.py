@@ -99,6 +99,22 @@ def perfusionReport(namedMasks, perfusedUnion, voxelML):
     return result
 
 
+def latticeOffset(imageToWorld, referenceToWorld, tolerance=1e-3, indexTolerance=0.05):
+    """Whole-voxel index offset (i, j, k) that re-numbers an image in the index space of a reference image lying on
+    the same voxel lattice: same voxel size and axis directions (4x4 image-to-world matrices equal in their 3x3
+    part), origin a whole number of reference voxels away. Voxel (i, j, k) of the image is then voxel
+    (i, j, k) + offset of the reference. None when the lattices differ (a resampling would be needed)."""
+    image = np.asarray(imageToWorld, dtype=float)
+    reference = np.asarray(referenceToWorld, dtype=float)
+    if not np.allclose(image[:3, :3], reference[:3, :3], atol=tolerance):
+        return None
+    offset = np.linalg.solve(reference[:3, :3], image[:3, 3] - reference[:3, 3])
+    rounded = np.round(offset)
+    if np.max(np.abs(offset - rounded)) > indexTolerance:
+        return None
+    return tuple(int(v) for v in rounded)
+
+
 def mismatchFraction(mask, expected):
     """Voxels in one mask but not the other, relative to the expected mask (0: identical)."""
     size = int(np.count_nonzero(expected))

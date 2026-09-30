@@ -168,6 +168,60 @@ def caseVolumes(case):
     return [node for node in case.roleNodes().values() if node is not None and node.IsA("vtkMRMLScalarVolumeNode")]
 
 
+def _numpyMatrix(vtkMatrix):
+    return np.array([[vtkMatrix.GetElement(r, c) for c in range(4)] for r in range(4)])
+
+
+def alignLayersToReference(segmentationNode):
+    """Number every labelmap layer of the segmentation in the index space of the segmentation's reference geometry.
+
+    Layers written on other grids (the tight grids of the hub tools, imported results) keep their own origin, so
+    their voxel indices do not match those of the other segments. Slicer's Logical operators compare index ranges
+    ("common extent"): an Intersect with such a segment changed nothing on the first click. Only layers on the same
+    voxel lattice are re-numbered (origin a whole number of voxels away): no resampling, no voxel lost, world
+    positions unchanged. Returns (layers re-numbered, names of segments on another lattice, left unchanged)."""
+    segmentation = segmentationNode.GetSegmentation() if segmentationNode is not None else None
+    if segmentation is None:
+        return 0, []
+    geometry = segmentation.GetConversionParameter(
+        slicer.vtkSegmentationConverter.GetReferenceImageGeometryParameterName())
+    if not geometry:
+        return 0, []
+    reference = slicer.vtkOrientedImageData()
+    slicer.vtkSegmentationConverter.DeserializeImageGeometry(geometry, reference, False)
+    referenceMatrix = vtk.vtkMatrix4x4()
+    reference.GetImageToWorldMatrix(referenceMatrix)
+    referenceArray = _numpyMatrix(referenceMatrix)
+    representation = slicer.vtkSegmentationConverter.GetBinaryLabelmapRepresentationName()
+    seen, moved, otherLattice = set(), 0, []
+    for segmentID in segmentIDs(segmentationNode):
+        layer = segmentation.GetLayerIndex(segmentID)
+        if layer in seen:
+            continue
+        seen.add(layer)
+        labelmap = segmentation.GetSegment(segmentID).GetRepresentation(representation)
+        if labelmap is None or not hasattr(labelmap, "GetImageToWorldMatrix"):
+            continue
+        extent = labelmap.GetExtent()
+        if extent[0] > extent[1] or extent[2] > extent[3] or extent[4] > extent[5]:
+            continue
+        matrix = vtk.vtkMatrix4x4()
+        labelmap.GetImageToWorldMatrix(matrix)
+        matrixArray = _numpyMatrix(matrix)
+        if np.allclose(matrixArray, referenceArray, atol=1e-6):
+            continue
+        offset = S.latticeOffset(matrixArray, referenceArray)
+        if offset is None:
+            otherLattice.append(segmentation.GetSegment(segmentID).GetName())
+            continue
+        labelmap.SetImageToWorldMatrix(referenceMatrix)
+        labelmap.SetExtent(extent[0] + offset[0], extent[1] + offset[0], extent[2] + offset[1],
+                           extent[3] + offset[1], extent[4] + offset[2], extent[5] + offset[2])
+        labelmap.Modified()
+        moved += 1
+    return moved, otherLattice
+
+
 def extendSegmentationGeometry(segmentationNode, referenceVolume, volumes=()):
     """Reference geometry of the segmentation (used by the Segment Editor and imports): voxel size of the primary
     image, extent covering all case images and segments. Returns True if it changed."""
@@ -180,6 +234,8 @@ def extendSegmentationGeometry(segmentationNode, referenceVolume, volumes=()):
         segmentationNode.SetReferenceImageGeometryParameterFromVolumeNode(grid)
         after = segmentationNode.GetSegmentation().GetConversionParameter(
             slicer.vtkSegmentationConverter.GetReferenceImageGeometryParameterName())
+        if before != after:
+            alignLayersToReference(segmentationNode)   # the existing layers follow the new index space
         return before != after
     finally:
         slicer.mrmlScene.RemoveNode(grid)
@@ -246,6 +302,7 @@ class SegmentGrid:
                                "outside); it was not changed.")
         ownLayer(self.node, segmentID)   # on a shared layer the write would take voxels from the other segments
         slicer.util.updateSegmentBinaryLabelmapFromArray(mask.astype(np.uint8), self.node, segmentID, self.reference)
+        alignLayersToReference(self.node)   # the write used this (tight) grid's origin: back to the common index space
         self._cache[segmentID] = mask.astype(bool)
 
     def _voxelsOutside(self, segmentID):

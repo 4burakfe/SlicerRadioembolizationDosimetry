@@ -110,6 +110,24 @@ class PerfusionTest(unittest.TestCase):
         self.assertAlmostEqual(S.mismatchFraction(b, a), 0.25)
         self.assertEqual(S.mismatchFraction(np.zeros_like(a), np.zeros_like(a)), 0.0)
 
+    def test_latticeOffset(self):
+        # reference: the segmentation's geometry (flipped axes, as in the case that failed)
+        reference = np.array([[-0.8203, 0, 0, 302.7277], [0, -0.8203, 0, 285.8136], [0, 0, 2.2, -109.949],
+                              [0, 0, 0, 1.0]])
+        tight = reference.copy()
+        tight[:3, 3] = reference[:3, :3] @ np.array([209.0, 280.0, 9.0]) + reference[:3, 3]   # tight grid of a tool
+        self.assertEqual(S.latticeOffset(tight, reference), (209, 280, 9))
+        self.assertEqual(S.latticeOffset(reference, reference), (0, 0, 0))
+        precise = tight.copy()
+        precise[0, 0] = precise[1, 1] = -0.8203125       # full-precision spacing vs the rounded geometry string
+        self.assertEqual(S.latticeOffset(precise, reference), (209, 280, 9))
+        shifted = tight.copy()
+        shifted[0, 3] += 0.4                             # half a voxel off: not the same lattice
+        self.assertIsNone(S.latticeOffset(shifted, reference))
+        coarse = tight.copy()
+        coarse[:3, :3] *= 2.0                            # other voxel size
+        self.assertIsNone(S.latticeOffset(coarse, reference))
+
 
 if __name__ == "__main__":
     unittest.main()

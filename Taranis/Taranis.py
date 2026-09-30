@@ -1587,6 +1587,7 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 logging.info(f"Taranis: {moved} segment(s) moved to their own labelmap layer.")
         except Exception as e:
             logging.warning(f"Taranis: could not separate the segment layers: {e}")
+        self._alignLayers(segmentationNode)
         if not self.hasObserver(segmentationNode, slicer.vtkSegmentation.SegmentAdded, self._onSegmentAddedLayer):
             self.addObserver(segmentationNode, slicer.vtkSegmentation.SegmentAdded, self._onSegmentAddedLayer)
 
@@ -1601,6 +1602,22 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             segtools.separateSharedLayers(segmentationNode)
         except Exception as e:
             logging.warning(f"Taranis: could not separate the segment layers: {e}")
+        self._alignLayers(segmentationNode)
+
+    def _alignLayers(self, segmentationNode):
+        """All segment layers in the index space of the segmentation's reference geometry (see
+        segtools.alignLayersToReference: otherwise Logical operators such as Intersect can do nothing)."""
+        try:
+            moved, otherLattice = segtools.alignLayersToReference(segmentationNode)
+        except Exception as e:
+            logging.warning(f"Taranis: could not align the segment layers: {e}")
+            return
+        if moved:
+            logging.info(f"Taranis: {moved} segment layer(s) re-numbered in the segmentation's index space.")
+        if otherLattice and otherLattice != getattr(self, "_otherLatticeReported", None):
+            self._otherLatticeReported = otherLattice
+            logging.warning("Taranis: segment(s) on a different voxel grid than the segmentation (Logical operators "
+                            "may not work on them until they are edited once): " + ", ".join(otherLattice))
 
     def _enforceAllowOverlap(self, node, event=None):
         """Segments of the case may overlap (tumours and perfused volumes inside the whole liver, normal tissue):
@@ -2735,6 +2752,8 @@ class TaranisTest(ScriptedLoadableModuleTest):
         self.setUp()
         self.test_segmentLayers()
         self.setUp()
+        self.test_layersAlignedToReference()
+        self.setUp()
         self.test_segmentationLayout()
         self.setUp()
         self.test_lsfFromCase()
@@ -2770,6 +2789,48 @@ class TaranisTest(ScriptedLoadableModuleTest):
         self.assertEqual(int(slicer.util.arrayFromSegmentBinaryLabelmap(segmentationNode, liverID, ct).sum()),
                          int(liver.sum()))
         self.delayDisplay("Every segment on its own layer; a new segment no longer carves the liver")
+
+    def test_layersAlignedToReference(self):
+        """A segment written on a tight grid gets the segmentation's index space (Intersect compares index ranges)."""
+        import numpy as np
+        ct = self._volume("CT", 0.0)
+        segmentationNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode")
+        segmentationNode.SetReferenceImageGeometryParameterFromVolumeNode(ct)
+        segmentation = segmentationNode.GetSegmentation()
+        tumorID = segmentation.AddEmptySegment("", "Tumor")
+        tumor = np.zeros((20, 20, 20), np.uint8)
+        tumor[8:12, 8:12, 8:12] = 1
+        slicer.util.updateSegmentBinaryLabelmapFromArray(tumor, segmentationNode, tumorID, ct)
+        liverID = segmentation.AddEmptySegment("", "Whole liver")
+        segtools.ownLayer(segmentationNode, liverID)
+        liver = np.zeros((20, 20, 20), bool)
+        liver[4:16, 4:16, 4:16] = True
+        # a tool writes the liver through a tight grid (other origin, same lattice)
+        tight = segtools.gridVolume(ct, (), None, "tight")
+        ijkToRas = vtk.vtkMatrix4x4()
+        ct.GetIJKToRASMatrix(ijkToRas)
+        ijkToRas.SetElement(0, 3, ijkToRas.GetElement(0, 3) + 3 * ct.GetSpacing()[0])
+        tight.SetIJKToRASMatrix(ijkToRas)
+        slicer.util.updateSegmentBinaryLabelmapFromArray(np.roll(liver, -3, axis=2).astype(np.uint8),
+                                                         segmentationNode, liverID, tight)
+        slicer.mrmlScene.RemoveNode(tight)
+        before = slicer.util.arrayFromSegmentBinaryLabelmap(segmentationNode, liverID, ct).copy()
+        moved, other = segtools.alignLayersToReference(segmentationNode)
+        self.assertEqual(other, [])
+        name = slicer.vtkSegmentationConverter.GetBinaryLabelmapRepresentationName()
+        reference = slicer.vtkOrientedImageData()
+        slicer.vtkSegmentationConverter.DeserializeImageGeometry(segmentation.GetConversionParameter(
+            slicer.vtkSegmentationConverter.GetReferenceImageGeometryParameterName()), reference, False)
+        expected, actual = vtk.vtkMatrix4x4(), vtk.vtkMatrix4x4()
+        reference.GetImageToWorldMatrix(expected)
+        segmentation.GetSegment(liverID).GetRepresentation(name).GetImageToWorldMatrix(actual)
+        self.assertTrue(all(abs(expected.GetElement(r, c) - actual.GetElement(r, c)) < 1e-6
+                            for r in range(4) for c in range(4)))
+        after = slicer.util.arrayFromSegmentBinaryLabelmap(segmentationNode, liverID, ct)
+        np.testing.assert_array_equal(after, before)   # same voxels, same place
+        np.testing.assert_array_equal(after > 0, liver)
+        self.assertEqual(segtools.alignLayersToReference(segmentationNode)[0], 0)   # nothing left to do
+        self.delayDisplay(f"Segment layers aligned to the segmentation's index space ({moved} re-numbered)")
 
     def _volume(self, name, value, origin=(0.0, 0.0, 0.0)):
         import numpy as np
