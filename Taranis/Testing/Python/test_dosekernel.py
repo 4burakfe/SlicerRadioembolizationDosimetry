@@ -162,6 +162,26 @@ class DensityScalingTest(unittest.TestCase):
             DK.voxelSDoseMap(ldm, (4.0,) * 3, localMask=np.ones((2, 2, 2), bool), samples=1000)
 
 
+class PublishedVoxelSValuesTest(unittest.TestCase):
+    """Independent check of the kernel shape against published Y-90 voxel S values in soft tissue (1.04 g/mL,
+    DOSXYZnrc): Lanconelli N, et al. A free database of radionuclide voxel S values for the dosimetry of nonuniform
+    activity distributions. Phys Med Biol. 2012;57(2):517 (Table 3 values, mGy/(MBq s))."""
+
+    REFERENCE = {3.0: {(0, 0, 0): 1.59, (0, 0, 1): 0.275}, 6.0: {(0, 0, 0): 0.342, (0, 0, 1): 0.038}}
+
+    def test_lanconelli_2012(self):
+        shells = DK.loadKernelShells(DK.kernelPath())
+        joulesPerMBqS = shells["totalEnergyMeV"] * 1.602176634e-13 * 1e6
+        for side, values in self.REFERENCE.items():
+            kernel, _ = DK.kernelForSpacing((side,) * 3, densityGPerML=1.04)
+            massKg = 1.04 * (side / 10.0) ** 3 / 1000.0
+            c = tuple(n // 2 for n in kernel.shape)
+            for (dz, dy, dx), reference in values.items():
+                ours = kernel[c[0] + dz, c[1] + dy, c[2] + dx] * joulesPerMBqS / massKg * 1000.0   # mGy/(MBq s)
+                self.assertLess(abs(ours / reference - 1.0), 0.02, f"{side} mm {(dz, dy, dx)}: {ours:.4f} vs "
+                                                                    f"{reference}")
+
+
 class ConvolutionTest(unittest.TestCase):
 
     def test_matches_direct_convolution(self):
