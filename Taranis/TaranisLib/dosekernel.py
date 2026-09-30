@@ -274,7 +274,7 @@ def voxelSDescription(nuclide=DEFAULT_NUCLIDE, samples=KERNEL_SAMPLES, radiusMM=
 
 
 VOXEL_S_WARNINGS = [
-    "Experimental: not validated for clinical use. Published dose thresholds were mostly derived with LDM or the "
+    "Experimental method. Published dose thresholds were mostly derived with LDM or the "
     "partition model: compare with an LDM calculation.",
     "Lungs are not calculated with the voxel S method: local deposition (LDM) with the lung density in absolute mode "
     "(lung segments), lung dose from the lung shunt in patient-relative mode. A single kernel cannot follow electrons "

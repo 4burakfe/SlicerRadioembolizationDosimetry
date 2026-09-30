@@ -112,7 +112,7 @@ def voxelSChecks(relative=False, energyOutsidePerfusedFraction=None, lungsCalcul
     energyOutsidePerfusedFraction: patient-relative mode, part of the delivered beta energy deposited outside the
     perfused volumes after the convolution. lungsCalculated: absolute mode with lung segments (lung doses reported)."""
     issues = [(W.SEVERITY_WARNING,
-               "Experimental voxel S (dose point kernel) calculation: not validated for clinical use. Published dose "
+               "Experimental voxel S (dose point kernel) calculation. Published dose "
                "thresholds, including those of these checks, were mostly derived with local deposition (LDM) or the "
                "partition model: compare with an LDM calculation before interpreting the doses.")]
     if relative and _finite(energyOutsidePerfusedFraction):
