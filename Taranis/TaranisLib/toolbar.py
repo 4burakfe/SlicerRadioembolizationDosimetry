@@ -2,11 +2,13 @@
 
 Idle (no case in the scene): one button "Start TARE dosimetry workflow".
 Active: case name and ID, the six steps with a status badge, an issue counter with a menu, and on the right
-"Disable at startup", "Close" and Epona. Visibility rules are in visibility.py.
+"Disable at startup" and "Close". Visibility rules are in visibility.py.
+The Epona button (SPECT/PET review) is hidden for now (SHOW_EPONA): Epona is leaving the SlicerPETDenoise
+extension and will be released as an extension of its own.
 
 The toolbar adapts to the width of the window (COMPACT_LEVELS): on small screens the explanation lines are dropped,
 the step buttons get narrower, "Disable at startup" and "Close" move into a "⋯" menu, and finally the steps show
-their badge only (details in the tooltips), so that the whole toolbar, Epona included, stays visible.
+their badge only (details in the tooltips), so that the whole toolbar stays visible.
 """
 
 import logging
@@ -16,7 +18,8 @@ import qt
 import slicer
 
 from . import workflow as W
-from .case import (settingBool, setSetting, SETTING_TOOLBAR_INITIALIZED, SETTING_SHOW_AT_STARTUP)
+from .case import (settingBool, setSetting, SETTING_TOOLBAR_INITIALIZED, SETTING_SHOW_AT_STARTUP,
+                   DEFAULT_SHOW_AT_STARTUP)
 from .controller import WorkflowController
 from .visibility import ToolbarVisibility
 
@@ -32,6 +35,7 @@ LOGO_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "Resources"
 EPONA_LOGO_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "Resources", "Icons", "Epona.png")
 EPONA_MODULE = "Easy_fusion"
 EPONA_LOGO_SIZE = 40
+SHOW_EPONA = False             # temporarily hidden: Epona moves from SlicerPETDenoise to its own extension
 CASE_TEXT_WIDTH_MAX = 240      # the case name is elided beyond this width
 WIDTH_SLACK = 24               # px kept free when choosing the compaction level
 WIDTH_CHECK_INTERVAL_MS = 1000  # fallback polling of the window width (resize events are the main trigger)
@@ -254,7 +258,7 @@ class WorkflowToolbar:
     def __init__(self):
         self.controller = WorkflowController.instance()
         self.visibility = ToolbarVisibility(settingBool(SETTING_TOOLBAR_INITIALIZED, False),
-                                            settingBool(SETTING_SHOW_AT_STARTUP, True))
+                                            settingBool(SETTING_SHOW_AT_STARTUP, DEFAULT_SHOW_AT_STARTUP))
         self._wasActive = self.controller.isActive
         if self._wasActive:
             self.visibility.onCaseActivated()
@@ -368,8 +372,9 @@ class WorkflowToolbar:
         self.optionsAction = self.toolbar.addWidget(self.optionsButton)
         self.optionsAction.setVisible(False)
 
-        # Epona - SPECT/PET review (SlicerPETDenoise extension), always available at the far right
-        self.toolbar.addSeparator()
+        # Epona - SPECT/PET review at the far right; hidden for now (SHOW_EPONA). The button is still built so that
+        # the compaction levels keep working, only its actions are hidden.
+        self.eponaSeparatorAction = self.toolbar.addSeparator()
         self.eponaButton = TwoLineButton(badge=True, subtitleLines=2, badgeSize=EPONA_LOGO_SIZE, textWidth=150)
         if os.path.exists(EPONA_LOGO_PATH):
             self.eponaButton.setBadge(qt.QIcon(EPONA_LOGO_PATH))
@@ -378,7 +383,9 @@ class WorkflowToolbar:
             "Epona - SPECT/PET Review: easy fusion of SPECT/PET with CT/MRI, MIP, spherical ROIs with max, mean, "
             "MTV and TLG, window presets and review layouts. Useful to explore the images of a case.")
         self.eponaButton.button.connect("clicked()", self.onEponaClicked)
-        self.toolbar.addWidget(self.eponaButton.button)
+        self.eponaAction = self.toolbar.addWidget(self.eponaButton.button)
+        self.eponaSeparatorAction.setVisible(SHOW_EPONA)
+        self.eponaAction.setVisible(SHOW_EPONA)
 
     def destroy(self):
         """Disconnect; the toolbar is hidden and replaced by the next instance (see _build)."""

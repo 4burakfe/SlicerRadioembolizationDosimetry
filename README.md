@@ -33,12 +33,11 @@ All modules are available under `Nuclear Medicine` category.
 **Purpose**: Run a complete case in six steps and always see where you are. The step modules below still work on their own.
 
 **Workflow toolbar** (top of the Slicer window):
-- The first time you open *Taranis* the toolbar is added; from then on it appears at every Slicer start.
+- The toolbar appears when you open *Taranis* or start / resume a case. By default it is **not** shown when Slicer starts; turn on *Show the workflow toolbar when Slicer starts* in the Taranis settings (or uncheck *Disable at startup* on the toolbar) to have it at every start.
 - Without a case it shows one button, **Start TARE dosimetry workflow**.
 - With a case: case name and ID, the steps **Data › Registration › Segmentation › LSF › Dosimetry › Report** with a status badge each (✓ done, ! done with warnings, ✕ error, ↻ outdated, » skipped, – not needed / waiting), and an issue counter whose menu jumps to the step concerned. Hover a step for its details.
-- At the far right, **Epona – SPECT/PET Review** (from the SlicerPETDenoise extension) opens the fusion / MIP / SUV-ROI review module to explore the images of a case.
-- It adapts to the window width: on smaller screens the explanation lines are dropped and the steps get narrower, then *Disable at startup* and *Close* move into a **⋯** menu, and finally the steps show only their badge (hover for the details) – Epona stays visible.
-- **Close** hides it for this session. **Disable at startup** stops showing it when Slicer starts: it then appears only when a case is started or resumed, and disappears when the case (scene) is closed.
+- It adapts to the window width: on smaller screens the explanation lines are dropped and the steps get narrower, then *Disable at startup* and *Close* move into a **⋯** menu, and finally the steps show only their badge (hover for the details).
+- **Close** hides it for this session. While it is not shown at startup (the default), it appears only when Taranis is opened or a case is started or resumed, and disappears when the case (scene) is closed.
 - Gating is soft: every step can be opened and skipped. Errors are only raised when a calculation would be impossible or wrong.
 
 **Steps**:

@@ -25,7 +25,7 @@ from TaranisLib import roles as R
 from TaranisLib import workflow as W
 from TaranisLib import dosekernel as DK
 from TaranisLib.case import (TaranisCase, candidateVolumes, volumeInfo, settingBool, settingText, setSetting,
-                             SETTING_SHOW_AT_STARTUP, SETTING_MODELS_FOLDER, P_MICROSPHERES, P_DOSE_METHOD,
+                             SETTING_SHOW_AT_STARTUP, DEFAULT_SHOW_AT_STARTUP, SETTING_MODELS_FOLDER, P_MICROSPHERES, P_DOSE_METHOD,
                              P_DOSE_NUCLIDE,
                              P_TREATMENT_DATETIME, P_LSF_SKIPPED, P_REGISTRATION_SKIPPED, P_REGISTRATION_CHECKED,
                              P_NAME, P_ID, P_LSF_LUNG_MASS, P_PLANNED_ACTIVITY)
@@ -737,7 +737,7 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         settingsBox.collapsed = True
         settingsLayout = qt.QFormLayout(settingsBox)
         self.showAtStartupCheckBox = qt.QCheckBox("Show the workflow toolbar when Slicer starts")
-        self.showAtStartupCheckBox.checked = settingBool(SETTING_SHOW_AT_STARTUP, True)
+        self.showAtStartupCheckBox.checked = settingBool(SETTING_SHOW_AT_STARTUP, DEFAULT_SHOW_AT_STARTUP)
         self.showAtStartupCheckBox.connect("toggled(bool)", self.onShowAtStartupToggled)
         settingsLayout.addRow(self.showAtStartupCheckBox)
         showToolbarButton = qt.QPushButton("Show workflow toolbar")

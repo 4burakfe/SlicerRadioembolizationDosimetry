@@ -42,6 +42,7 @@ P_ROLE_TYPE = "RoleType."                            # + role
 # Application settings
 SETTING_TOOLBAR_INITIALIZED = "Taranis/ToolbarInitialized"
 SETTING_SHOW_AT_STARTUP = "Taranis/ShowToolbarAtStartup"
+DEFAULT_SHOW_AT_STARTUP = False   # the toolbar appears when Taranis is opened or a case is started
 SETTING_MODELS_FOLDER = "Taranis/ModelsFolder"
 SETTING_DISCLAIMER_ACCEPTED = "Taranis/DisclaimerAccepted"
 

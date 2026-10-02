@@ -401,6 +401,15 @@ class VisibilityTest(unittest.TestCase):
         v.onCaseDeactivated()
         self.assertFalse(v.visible)          # vanishes when the case / scene is closed
 
+    def test_defaultNotShownAtStartup(self):
+        v = ToolbarVisibility(initialized=True)   # default: not shown at Slicer start
+        self.assertFalse(v.showAtStartup)
+        self.assertFalse(v.visible)
+        v.onHubOpened()
+        self.assertTrue(v.visible)           # opening Taranis shows it
+        v.onCaseDeactivated()
+        self.assertFalse(v.visible)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,15 +1,17 @@
 """Rules for showing the workflow toolbar. Pure Python, so the rules can be tested outside Slicer.
 
-- The first time Taranis is opened the toolbar is added, and from then on it is shown at every Slicer start.
+- The first time Taranis is opened the toolbar is added. It is not shown at Slicer start unless
+  "Show the workflow toolbar when Slicer starts" is on (off by default).
 - "Close" hides it for this session. "Disable at startup" stops showing it at Slicer start.
+- Opening Taranis shows it (unless it was closed in this session).
 - Starting or resuming a case always shows it.
-- With "Disable at startup" on, closing the scene / case hides it again.
+- When it is not shown at startup, closing the scene / case hides it again.
 """
 
 
 class ToolbarVisibility:
 
-    def __init__(self, initialized=False, showAtStartup=True):
+    def __init__(self, initialized=False, showAtStartup=False):
         self.initialized = initialized
         self.showAtStartup = showAtStartup
         self.closedByUser = False
