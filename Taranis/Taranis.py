@@ -509,11 +509,13 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         except Exception as e:
             logging.warning(f"Taranis: could not show the segments in 3D: {e}")
         # a new (non-empty) segment: centre the 3D view on all segments once its surface is there
+        # (also the first segment: the view was centred on an empty scene, e.g. before the first AI result)
         filled = {segment.segmentID for segment in snapshot.segments if segment.voxels}
-        added = filled - (self._filledSegments or set())
+        previous = self._filledSegments or set()
+        added = filled - previous
         firstLook = self._filledSegments is None or force
         self._filledSegments = filled
-        if added and not firstLook:
+        if added and (not firstLook or not previous):
             qt.QTimer.singleShot(300, lambda: V.resetThreeDView(viewNode, rotate=False))
 
     def onReload(self):
