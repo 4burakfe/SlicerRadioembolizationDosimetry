@@ -292,6 +292,21 @@ def _colorNode(name):
     return None
 
 
+def applyFunctionalColormap(volumeNode):
+    """Show a SPECT/PET in the functional colour map (inferno), whichever path brought it into the case
+    (registration, direct use of a SPECT/CT or PET/CT, a metabolic PET)."""
+    if volumeNode is None:
+        return
+    if volumeNode.GetDisplayNode() is None:
+        volumeNode.CreateDefaultDisplayNodes()
+    displayNode = volumeNode.GetDisplayNode()
+    colorNode = _colorNode(FUNCTIONAL_COLORMAP)
+    if colorNode is None:
+        logging.warning(f"Taranis: {FUNCTIONAL_COLORMAP} colour table not found; the SPECT/PET keeps its colours.")
+    elif displayNode is not None and displayNode.GetColorNodeID() != colorNode.GetID():
+        displayNode.SetAndObserveColorNodeID(colorNode.GetID())
+
+
 def viewNodes():
     """{key: slice or 3D view node} of the layout (None if it was not created yet)."""
     nodes = {key: slicer.mrmlScene.GetSingletonNode(spec[0], "vtkMRMLSliceNode") for key, spec in SLICE_VIEWS.items()}
@@ -369,13 +384,7 @@ def showLayout(anatomy, functional, segmentationNode, fit=True, fusionOpacity=FU
             logging.warning(f"Taranis: could not move the 3D window to the second screen: {e}")
     nodes = viewNodes()
 
-    if functional is not None:
-        if functional.GetDisplayNode() is None:
-            functional.CreateDefaultDisplayNodes()
-        displayNode = functional.GetDisplayNode()
-        colorNode = _colorNode(FUNCTIONAL_COLORMAP)
-        if colorNode is not None and displayNode.GetColorNodeID() in (None, "", "vtkMRMLColorTableNodeGrey"):
-            displayNode.SetAndObserveColorNodeID(colorNode.GetID())   # grey on grey would hide the uptake
+    applyFunctionalColormap(functional)   # grey (or a DICOM PET table) on grey would hide the uptake
 
     for key, (tag, orientation, _, _, fused) in SLICE_VIEWS.items():
         sliceWidget = layoutManager.sliceWidget(tag)

@@ -51,6 +51,7 @@ EDITOR_NODE_TAG = "TaranisSegmentEditor"
 TOTALSEG_LIVER = "totalseg_liver"
 TOTALSEG_LUNGS = "totalseg_lungs"
 TOTALSEG_TUMOR = "totalseg_tumor"
+FUNCTIONAL_ROLES = (R.ROLE_DOSIMETRY, R.ROLE_METABOLIC)   # SPECT/PET roles, always shown in inferno
 TOTALSEG_KEYS = {TOTALSEG_LIVER: W.SEGMENT_LIVER, TOTALSEG_LUNGS: W.SEGMENT_LUNGS, TOTALSEG_TUMOR: W.SEGMENT_TUMOR}
 CANDIDATE_SUFFIX = re.compile(r"\s*\([^()]*evaluate\)\s*$")
 STRUCTURE_ROLES = [W.SEGMENT_LIVER, W.SEGMENT_PERFUSED, W.SEGMENT_TUMOR, W.SEGMENT_VIABLE, W.SEGMENT_NORMAL,
@@ -470,6 +471,7 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if functional is anatomy:
             functional = None
         segmentationNode = case.roleNode(R.ROLE_SEGMENTATION)
+        self._colorFunctionalImages()   # the metabolic PET too, in case it is put in the foreground
         try:
             if segmentationNode is not None:
                 segtools.extendSegmentationGeometry(segmentationNode, anatomy, segtools.caseVolumes(case))
@@ -1104,6 +1106,21 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 self._ensureValidMode()
         finally:
             case.node.EndModify(wasModifying)
+        if role in FUNCTIONAL_ROLES:
+            self._colorFunctionalImages()
+
+    def _colorFunctionalImages(self):
+        """Inferno for the dosimetry and metabolic images as soon as they are assigned, so the fused views show
+        them in colour whether or not the registration step was used."""
+        case = self.controller.case
+        anatomy = case.primaryVolume()
+        for role in FUNCTIONAL_ROLES:
+            node = case.roleNode(role)
+            if node is not None and node is not anatomy:
+                try:
+                    V.applyFunctionalColormap(node)
+                except Exception as e:
+                    logging.warning(f"Taranis: could not colour {node.GetName()}: {e}")
 
     def onRoleTypeChanged(self, role):
         if self._updating or not self.controller.isActive:
@@ -1173,6 +1190,7 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 changes.append(f"Segmentation: {segmentations[0].GetName()}")
         finally:
             case.node.EndModify(wasModifying)
+        self._colorFunctionalImages()
         if case.roleNode(R.ROLE_SEGMENTATION) is not None:
             persistSegmentRoles(case.roleNode(R.ROLE_SEGMENTATION))
         text = "\n".join(changes + suggestion.notes) if (changes or suggestion.notes) else \
