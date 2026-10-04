@@ -1,5 +1,8 @@
 # Taranis: Open-Source Dosimetry Suite for Radioembolization
 
+Author: Burak Demir, MD, FEBNM
+Contact: 4burakfe@gmail.com
+
 ![Banner](banner.png)
 
 
