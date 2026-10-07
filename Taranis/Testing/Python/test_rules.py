@@ -146,6 +146,21 @@ class DataStepTest(unittest.TestCase):
         status = W.evaluateData(snapshot(roles=roles, roleTypes=types, mode=R.MODE_ABSOLUTE))
         self.assertTrue(all(i.severity != W.SEVERITY_ERROR for i in status.issues))
 
+    def test_wrongRadionuclide(self):
+        fdg = vol("s", modality="PT", units="BQML", radionuclideHalfLife=6586.2, radionuclide="^18^Fluorine")
+        roles = {R.ROLE_DOSIMETRY: fdg, R.ROLE_REFERENCE: vol("c")}
+        types = {R.ROLE_DOSIMETRY: R.TYPE_Y90_PET, R.ROLE_REFERENCE: R.TYPE_CT}
+        status = W.evaluateData(snapshot(roles=roles, roleTypes=types, mode=R.MODE_ABSOLUTE))
+        self.assertTrue(any(i.severity == W.SEVERITY_ERROR and i.text.startswith(W.WRONG_RADIONUCLIDE)
+                            and "F-18" in i.text for i in status.issues))
+        status = W.evaluateData(snapshot(roles=roles, roleTypes=types, mode=R.MODE_RELATIVE))
+        self.assertTrue(any(i.severity == W.SEVERITY_WARNING and i.text.startswith(W.WRONG_RADIONUCLIDE)
+                            for i in status.issues))
+        self.assertFalse(any(i.severity == W.SEVERITY_ERROR for i in status.issues))
+        roles[R.ROLE_DOSIMETRY] = vol("s", modality="PT", units="BQML", radionuclideHalfLife=230400.0)
+        status = W.evaluateData(snapshot(roles=roles, roleTypes=types, mode=R.MODE_ABSOLUTE))
+        self.assertFalse(any(i.text.startswith(W.WRONG_RADIONUCLIDE) for i in status.issues))
+
     def test_maaAbsoluteIsError(self):
         status = W.evaluateData(snapshot(
             roles={R.ROLE_DOSIMETRY: vol("s"), R.ROLE_DOSIMETRY_ANATOMY: vol("c")},

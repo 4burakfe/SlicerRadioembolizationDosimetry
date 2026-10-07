@@ -121,13 +121,54 @@ def unitsAreActivityConcentration(unitText):
     return text == "bqml" or text.endswith("bq/ml")
 
 
-def absoluteDosimetryProblem(inputName, hasCase, caseImageName, isCaseImage, caseImageType, voxelUnits, dicomUnits):
+# Physical half-lives (s) used to name the radionuclide a PET was acquired with (DICOM (0018,1075))
+Y90_HALF_LIFE_S = 230580.0
+_HALF_LIVES_S = [("Y-90", Y90_HALF_LIFE_S), ("F-18", 6586.2), ("Ga-68", 4062.6), ("C-11", 1223.4),
+                 ("N-13", 597.9), ("O-15", 122.2), ("Rb-82", 76.4), ("Cu-64", 45720.0), ("Zr-89", 282276.0),
+                 ("I-124", 360806.0)]
+_HALF_LIFE_TOLERANCE = 0.02
+_NON_Y90_NUCLIDE_WORDS = ["fluor", "f18", "f-18", "18f", "^18^f", "fdg", "fludeoxyglucose", "psma", "choline", "gallium", "ga68",
+                          "ga-68", "68ga", "^68^ga", "dota", "carbon", "c11", "c-11", "11c", "nitrogen", "n13",
+                          "ammonia", "oxygen", "o15", "water", "rubidium", "rb82", "copper", "cu64", "zirconium",
+                          "zr89", "iodine", "i124"]
+
+
+def radionuclideProblem(modality, halfLifeSeconds, nuclideText):
+    """Description of the wrong radionuclide a PET was acquired with (e.g. "F-18 (half-life 109.8 min)"),
+    or "" when it is Y-90 or unknown.
+
+    The scanner takes both the decay correction and the positron branching ratio from the selected radionuclide,
+    so a Y-90 PET acquired as F-18 has Bq/mL values about 30 000 times too low. The DICOM half-life (0018,1075) is
+    the number the scanner actually used and decides; without it the radionuclide / radiopharmaceutical names are
+    used. Only PET is checked: bremsstrahlung SPECT is often acquired with a Tc-99m protocol and calibrated
+    separately."""
+    if (modality or "").upper() != "PT":
+        return ""
+    if halfLifeSeconds and halfLifeSeconds > 0:
+        if abs(halfLifeSeconds / Y90_HALF_LIFE_S - 1) <= _HALF_LIFE_TOLERANCE:
+            return ""
+        name = next((n for n, t in _HALF_LIVES_S if abs(halfLifeSeconds / t - 1) <= _HALF_LIFE_TOLERANCE), "")
+        minutes = halfLifeSeconds / 60.0
+        duration = f"{minutes:.1f} min" if minutes < 120 else f"{minutes / 60.0:.1f} h"
+        return f"{name} (half-life {duration})" if name else f"a radionuclide with a half-life of {duration}"
+    text = (nuclideText or "").strip()
+    lowered = text.lower()
+    if not text or _contains(lowered, _Y90_WORDS):
+        return ""
+    if _contains(lowered, _NON_Y90_NUCLIDE_WORDS):
+        return text
+    return ""
+
+
+def absoluteDosimetryProblem(inputName, hasCase, caseImageName, isCaseImage, caseImageType, voxelUnits, dicomUnits,
+                             modality="", halfLifeSeconds=None, nuclideText=""):
     """Reason why absolute dosimetry must not run on the selected input image, or "" when it may.
 
     With a Taranis case in the scene, the input must be the case's dosimetry image and its type must allow absolute
     dosimetry (as on the hub's Dosimetry step). Without a case, the image must carry activity-concentration units
     (Bq/mL) in its metadata. voxelUnits: the volume's voxel value units (e.g. "Bq/ml", "{SUVbw}g/ml");
-    dicomUnits: DICOM (0054,1001) Units of its series (BQML, CNTS, GML...)."""
+    dicomUnits: DICOM (0054,1001) Units of its series (BQML, CNTS, GML...), used only when voxelUnits are not
+    recognised. modality, halfLifeSeconds, nuclideText: see radionuclideProblem."""
     if hasCase:
         if not caseImageName:
             return ("Absolute dosimetry is locked: no dosimetry image is assigned in the Taranis case. Assign the "
@@ -142,11 +183,21 @@ def absoluteDosimetryProblem(inputName, hasCase, caseImageName, isCaseImage, cas
             note = next((n for m, _, n in modeOptions(caseImageType) if m == MODE_ABSOLUTE), "")
             return (f"Absolute dosimetry is locked for a {TYPE_LABELS.get(caseImageType, caseImageType)}"
                     + (f": {note}" if note else ".") + " Use patient-relative dosimetry.")
-    if unitsAreActivityConcentration(voxelUnits) or (dicomUnits or "").upper() == UNITS_QUANTITATIVE:
+    nuclide = radionuclideProblem(modality, halfLifeSeconds, nuclideText)
+    if nuclide:
+        return (f"Absolute dosimetry is locked: '{inputName}' was acquired as {nuclide}, not Y-90. The scanner used "
+                "the wrong decay and positron branching ratio, so its Bq/mL values are not Y-90 activity. Use "
+                "patient-relative dosimetry, or reconstruct the PET with Y-90 as the radionuclide.")
+    # The voxel units describe the array as loaded and win over the series' DICOM Units: a PET loaded as SUV keeps
+    # the BQML header of its series. The header decides only when the array carries no recognised units.
+    voxelIsSuv = "suv" in (voxelUnits or "").lower()
+    if unitsAreActivityConcentration(voxelUnits):
+        return ""
+    if not voxelIsSuv and (dicomUnits or "").upper() == UNITS_QUANTITATIVE:
         return ""
     if hasCase and not voxelUnits and not dicomUnits:
         return ""   # e.g. loaded from a file without metadata: the user assigned it as quantitative in the case
-    if "suv" in (voxelUnits or "").lower() or (dicomUnits or "").upper() == UNITS_SUV:
+    if voxelIsSuv or (dicomUnits or "").upper() == UNITS_SUV:
         return (f"Absolute dosimetry is locked: '{inputName}' is in SUV, not in activity concentration (Bq/mL). "
                 "Load the PET in Bq/mL.")
     if (dicomUnits or "").upper() == UNITS_COUNTS:
@@ -182,6 +233,7 @@ class VolumeInfo:
     units: str = ""                  # DICOM (0054,1001): BQML, CNTS, GML, ...
     radiopharmaceutical: str = ""
     radionuclide: str = ""
+    radionuclideHalfLife: float = None   # s, DICOM (0018,1075) (None if unknown)
     frameOfReferenceUID: str = ""
     studyUID: str = ""
     acquisitionDateTime: str = ""    # ISO format, "" if unknown

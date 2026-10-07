@@ -658,14 +658,43 @@ class RadioembolizationDosimetryAbsoluteWidget(DosimetryWidgetBase):
         case = TaranisCase.find()
         caseImage = case.roleNode(R.ROLE_DOSIMETRY) if case is not None else None
         try:
-            dicomUnits = volumeInfo(node).units
+            info = volumeInfo(node)
         except Exception:
-            dicomUnits = ""
+            info = R.VolumeInfo(nodeID=node.GetID())
         return R.absoluteDosimetryProblem(
             node.GetName(), case is not None, caseImage.GetName() if caseImage is not None else "",
             caseImage is not None and caseImage.GetID() == node.GetID(),
             case.roleType(R.ROLE_DOSIMETRY) if case is not None else None,
-            detectConcentrationUnit(node) or "", dicomUnits or "")
+            detectConcentrationUnit(node) or "", info.units or "",
+            info.modality, info.radionuclideHalfLife, f"{info.radionuclide} {info.radiopharmaceutical}")
+
+    def _warnWrongRadionuclide(self, node):
+        """Pop-up, once per volume, when the selected PET was acquired with another radionuclide than Y-90."""
+        if node is None:
+            return
+        warned = getattr(self, "_radionuclideWarned", set())
+        self._radionuclideWarned = warned
+        if node.GetID() in warned:
+            return
+        try:
+            from TaranisLib import roles as R
+            from TaranisLib.case import volumeInfo
+            info = volumeInfo(node)
+            nuclide = R.radionuclideProblem(info.modality, info.radionuclideHalfLife,
+                                            f"{info.radionuclide} {info.radiopharmaceutical}")
+        except Exception as e:
+            logging.warning(f"Absolute dosimetry: could not check the radionuclide of '{node.GetName()}': {e}")
+            return
+        if not nuclide:
+            return
+        warned.add(node.GetID())
+        slicer.util.warningDisplay(
+            f"'{node.GetName()}' was acquired as {nuclide}, not Y-90.\n\n"
+            "The scanner used that radionuclide's decay and positron branching ratio, so the Bq/mL values in this "
+            "image are not Y-90 activity (for F-18 about 30 000 times too low).\n\n"
+            "Absolute dosimetry is locked for this image. If this is a Y-90 PET, reconstruct it with Y-90 as the "
+            "radionuclide, or use patient-relative dosimetry.",
+            windowTitle="Wrong radionuclide")
 
     def _updateAbsoluteLock(self):
         try:
@@ -685,6 +714,7 @@ class RadioembolizationDosimetryAbsoluteWidget(DosimetryWidgetBase):
     def onInputVolumeChanged(self, node):
         """Pre-select the image unit if the volume carries unit metadata."""
         self._updateAbsoluteLock()
+        self._warnWrongRadionuclide(node)
         unit = detectConcentrationUnit(node) if node else None
         if not unit:
             return

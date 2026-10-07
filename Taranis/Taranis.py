@@ -542,10 +542,39 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def _moveStep(self, delta):
         order = [HOME] + W.STEP_KEYS
         index = order.index(self._step) + delta
+        if delta > 0 and self._step == W.STEP_DATA and not self._confirmData():
+            return
         if delta > 0 and self._step == W.STEP_SEGMENTATION and not self._confirmSegmentation():
             return
         if 0 <= index < len(order):
             self.showStep(order[index])
+
+    def _confirmData(self):
+        """Continue from the Data step: show its errors (e.g. absolute dosimetry on an F-18 PET) and a wrong
+        radionuclide of the dosimetry image in a pop-up. Returns False if the user stays to fix them (soft gating)."""
+        if not self.controller.isActive:
+            return True
+        try:
+            self.controller.update()
+        except Exception as e:
+            logging.warning(f"Taranis: data check before continuing failed: {e}")
+        status = self.controller.status(W.STEP_DATA)
+        issues = status.issues if status else []
+        if not any(issue.severity == W.SEVERITY_ERROR or issue.text.startswith(W.WRONG_RADIONUCLIDE)
+                   for issue in issues):
+            return True
+        findings = [issue for issue in issues if issue.severity in (W.SEVERITY_ERROR, W.SEVERITY_WARNING)]
+        box = qt.QMessageBox(slicer.util.mainWindow())
+        box.setIcon(qt.QMessageBox.Warning)
+        box.setWindowTitle("Data check")
+        box.setText("The data check found:")
+        box.setInformativeText("\n".join(f"• {issue.text}" for issue in
+                                          sorted(findings, key=lambda i: W.SEVERITY_ORDER[i.severity])))
+        stayButton = box.addButton("Stay and fix", qt.QMessageBox.RejectRole)
+        box.addButton("Continue anyway", qt.QMessageBox.AcceptRole)
+        box.setDefaultButton(stayButton)
+        box.exec_()
+        return box.clickedButton() is not stayButton
 
     def _confirmSegmentation(self):
         """Continue from the Segmentation step: run the geometry check and show every error / warning of the step

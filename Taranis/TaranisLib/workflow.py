@@ -273,6 +273,9 @@ def _roleLabel(role):
     return R.ROLE_INFO[role][0]
 
 
+WRONG_RADIONUCLIDE = "Wrong radionuclide:"
+
+
 def evaluateData(s):
     issues = []
     dosimetry = s.roles.get(R.ROLE_DOSIMETRY)
@@ -288,6 +291,18 @@ def evaluateData(s):
         elif s.mode and not R.modeAllowed(imageType, s.mode):
             issues.append(Issue(SEVERITY_ERROR, f"{R.MODE_LABELS[s.mode]} dosimetry is not possible with "
                                                 f"{R.TYPE_LABELS[imageType]}."))
+        nuclide = R.radionuclideProblem(dosimetry.modality, dosimetry.radionuclideHalfLife,
+                                        f"{dosimetry.radionuclide} {dosimetry.radiopharmaceutical}")
+        if nuclide and s.mode == R.MODE_ABSOLUTE:
+            issues.append(Issue(SEVERITY_ERROR, f"{WRONG_RADIONUCLIDE} '{dosimetry.name}' was acquired as {nuclide}, "
+                                                "not Y-90: its Bq/mL values are not Y-90 activity, absolute dosimetry "
+                                                "is not possible. Use patient-relative dosimetry, or reconstruct the "
+                                                "PET with Y-90 as the radionuclide."))
+        elif nuclide:
+            issues.append(Issue(SEVERITY_WARNING, f"{WRONG_RADIONUCLIDE} '{dosimetry.name}' was acquired as "
+                                                  f"{nuclide}, not Y-90. Patient-relative dosimetry is still valid "
+                                                  "for a single-bed acquisition (multi-bed: the beds are "
+                                                  "decay-corrected with the wrong half-life)."))
         if s.mode == R.MODE_ABSOLUTE:
             if R.looksLikeSuv(dosimetry):
                 issues.append(Issue(SEVERITY_ERROR, "The dosimetry image is in SUV: absolute dosimetry needs an "

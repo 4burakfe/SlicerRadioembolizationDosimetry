@@ -264,6 +264,9 @@ def _dicomFields(volumeNode):
                 codes = item.get("RadionuclideCodeSequence")
                 if codes:
                     fields["radionuclide"] = str(codes[0].get("CodeMeaning", "") or "")
+                halfLife = item.get("RadionuclideHalfLife")
+                if halfLife not in (None, ""):
+                    fields["radionuclideHalfLife"] = float(halfLife)
         except Exception:
             pass
     _dicomCache[key] = fields
