@@ -219,13 +219,15 @@ SEGMENT_ROLE_KEYS = list(SEGMENT_ROLES)
 
 
 def perfusedColor(key):
-    """A red of its own for every perfused volume: full red, plus a little green and / or blue (together at most
-    0.3), chosen from the segment ID so it stays the same."""
+    """A red of its own for every perfused volume, chosen from the segment ID so it stays the same: full red plus
+    green (r+g), blue (r+b) or both (r+g+b), each added channel 0.08 .. 0.3."""
     import zlib
     value = zlib.crc32(str(key).encode("utf-8"))
-    total = 0.08 + 0.22 * ((value % 1000) / 999.0)          # green + blue: 0.08 .. 0.30
-    share = ((value // 1000) % 1000) / 999.0                 # how it is split between green and blue
-    return (1.0, round(total * share, 4), round(total * (1.0 - share), 4))
+    mix = value % 3                                              # 0: r+g, 1: r+b, 2: r+g+b
+    level = lambda n: round(0.08 + 0.22 * (((value // n) % 1000) / 999.0), 4)
+    green = level(3) if mix in (0, 2) else 0.0
+    blue = level(3000) if mix in (1, 2) else 0.0
+    return (1.0, green, blue)
 
 # Normal tissue segments: whole normal liver (liver − tumours) or perfused normal liver (perfused volume − tumours).
 # Tag on the segment, read by the dose checks (tumour-to-normal ratio against the perfused normal liver).

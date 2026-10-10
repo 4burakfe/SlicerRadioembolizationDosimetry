@@ -161,6 +161,65 @@ class TreeSegmentTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             V.arterialTree(self.denoised, self.contrast, self.region, (5, 85, 5), SPACING, rootMaxMM=3.0)
 
+    def test_bridgeGaps(self):
+        """The left branch interrupted for a few mm (noise): its distal part is lost without bridging, joined with
+        it."""
+        p = self.phantom
+        image = self.image.copy()
+        gap = V.ballMask(SHAPE, (30, 64, 27), 2.5, SPACING)               # on the left branch, past its side branch
+        cut = gap & p.vessels
+        image[cut] = 100.0 + self.shading[cut]
+        denoised = V.denoise(image, SPACING)
+        contrast = V.localContrast(denoised, p.liver, SPACING)
+        distal = segmentDistance(SHAPE, (30, 70, 23), (30, 75, 20)) <= 1.0
+        try:
+            V.setParameters({})
+            plain = V.arterialTree(denoised, contrast, self.region, p.root, SPACING, p.liver).mask
+            V.setParameters({"BRIDGE_GAPS": True, "BRIDGE_GAP_MM": 8.0})
+            bridged = V.arterialTree(denoised, contrast, self.region, p.root, SPACING, p.liver).mask
+        finally:
+            V.setParameters({})
+        self.assertFalse((plain & distal).any())
+        self.assertTrue((bridged & distal).any())
+        self.assertFalse((bridged & self.bone).any())
+
+    def test_bridgeGapsDirect(self):
+        tree = np.zeros((10, 30, 10), bool)
+        tree[5, 0:10, 5] = True
+        piece = np.zeros_like(tree)
+        piece[5, 13:25, 5] = True                                    # 3 voxels missing
+        region = np.ones_like(tree)
+        joined = V.bridgeGaps(tree, piece, piece, region, (1.0, 1.0, 1.0), gapMM=4.0)
+        self.assertTrue(joined[5, 10:13, 5].all() and joined[5, 24, 5])
+        self.assertFalse(V.bridgeGaps(tree, piece, piece, region, (1.0, 1.0, 1.0), gapMM=2.0)[5, 24, 5])
+        self.assertFalse(V.bridgeGaps(tree, piece, np.zeros_like(tree), region, (1.0, 1.0, 1.0), gapMM=4.0)[5, 24, 5])
+        blocked = region.copy()
+        blocked[5, 11, 5] = False                                    # metal in the gap
+        self.assertFalse(V.bridgeGaps(tree, piece, piece, blocked, (1.0, 1.0, 1.0), gapMM=4.0)[5, 24, 5])
+
+    def test_extrahepaticFloor(self):
+        """A moderately bright tube outside the liver, joined to the trunk (muscle / bowel wall seen against the liver
+        background): tree without a floor, not tree with a floor above its value."""
+        p = self.phantom
+        image = self.image.copy()
+        tissue = segmentDistance(SHAPE, (30, 8, 52), (30, 8, 80)) <= 2.0
+        tissue &= ~p.vessels
+        image[tissue] = 200.0
+        denoised = V.denoise(image, SPACING)
+        contrast = V.localContrast(denoised, p.liver, SPACING)
+        try:
+            V.setParameters({"EXTRAHEPATIC_MIN_HU": -1000.0})
+            loose = V.arterialTree(denoised, contrast, self.region, p.root, SPACING, p.liver).mask
+            V.setParameters({"EXTRAHEPATIC_MIN_HU": 300.0})
+            floored = V.arterialTree(denoised, contrast, self.region, p.root, SPACING, p.liver).mask
+        finally:
+            V.setParameters({})
+        far = tissue.copy()
+        far[:, :, :60] = False
+        self.assertGreater(np.count_nonzero(loose & far), 20)
+        self.assertEqual(np.count_nonzero(floored & far), 0)
+        self.assertTrue(floored[tuple(np.array(p.fork))])           # the 600 HU trunk stays
+
     def test_coilNextToArtery(self):
         """A coil 4 mm beside the right branch: the metal margin does not cut the branch, the coil is not tree."""
         p = self.phantom
@@ -545,6 +604,54 @@ class DenoiseTest(unittest.TestCase):
         self.assertEqual(V.DENOISE_METHOD, V.DENOISE_BILATERAL)
         V.setParameters({})
         self.assertEqual(V.DENOISE_METHOD, V.DENOISE_CURVATURE)                 # the default
+
+
+class SeveralInjectionsTest(unittest.TestCase):
+    """Two separate trees (celiac trunk and SMA origins), one injection point in each."""
+
+    def test_forest(self):
+        skeleton = np.zeros((20, 60, 60), bool)
+        skeleton[10, 5:30, 10] = True          # tree A: trunk ...
+        skeleton[10, 29, 10:25] = True         # ... and a branch
+        skeleton[10, 5:40, 45] = True          # tree B, separate
+        tree = V.buildTree(skeleton, SPACING, [(10, 5, 10), (10, 5, 45)])
+        self.assertEqual(len(tree.roots), 2)
+        self.assertEqual(int(np.count_nonzero(tree.parent < 0)), 2)
+        self.assertGreater(tree.count, 60)                       # both trees kept
+        for root in tree.roots:
+            self.assertTrue(tree.isRoot(root))
+        # the subtrees do not mix: no point of B downstream of A's root
+        rootA = min(tree.roots, key=lambda r: tree.points[r][2])
+        rootB = max(tree.roots, key=lambda r: tree.points[r][2])
+        self.assertFalse((tree.downstream(rootA) & tree.downstream(rootB)).any())
+        self.assertTrue(tree.downstream(rootA).sum() + tree.downstream(rootB).sum() == tree.count)
+        # one injection point: only its tree
+        single = V.buildTree(skeleton, SPACING, (10, 5, 10))
+        self.assertLess(single.count, tree.count)
+        with self.assertRaises(ValueError):
+            V.buildTree(skeleton, SPACING, [(10, 5, 10), (10, 55, 55)])   # the second point is not on a vessel
+
+    def test_brightestOnLine(self):
+        values = np.zeros((20, 20, 20))
+        values[10, 10, 15] = 5.0
+        values[10, 10, 3] = 9.0
+        mask = np.ones(values.shape, bool)
+        self.assertEqual(V.brightestOnLine(values, mask, (10, 10, 8), (0, 0, 1), SPACING), (10, 10, 3))
+        mask[:, :, :5] = False                                  # the brighter one is outside the rendered region
+        self.assertEqual(V.brightestOnLine(values, mask, (10, 10, 8), (0, 0, 1), SPACING), (10, 10, 15))
+
+
+class NearestToLineTest(unittest.TestCase):
+
+    def test_viewingLine(self):
+        points = np.array([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, 0.0, 50.0], [30.0, 0.0, 0.0]])
+        # looking down -z through (10, 0.5, 100): both points at x = 10 are on the line, the nearer one wins
+        index, distance = V.nearestToLine(points, (10.0, 0.5, 100.0), (0.0, 0.0, -1.0), 4.0)
+        self.assertEqual(index, 2)
+        self.assertAlmostEqual(distance, 0.5)
+        index, distance = V.nearestToLine(points, (20.0, 0.0, 100.0), (0.0, 0.0, -1.0), 4.0)
+        self.assertIsNone(index)
+        self.assertAlmostEqual(distance, 10.0)
 
 
 class CarmAngleTest(unittest.TestCase):

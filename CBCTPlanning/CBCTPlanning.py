@@ -238,9 +238,17 @@ class CBCTPlanningWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                                     "contrast-filled artery, then extract the tree. Review it, erase veins, bone or the "
                                     "catheter in the Segment Editor if needed, and recompute the centerlines."))
         row = qt.QHBoxLayout()
-        self.injectionButton = qt.QPushButton("Place injection point")
+        self.injectionButton = qt.QPushButton("Add injection point")
+        self.injectionButton.setToolTip("The catheter tip of the CBCT run, inside the contrast-filled artery. Add a "
+                                        "second one when the liver has arteries from two origins (e.g. celiac trunk "
+                                        "and superior mesenteric artery) filled in the same run. In the 3D view the "
+                                        "point goes to the brightest vessel under the click.")
         self.injectionButton.connect("clicked()", self.onPlaceInjection)
         row.addWidget(self.injectionButton)
+        self.clearInjectionButton = qt.QPushButton("Clear")
+        self.clearInjectionButton.setToolTip("Remove all injection points.")
+        self.clearInjectionButton.connect("clicked()", self.onClearInjection)
+        row.addWidget(self.clearInjectionButton)
         self.injectionLabel = smallGray()
         row.addWidget(self.injectionLabel, 1)
         treeLayout.addRow(row)
@@ -434,6 +442,12 @@ class CBCTPlanningWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                                      "but not across vessel walls (slower).")
         self.denoiseCombo.connect("currentIndexChanged(int)", self._onAdvancedChanged)
         advancedLayout.addRow("Denoising method:", self.denoiseCombo)
+        self.bridgeCheck = qt.QCheckBox("Bridge short interruptions of vessels")
+        self.bridgeCheck.setToolTip("Arteries that look interrupted for a few mm (noise) are joined to the tree when "
+                                    "their continuation is a seeded, tube-shaped vessel piece within the largest gap "
+                                    "below. Off by default: it can also join veins or noise running close by.")
+        self.bridgeCheck.connect("toggled(bool)", self._onAdvancedChanged)
+        advancedLayout.addRow(self.bridgeCheck)
         self.advancedSpins = {}
         for name, label, minimum, maximum, step, toolTip in V.TUNABLE:
             spin = qt.QDoubleSpinBox()
@@ -476,6 +490,7 @@ class CBCTPlanningWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ruleCombo.connect("currentIndexChanged(int)", self._onSettingsChanged)
         self.subtractCheck.connect("toggled(bool)", self._onSettingsChanged)
         self.addObserver(slicer.mrmlScene, slicer.mrmlScene.StartCloseEvent, self._onSceneClose)
+        self.addObserver(slicer.mrmlScene, slicer.mrmlScene.EndImportEvent, self._onSceneImported)
         self.feedersTable.connect("itemSelectionChanged()", self.onFeederSelected)
         self._autoPredictTimer = qt.QTimer()
         self._autoPredictTimer.setSingleShot(True)
@@ -491,8 +506,21 @@ class CBCTPlanningWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         allowNarrowPanel(self.parent)   # long names must not widen the panel
         self._fillFromCase()
         self._observeTips()
+        self._observeInjection()
         self._refresh()
-        qt.QTimer.singleShot(0, lambda: self._showLayout(resetView=True))
+        qt.QTimer.singleShot(0, self._showOnEnter)
+
+    def _showOnEnter(self):
+        """The planning layout with the MIP of the CBCT in the liver at once (the working grid is prepared if the
+        CBCT and the whole liver are known), not only after the tree extraction."""
+        if self.session is None and self._inputsReady():
+            try:
+                with self._busy("Preparing the working grid"):
+                    self._getSession()
+                self.statusLabel.text = ""
+            except Exception as e:
+                logging.warning(f"CBCT planning: could not prepare the working grid: {e}")
+        self._showLayout(resetView=True)
 
     def _showLayout(self, resetView=False):
         """Planning layout; 3D view white, orthographic, centred and seen from anterior when resetView."""
@@ -510,6 +538,36 @@ class CBCTPlanningWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def _onSceneClose(self, caller=None, event=None):
         self._closeSession()
         self._observedTips = None
+        self._observedInjection = None
+
+    def _onSceneImported(self, caller=None, event=None):
+        """A loaded scene brings new tip / injection markups: watch them (snapping) even if the module is open."""
+        def observe():
+            try:
+                self._fillFromCase()
+            except Exception as e:
+                logging.warning(f"CBCT planning: could not fill the inputs from the case: {e}")
+            self._observedTips = None
+            self._observedInjection = None
+            self._observeTips()
+            self._observeInjection()
+        qt.QTimer.singleShot(0, observe)
+
+    def _ensureTree(self):
+        """The session and the centerlines for snapping (after a scene was loaded both are rebuilt from the stored
+        tree segment). Returns the session, or None when there is no tree yet."""
+        if self.session is not None and self.session.tree is not None:
+            return self.session
+        if C.treeNode(self.store) is None or not self._inputsReady():
+            return self.session
+        try:
+            self._progress("Reading the arterial tree")
+            session = self._getSession()
+            session.ensureTree()
+            return session
+        except Exception as e:
+            logging.warning(f"CBCT planning: could not read the arterial tree for snapping: {e}")
+            return self.session
 
     def _observeTips(self):
         """Tips added, moved or removed: refresh the table and predict the territories again."""
@@ -523,11 +581,51 @@ class CBCTPlanningWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         for name in ("PointPositionDefinedEvent", "PointEndInteractionEvent", "PointRemovedEvent"):
             self.addObserver(node, getattr(slicer.vtkMRMLMarkupsNode, name), self._onTipsChanged)
         self._observedTips = node
+        self._snappedTips = {}
 
     def _onTipsChanged(self, caller=None, event=None):
-        """Only the tip table follows the markers (no automatic prediction: it made placing tips lag)."""
+        """Only the tip table follows the markers (no automatic prediction: it made placing tips lag). A tip placed
+        or moved is snapped onto the centerlines."""
+        message = self._snapTips(caller)
         self._refreshResults()
-        self.statusLabel.text = "Tips changed: click 'Predict territories' to update the territories."
+        self.statusLabel.text = message or "Tips changed: click 'Predict territories' to update the territories."
+
+    def _snapTips(self, node):
+        """Tips placed or dragged since the last snap go onto the nearest centerline: in the 3D view along the
+        viewing line (the volume rendering puts them on its surface), in a slice view to the nearest point."""
+        if node is None:
+            return ""
+        self._ensureTree()
+        if self.session is None or self.session.tree is None:
+            return ""
+        snapped = getattr(self, "_snappedTips", {})
+        messages = []
+        for index in range(node.GetNumberOfControlPoints()):
+            ras = [0.0, 0.0, 0.0]
+            node.GetNthControlPointPositionWorld(index, ras)
+            pointID = node.GetNthControlPointID(index)
+            if snapped.get(pointID) is not None and np.allclose(snapped[pointID], ras, atol=1e-3):
+                continue
+            label = node.GetNthControlPointLabel(index)
+            viewLine = None if C.placedOnSlice(ras) else C.viewLineThrough(ras)
+            try:
+                target, distance = self.session.snapPlaced(ras, viewLine)
+            except Exception as e:
+                logging.warning(f"CBCT planning: could not snap tip {label}: {e}")
+                continue
+            if target is None:
+                snapped[pointID] = tuple(ras)
+                messages.append(f"{label} is not on an artery ({distance:.0f} mm from the nearest centerline).")
+                continue
+            snapped[pointID] = target
+            if not np.allclose(target, ras, atol=1e-3):
+                node.SetNthControlPointPositionWorld(index, *target)
+                messages.append(f"{label} snapped onto the artery.")
+        self._snappedTips = {key: value for key, value in snapped.items()
+                             if key in {node.GetNthControlPointID(i) for i in range(node.GetNumberOfControlPoints())}}
+        if messages:
+            return " ".join(messages) + " Click 'Predict territories' to update the territories."
+        return ""
 
     def _autoPredict(self):
         """Predict again after a tip change, quietly (no dialogs), once the tree exists."""
@@ -582,6 +680,7 @@ class CBCTPlanningWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 spin.value = float(advanced.get(name, V.DEFAULT_PARAMETERS[name]))
             self.denoiseCombo.setCurrentIndex(max(0, self.denoiseCombo.findData(
                 advanced.get("DENOISE_METHOD", V.DEFAULT_DENOISE_METHOD))))
+            self.bridgeCheck.checked = bool(advanced.get("BRIDGE_GAPS", False))
             for key, button in self.threeDButtons.items():
                 button.checked = bool(values[f"show3D{key}"])
             self.dsaTopSpin.value = float(values["dsaTopPercentile"])
@@ -651,6 +750,13 @@ class CBCTPlanningWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                       supplyDistanceMM=float(self.supplyDistanceSlider.value),
                       limitTerritories=bool(self.limitCheck.checked),
                       **self._dsa())
+
+    def _inputsReady(self):
+        try:
+            self._inputs()
+            return True
+        except ValueError:
+            return False
 
     def _inputs(self):
         cbct = self.cbctSelector.currentNode()
@@ -749,7 +855,7 @@ class CBCTPlanningWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.statisticsLabel.text = ""
         self.registerButton.enabled = case is not None
         injection = controlPoints(store.GetNodeReference(REF_PLANNING_INJECTION))
-        self.injectionLabel.text = ("placed" if injection else "not placed")
+        self.injectionLabel.text = ({0: "not placed", 1: "placed"}.get(len(injection), f"{len(injection)} placed"))
         tree = self.session.tree if self.session is not None else None
         if tree is not None:
             self.treeLabel.text = (f"Tree: {tree.lengthMM() / 10.0:.0f} cm of centerline, {len(tree.branchPoints())} "
@@ -828,6 +934,8 @@ class CBCTPlanningWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                   if abs(spin.value - V.DEFAULT_PARAMETERS[name]) > 1e-9}
         if self.denoiseCombo.currentData != V.DEFAULT_DENOISE_METHOD:
             values["DENOISE_METHOD"] = self.denoiseCombo.currentData
+        if self.bridgeCheck.checked:
+            values["BRIDGE_GAPS"] = True
         C.setSettings(self.store, advanced=values)
         C.applyAdvanced(self.store)
         self.statusLabel.text = "Advanced settings changed: click 'Extract arterial tree' to use them."
@@ -838,6 +946,7 @@ class CBCTPlanningWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             for name, spin in self.advancedSpins.items():
                 spin.value = float(V.DEFAULT_PARAMETERS[name])
             self.denoiseCombo.setCurrentIndex(self.denoiseCombo.findData(V.DEFAULT_DENOISE_METHOD))
+            self.bridgeCheck.checked = False
         finally:
             self._updating = False
         self._onAdvancedChanged()
@@ -859,9 +968,59 @@ class CBCTPlanningWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def onPlaceInjection(self):
         node = C.markupsNode(self.store, REF_PLANNING_INJECTION, create=True)
-        node.RemoveAllControlPoints()
+        self._observeInjection()
         C.startPlacing(node)
-        self.statusLabel.text = "Click the catheter tip (inside the contrast-filled artery) in a slice view."
+        self.statusLabel.text = ("Click the catheter tip (inside the contrast-filled artery) in a slice view, or on the "
+                                 "vessel in the 3D view.")
+
+    def onClearInjection(self):
+        node = C.markupsNode(self.store, REF_PLANNING_INJECTION)
+        if node is not None:
+            node.RemoveAllControlPoints()
+        self._refresh()
+        self.statusLabel.text = "Injection points removed."
+
+    def _observeInjection(self):
+        node = C.markupsNode(self.store, REF_PLANNING_INJECTION)
+        if node is None or node is getattr(self, "_observedInjection", None):
+            return
+        if getattr(self, "_observedInjection", None) is not None:
+            for name in ("PointPositionDefinedEvent", "PointEndInteractionEvent", "PointRemovedEvent"):
+                self.removeObserver(self._observedInjection, getattr(slicer.vtkMRMLMarkupsNode, name),
+                                    self._onInjectionChanged)
+        for name in ("PointPositionDefinedEvent", "PointEndInteractionEvent", "PointRemovedEvent"):
+            self.addObserver(node, getattr(slicer.vtkMRMLMarkupsNode, name), self._onInjectionChanged)
+        self._observedInjection = node
+        self._snappedInjection = {}
+
+    def _onInjectionChanged(self, caller=None, event=None):
+        """An injection point placed or dragged in the 3D view goes to the brightest vessel under the click."""
+        node = caller
+        if node is not None and self.session is None and self._inputsReady():
+            try:
+                self._getSession()
+            except Exception as e:
+                logging.warning(f"CBCT planning: could not prepare the working grid: {e}")
+        if node is not None and self.session is not None:
+            snapped = getattr(self, "_snappedInjection", {})
+            for index in range(node.GetNumberOfControlPoints()):
+                ras = [0.0, 0.0, 0.0]
+                node.GetNthControlPointPositionWorld(index, ras)
+                pointID = node.GetNthControlPointID(index)
+                if snapped.get(pointID) is not None and np.allclose(snapped[pointID], ras, atol=1e-3):
+                    continue
+                target = None
+                if not C.placedOnSlice(ras):
+                    viewLine = C.viewLineThrough(ras)
+                    try:
+                        target = self.session.snapInjection(ras, viewLine) if viewLine is not None else None
+                    except Exception as e:
+                        logging.warning(f"CBCT planning: could not snap the injection point: {e}")
+                snapped[pointID] = target or tuple(ras)
+                if target is not None and not np.allclose(target, ras, atol=1e-3):
+                    node.SetNthControlPointPositionWorld(index, *target)
+            self._snappedInjection = snapped
+        self._refresh()
 
     def onAddTip(self):
         node = C.markupsNode(self.store, REF_PLANNING_TIPS, create=True)

@@ -162,8 +162,13 @@ def dualLayoutXml():
 
 
 def registerLayout(*args):
-    """Register the single and dual monitor segmentation layouts (at startup, before every scene import and before
-    they are shown: a scene saved in one of them stores only the layout ID)."""
+    """Register the single and dual monitor segmentation layouts and the CBCT planning layout (at startup, before
+    every scene import and before they are shown: a scene saved in one of them stores only the layout ID)."""
+    try:
+        from .cbct import registerPlanningLayout
+        registerPlanningLayout()
+    except Exception as e:
+        logging.warning(f"Taranis: could not register the CBCT planning layout: {e}")
     try:
         layoutManager = slicer.app.layoutManager()
     except Exception:

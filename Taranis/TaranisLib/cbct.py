@@ -120,9 +120,9 @@ def markupsNode(store, reference, create=False):
         display.SetColor(*color)
         display.SetGlyphScale(2.5)
         node.SetMarkupLabelFormat(f"{label}%d")
-        if reference == REF_PLANNING_INJECTION:
-            node.SetMaximumNumberOfControlPoints(1)
         store.SetNodeReferenceID(reference, node.GetID())
+    if node is not None and reference == REF_PLANNING_INJECTION and node.GetMaximumNumberOfControlPoints() == 1:
+        node.SetMaximumNumberOfControlPoints(-1)   # several injection points (older cases allowed one)
     return node
 
 
@@ -560,21 +560,45 @@ class PlanningSession:
         return self.grid.spacing
 
     def injectionKji(self):
+        """The injection point(s) on the grid: [(k, j, i)], one per point (celiac trunk and SMA, for example)."""
         points = controlPoints(markupsNode(self.store, REF_PLANNING_INJECTION))
         if not points:
             raise ValueError("Place the injection point first: the catheter tip during the CBCT, inside the "
                              "contrast-filled artery.")
-        kji = self.grid.toKji(points[0])
-        if not self.grid.inside(kji):
-            raise ValueError("The injection point is outside the working grid: is it on the CBCT?")
-        return kji
+        result = []
+        for number, point in enumerate(points, start=1):
+            kji = self.grid.toKji(point)
+            if not self.grid.inside(kji):
+                raise ValueError(f"Injection point I{number} is outside the working grid: is it on the CBCT?")
+            result.append(kji)
+        return result
+
+    def snapInjection(self, ras, viewLine):
+        """An injection point clicked in the 3D view lands on the surface of the volume rendering: it goes to the
+        brightest voxel along the viewing line inside the rendered region (what the MIP shows there). Returns the new
+        ras or None."""
+        region = self.region if self.region is not None else self.searchRegion(requireInjection=False)
+        origin = self.grid.toKji(viewLine[0])
+        tip = self.grid.toKji(np.asarray(viewLine[0], dtype=float) + np.asarray(viewLine[1], dtype=float))
+        direction = np.asarray(tip) - np.asarray(origin)
+        voxel = V.brightestOnLine(self.values, region, origin, direction, self.spacing)
+        if voxel is None:
+            return None
+        return tuple(float(v) for v in self.grid.toRas(voxel)[0])
 
     # -- Tree --
 
-    def searchRegion(self):
+    def searchRegion(self, requireInjection=True):
+        """Search mask; requireInjection False: without the ball around the injection point(s) when none is placed
+        yet (the MIP shown when the module opens)."""
         # tumours are searched too (their feeding arteries run into them); only the statistics use the parenchyma
-        return V.searchRegion(self.values, self.liver, self.spacing,
-                              self.statistics, self.injectionKji(), self.fov)
+        try:
+            injection = self.injectionKji()
+        except ValueError:
+            if requireInjection:
+                raise
+            injection = None
+        return V.searchRegion(self.values, self.liver, self.spacing, self.statistics, injection, self.fov)
 
     def localContrast(self):
         """Denoised CBCT and its contrast against the surrounding liver (computed once per session)."""
@@ -690,6 +714,20 @@ class PlanningSession:
         return self.segmentMasks((W.SEGMENT_TUMOR, W.SEGMENT_VIABLE))
 
     # -- Prediction --
+
+    def snapPlaced(self, ras, viewLine=None):
+        """Where a tip placed at ras goes on the centerlines: (ras, distance mm) or (None, distance). viewLine
+        (origin, direction) for a click in the 3D view: the volume rendering puts the point on its surface, so the
+        centerline nearest to the viewing line through it is taken (V.RAY_SNAP_MM); otherwise the nearest one."""
+        tree = self.ensureTree()
+        if viewLine is not None:
+            pointsRas = self.grid.toRas(tree.points)
+            index, distance = V.nearestToLine(pointsRas, viewLine[0], viewLine[1], V.RAY_SNAP_MM)
+        else:
+            index, distance = V.snapTip(tree, self.grid.toKji(ras))
+        if index is None:
+            return None, distance
+        return tuple(float(v) for v in self.grid.toRas(tree.points[index])[0]), distance
 
     def snap(self, tipsNode):
         """[(label, ras, index or None, distance mm)] of the planned tips."""
@@ -1008,6 +1046,45 @@ V_PAD = -1024.0                  # outside the search mask
 THREED_VIEW_TAG = "CBCTPlanning3D"   # own 3D view node: other modules' layouts (e.g. the hub's) keep theirs
 
 
+def placedOnSlice(ras, toleranceMM=0.05):
+    """Was this point placed in a slice view (it lies on the plane of a slice view of the layout)?"""
+    layoutManager = slicer.app.layoutManager()
+    if layoutManager is None:
+        return False
+    point = np.asarray(ras, dtype=float)
+    for name in layoutManager.sliceViewNames():
+        widget = layoutManager.sliceWidget(name)
+        if widget is None or not widget.isVisible():
+            continue
+        matrix = widget.mrmlSliceNode().GetSliceToRAS()
+        normal = np.array([matrix.GetElement(r, 2) for r in range(3)])
+        origin = np.array([matrix.GetElement(r, 3) for r in range(3)])
+        if abs(float((point - origin) @ (normal / np.linalg.norm(normal)))) <= toleranceMM:
+            return True
+    return False
+
+
+def viewLineThrough(ras):
+    """(origin, direction) of the planning 3D view's viewing line through a point: along the direction of projection
+    (orthographic) or from the camera (perspective)."""
+    widget = threeDWidget()
+    if widget is None:
+        return None
+    camera = slicer.modules.cameras.logic().GetViewActiveCameraNode(widget.mrmlViewNode())
+    if camera is None:
+        return None
+    position = np.array(camera.GetPosition(), dtype=float)
+    focal = np.array(camera.GetFocalPoint(), dtype=float)
+    point = np.asarray(ras, dtype=float)
+    if camera.GetParallelProjection():
+        direction = focal - position
+    else:
+        direction = point - position
+    if np.linalg.norm(direction) < 1e-6:
+        return None
+    return point, direction
+
+
 def threeDWidget():
     """The 3D widget of the planning layout (not simply the first one: other layouts' 3D views stay registered)."""
     layoutManager = slicer.app.layoutManager()
@@ -1165,7 +1242,8 @@ def renderMaskedContrast(session, viewNode, look=None):
         return None
     if session.region is None:
         try:
-            session.region = session.searchRegion()   # e.g. a new session (settings changed) before extraction
+            # e.g. a new session (settings changed) before extraction, or no injection point yet: the liver alone
+            session.region = session.searchRegion(requireInjection=False)
         except ValueError:
             return None
     if not session.region.any():
@@ -1246,6 +1324,27 @@ def renderMaskedContrast(session, viewNode, look=None):
     return node
 
 
+def registerPlanningLayout(*args):
+    """Make the planning layout known to Slicer (at startup, before every scene import and before it is shown: a
+    scene saved in it stores only the layout ID). True if it was added or changed."""
+    try:
+        layoutManager = slicer.app.layoutManager()
+    except Exception:
+        layoutManager = None
+    if layoutManager is None:
+        return False
+    layoutNode = layoutManager.layoutLogic().GetLayoutNode()
+    if layoutNode is None:
+        return False
+    if not layoutNode.IsLayoutDescription(PLANNING_LAYOUT_ID):
+        layoutNode.AddLayoutDescription(PLANNING_LAYOUT_ID, LAYOUT_XML)
+        return True
+    if layoutNode.GetLayoutDescription(PLANNING_LAYOUT_ID) != LAYOUT_XML:
+        layoutNode.SetLayoutDescription(PLANNING_LAYOUT_ID, LAYOUT_XML)   # an older version registered in this session
+        return True
+    return False
+
+
 def showLayout(cbctNode, treeSegmentationNode=None, caseSegmentationNode=None, session=None, look=None,
                resetView=True):
     """Planning layout: 3D view (white, orthographic, from anterior) with the whole liver, tumours, perfused volumes,
@@ -1253,11 +1352,10 @@ def showLayout(cbctNode, treeSegmentationNode=None, caseSegmentationNode=None, s
     layoutManager = slicer.app.layoutManager()
     if layoutManager is None:
         return
-    layoutNode = layoutManager.layoutLogic().GetLayoutNode()
-    if not layoutNode.IsLayoutDescription(PLANNING_LAYOUT_ID):
-        layoutNode.AddLayoutDescription(PLANNING_LAYOUT_ID, LAYOUT_XML)
-    elif layoutNode.GetLayoutDescription(PLANNING_LAYOUT_ID) != LAYOUT_XML:
-        layoutNode.SetLayoutDescription(PLANNING_LAYOUT_ID, LAYOUT_XML)   # an older version registered in this session
+    if registerPlanningLayout() and layoutManager.layout == PLANNING_LAYOUT_ID:
+        # a scene saved in this layout was opened before the layout was known: its views were never built, and
+        # setting the same layout again does nothing
+        layoutManager.setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutOneUp3DView)
     layoutManager.setLayout(PLANNING_LAYOUT_ID)
     slicer.app.processEvents()
     if cbctNode is not None:

@@ -506,11 +506,16 @@ class CbctTest(unittest.TestCase):
         self.assertTrue(any("not accepted yet" in i.text for i in status.issues))
 
     def test_perfusedColors(self):
-        colors = {W.perfusedColor(f"Segment_{n}") for n in range(20)}
-        self.assertGreater(len(colors), 15)
+        colors = {W.perfusedColor(f"Segment_{n}") for n in range(60)}
+        self.assertGreater(len(colors), 50)
+        mixes = set()
         for r, g, b in colors:
             self.assertEqual(r, 1.0)
-            self.assertTrue(0.08 - 1e-6 <= g + b <= 0.30 + 1e-6)   # green and blue together at most 0.3
+            for channel in (g, b):                                  # each of green and blue: none, or 0.08 .. 0.3
+                self.assertTrue(channel == 0.0 or 0.08 - 1e-6 <= channel <= 0.30 + 1e-6)
+            self.assertTrue(g > 0 or b > 0)
+            mixes.add((g > 0, b > 0))
+        self.assertEqual(mixes, {(True, False), (False, True), (True, True)})   # r+g, r+b and r+g+b
         self.assertEqual(W.perfusedColor("x"), W.perfusedColor("x"))
 
     def test_vesselSegments(self):

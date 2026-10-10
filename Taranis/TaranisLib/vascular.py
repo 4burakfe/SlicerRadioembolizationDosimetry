@@ -58,6 +58,10 @@ LOCAL_OUTLIER_SD = 2.0                # second pass: voxels above background + 2
 LOCAL_HALO_MM = 1.5                   # ... with this halo around them
 LOCAL_MIN_COVERAGE = 0.2              # fewer liver voxels in the window (hilum, outside): global liver statistics
 LOCAL_MIN_SD_FRACTION = 0.5           # the local SD is never below half of the liver's typical local SD
+BRIDGE_GAPS = False                   # bridge short interruptions of a vessel (noise): off by default
+BRIDGE_GAP_MM = 3.0                   # ... a seeded piece at most this far from the tree is joined to it
+BRIDGE_ROUNDS = 10                    # ... repeated for the pieces this adds (a vessel broken several times)
+EXTRAHEPATIC_MIN_HU = 150.0           # outside the liver tree voxels must be at least this bright (fat, muscle, bowel wall)
 LIVER_SHELL_MM = 2.0                  # no seeds in the outer 2 mm of the liver (partial volume with ribs, lung)
 JUNCTION_MM = 3.0                     # within this distance of the tree the shape is not checked (bifurcations)
 JUNCTION_ROUNDS = 1                   # (more rounds let flat streaks creep along the tree)
@@ -70,6 +74,7 @@ METAL_SPARED_MM = 10.0                # ... except around the injection point (c
 HALF_MAXIMUM_WINDOW_MM = 3.0          # vessel wall: half way between the liver and the brightest lumen within 3 mm
 ROOT_MAX_MM = 10.0                    # injection point farther than this from the tree: not on the tree
 SPUR_MM = 3.0                         # terminal centerline branches shorter than this are pruned
+RAY_SNAP_MM = 4.0                     # a tip clicked in the 3D view: centerline within this of the viewing line
 SNAP_MM = 3.0                         # a planned tip farther than this from any centerline is not used
 LOOP_MIN_MM = 10.0                    # cycles shorter than this are skeleton noise, not loops
 MAX_LOOPS = 3                         # more loops after orientation: veins or bone in the tree segment?
@@ -108,6 +113,13 @@ TUNABLE = [
     ("AIR_MARGIN_MM", "Air / lung margin (mm)", 0.0, 15.0, 0.5, "Removed around air and lung."),
     ("AIR_CONTRAST_SD", "Air detection (SD below liver)", 5.0, 50.0, 1.0,
      "Air / lung is excluded only when the darkest voxels are this far below the liver."),
+    ("BRIDGE_GAP_MM", "Interruptions: largest gap (mm)", 0.5, 15.0, 0.5,
+     "With 'Bridge short interruptions': a vessel piece (with a seed, tube-shaped) at most this far from the tree "
+     "is joined to it by a straight bridge. Larger also joins neighbouring veins and noise."),
+    ("EXTRAHEPATIC_MIN_HU", "Outside liver: vessel minimum (HU)", -1000.0, 2000.0, 10.0,
+     "Outside the liver the local background is the liver's, so moderately bright tissue (muscle, bowel wall, "
+     "partial volume of ribs) can pass the SD thresholds there; tree voxels outside the liver must also be at least "
+     "this bright (denoised CBCT). Inside the liver only the local contrast counts. -1000: off."),
     ("LIVER_SHELL_MM", "No seeds in outer liver (mm)", 0.0, 10.0, 0.5, "Partial volume with ribs and lung."),
     ("TUBE_MIN", "Tube-shape minimum", 0.0, 1.0, 0.05, "Shape-only vesselness the tree voxels need (tube check)."),
     ("JUNCTION_MM", "Bifurcation tolerance (mm)", 0.0, 10.0, 0.5,
@@ -134,9 +146,10 @@ DEFAULT_PARAMETERS = {name: globals()[name] for name, *_ in TUNABLE}
 
 def setParameters(values):
     """Set tunable parameters (unknown names ignored); missing ones go back to their defaults. The denoising method
-    is the text value DENOISE_METHOD."""
-    global DENOISE_METHOD
+    is the text value DENOISE_METHOD, gap bridging the switch BRIDGE_GAPS."""
+    global DENOISE_METHOD, BRIDGE_GAPS
     values = values or {}
+    BRIDGE_GAPS = bool(values.get("BRIDGE_GAPS", False))
     for name, default in DEFAULT_PARAMETERS.items():
         globals()[name] = float(values.get(name, default))
     method = values.get("DENOISE_METHOD", DEFAULT_DENOISE_METHOD)
@@ -299,6 +312,19 @@ def airMask(values, statistics, region=None):
     return np.asarray(values) < threshold
 
 
+def injectionList(injectionKJI):
+    """Injection points as a list of (k, j, i): one point or several (e.g. celiac trunk and superior mesenteric
+    artery when the liver has arteries from both)."""
+    if injectionKJI is None:
+        return []
+    points = np.asarray(injectionKJI, dtype=float)
+    if points.size == 0:
+        return []
+    if points.ndim == 1:
+        return [tuple(points)]
+    return [tuple(p) for p in points]
+
+
 def searchRegion(values, liver, spacing, statistics, injectionKJI=None, fov=None, marginMM=None,
                  injectionMM=None, airMarginMM=None):
     """Where arteries are searched: the liver plus a small margin and a ball around the injection point (the
@@ -309,8 +335,8 @@ def searchRegion(values, liver, spacing, statistics, injectionKJI=None, fov=None
     airMarginMM = AIR_MARGIN_MM if airMarginMM is None else airMarginMM
     liver = np.asarray(liver, bool)
     region = dilateMM(liver, marginMM, spacing)
-    if injectionKJI is not None:
-        region |= ballMask(liver.shape, injectionKJI, injectionMM, spacing)
+    for point in injectionList(injectionKJI):
+        region |= ballMask(liver.shape, point, injectionMM, spacing)
     if fov is not None:
         region &= fov
     air = airMask(values, statistics, fov)
@@ -467,8 +493,8 @@ def metalMask(denoised, contrast, seeds, spacing, injectionKJI=None, factor=None
         metal |= denoised >= level + 0.95 * (top - level)
     if METAL_MIN_VALUE > 0:
         metal &= denoised >= METAL_MIN_VALUE
-    if injectionKJI is not None:
-        metal &= ~ballMask(metal.shape, injectionKJI, sparedMM, spacing)
+    for point in injectionList(injectionKJI):
+        metal &= ~ballMask(metal.shape, point, sparedMM, spacing)
     if not metal.any():
         return metal, metal
     # the metal's own blur (blooming) belongs to it; the rest of the margin keeps only the seeds out
@@ -484,8 +510,8 @@ class TreeSegment:
 
 
 def _injectionComponent(candidate, strong, injectionKJI, spacing, rootMaxMM, growSD):
-    """Hysteresis: the connected component of the candidates that contains a seed and is nearest to the injection
-    point."""
+    """Hysteresis: the connected components of the candidates that contain a seed and are nearest to the injection
+    point(s)."""
     labels, count = ndimage.label(candidate, structure=np.ones((3, 3, 3)))
     if count == 0:
         raise ValueError(f"Nothing brighter than the local liver background + {growSD:g} SD in the search region: "
@@ -493,11 +519,62 @@ def _injectionComponent(candidate, strong, injectionKJI, spacing, rootMaxMM, gro
     seeded = np.unique(labels[strong])
     keep = np.zeros(count + 1, bool)
     keep[seeded[seeded > 0]] = True
-    start = nearestTrue(keep[labels], injectionKJI, spacing, rootMaxMM)
-    if start is None:
-        raise ValueError(f"No contrast-filled vessel within {rootMaxMM:g} mm of the injection point: place it inside "
-                         "the artery at the catheter tip, or lower the vessel threshold.")
-    return labels == labels[start]
+    points = injectionList(injectionKJI)
+    chosen = set()
+    for number, point in enumerate(points, start=1):
+        start = nearestTrue(keep[labels], point, spacing, rootMaxMM)
+        if start is None:
+            which = f"injection point I{number}" if len(points) > 1 else "the injection point"
+            raise ValueError(f"No contrast-filled vessel within {rootMaxMM:g} mm of {which}: place it inside the "
+                             "artery at the catheter tip, or lower the vessel threshold.")
+        chosen.add(int(labels[start]))
+    return np.isin(labels, list(chosen))
+
+
+def _lineVoxels(a, b):
+    """Voxels (n, 3) of the straight line between two voxel indices."""
+    a, b = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
+    count = int(np.abs(b - a).max()) + 1
+    return np.unique(np.rint(a + np.linspace(0.0, 1.0, count)[:, None] * (b - a)).astype(int), axis=0)
+
+
+def bridgeGaps(tree, pieces, strong, region, spacing, gapMM=None, rounds=None):
+    """Short interruptions of a vessel (noise, a stenosis, a beam-hardening band): every connected piece of `pieces`
+    that contains a seed (`strong`) and comes within gapMM of the tree is joined to it by a straight bridge (one
+    voxel thick, from its nearest voxel to the nearest tree voxel; only through `region`), repeated for the pieces
+    this adds. Returns the tree with the joined pieces and bridges."""
+    gapMM = BRIDGE_GAP_MM if gapMM is None else gapMM
+    rounds = int(BRIDGE_ROUNDS if rounds is None else rounds)
+    tree = np.asarray(tree, bool).copy()
+    labels, count = ndimage.label(np.asarray(pieces, bool) & ~tree, structure=np.ones((3, 3, 3)))
+    if count == 0 or gapMM <= 0:
+        return tree
+    seeded = np.zeros(count + 1, bool)
+    found = np.unique(labels[np.asarray(strong, bool)])
+    seeded[found[found > 0]] = True
+    region = np.asarray(region, bool)
+    cross = ndimage.generate_binary_structure(3, 1)
+    for _ in range(rounds):
+        distance, nearest = ndimage.distance_transform_edt(~tree, sampling=spacing, return_indices=True)
+        close = (labels > 0) & seeded[labels] & (distance <= gapMM)
+        candidates = np.unique(labels[close])
+        joined = False
+        for label in candidates[candidates > 0]:
+            voxels = np.argwhere(close & (labels == label))
+            start = voxels[int(np.argmin(distance[tuple(voxels.T)]))]
+            end = nearest[(slice(None),) + tuple(start)]
+            line = _lineVoxels(start, end)
+            bridge = np.zeros(tree.shape, bool)
+            bridge[tuple(line.T)] = True
+            if not region[bridge].all():
+                continue   # the gap crosses metal, air or leaves the search region
+            bridge = ndimage.binary_dilation(bridge, structure=cross) & region
+            tree |= (labels == label) | bridge
+            seeded[label] = False
+            joined = True
+        if not joined:
+            break
+    return tree
 
 
 def arterialTree(denoised, contrast, region, injectionKJI, spacing, liver=None, vesselSD=VESSEL_SD, growSD=GROW_SD,
@@ -508,8 +585,13 @@ def arterialTree(denoised, contrast, region, injectionKJI, spacing, liver=None, 
     the vessel wall at half maximum (half way between the local background and the brightest lumen within
     HALF_MAXIMUM_WINDOW_MM), keeping the centerlines so faint branches stay attached. tube (optional shape-only
     vesselness, tubeShape): seeds and grown voxels must also be tube-shaped (3 x 3 x 3 mean score at least
-    TUBE_MIN), except within JUNCTION_MM of the tree (bifurcations); speckle and streaks are not tubes."""
+    TUBE_MIN), except within JUNCTION_MM of the tree (bifurcations); speckle and streaks are not tubes. Outside the
+    liver tree voxels must also reach EXTRAHEPATIC_MIN_HU on the denoised image. BRIDGE_GAPS: short interruptions
+    (up to BRIDGE_GAP_MM) are bridged (bridgeGaps)."""
     z = contrast.z
+    if liver is not None:
+        # outside the liver an absolute floor as well: there the background is the liver's typical one
+        region = region & (np.asarray(liver, bool) | (np.asarray(denoised) >= EXTRAHEPATIC_MIN_HU))
     strong = region & (z >= vesselSD)
     if liver is not None:
         strong &= ~(np.asarray(liver, bool) & ~erodeMM(liver, LIVER_SHELL_MM, spacing))
@@ -540,6 +622,9 @@ def arterialTree(denoised, contrast, region, injectionKJI, spacing, liver=None, 
             if np.count_nonzero(grown) == np.count_nonzero(tree):
                 break
             tree = grown
+    if BRIDGE_GAPS:
+        # a vessel interrupted for a few mm (noise): its seeded, tube-shaped continuation is joined by a bridge
+        tree = bridgeGaps(tree, candidate if tube is None else tubular, strong, region, spacing)
     if trimWall:
         # the wall at half maximum: a bright lumen blurred by the reconstruction would otherwise grow by its blur.
         # The centerlines (and one voxel around them) are kept, so a faint branch is not cut off where it leaves a
@@ -556,9 +641,13 @@ def arterialTree(denoised, contrast, region, injectionKJI, spacing, liver=None, 
             pass   # without scikit-image: plain half-maximum wall
         tree = trimmed
         labels, _ = ndimage.label(tree, structure=np.ones((3, 3, 3)))
-        start = nearestTrue(labels > 0, injectionKJI, spacing, rootMaxMM)
-        if start is not None:
-            tree = labels == labels[start]
+        chosen = set()
+        for point in injectionList(injectionKJI):
+            start = nearestTrue(labels > 0, point, spacing, rootMaxMM)
+            if start is not None:
+                chosen.add(int(labels[start]))
+        if chosen:
+            tree = np.isin(labels, list(chosen))
     tree = ndimage.binary_closing(tree, structure=ndimage.generate_binary_structure(3, 1)) | tree
     tree = ndimage.binary_fill_holes(tree)
     voxelML = voxelML if voxelML is not None else float(np.prod(spacing)) / 1000.0
@@ -617,7 +706,8 @@ def _skeletonGraph(points, shape, spacing):
 def _pruneSpurs(graph, keepIndex, spurMM, rounds=3, radius=None):
     """Alive mask after removing terminal branches shorter than spurMM, or than SPUR_RADIUS_FACTOR x the vessel
     radius at their junction (radius (n,), optional: bumps of a thick vessel's surface give long thinning spurs);
-    never the branch of keepIndex."""
+    never the branch of keepIndex (an index or several)."""
+    keep = {int(keepIndex)} if np.ndim(keepIndex) == 0 else {int(i) for i in keepIndex}
     count = graph.shape[0]
     alive = np.ones(count, bool)
     indptr, indices, data = graph.indptr, graph.indices, graph.data
@@ -644,7 +734,7 @@ def _pruneSpurs(graph, keepIndex, spurMM, rounds=3, radius=None):
                     break
                 previous, current = current, nextNode
                 path.append(current)
-            if spur and keepIndex not in path:
+            if spur and not keep.intersection(path):
                 remove.update(path)
         if not remove:
             break
@@ -654,7 +744,8 @@ def _pruneSpurs(graph, keepIndex, spurMM, rounds=3, radius=None):
 
 @dataclasses.dataclass
 class VesselTree:
-    """Centerline points of the arterial tree, oriented from the injection point (root)."""
+    """Centerline points of the arterial tree, oriented from the injection point (root); with several injection
+    points a forest: every point hangs from its nearest root (roots: all of them, parent -1)."""
     points: np.ndarray        # (n, 3) voxel indices (k, j, i)
     spacing: tuple            # (sk, sj, si) mm
     shape: tuple              # grid shape
@@ -665,6 +756,10 @@ class VesselTree:
     tin: np.ndarray           # Euler tour: point m is downstream of p iff tin[p] <= tin[m] < tout[p]
     tout: np.ndarray
     loops: int = 0            # independent cycles longer than LOOP_MIN_MM
+    roots: tuple = ()         # every root (several injection points); () means (root,)
+
+    def isRoot(self, index):
+        return int(self.parent[int(index)]) < 0
 
     @property
     def count(self):
@@ -717,7 +812,7 @@ class VesselTree:
         return float(np.sum(self.distance[child] - self.distance[self.parent[child]]))
 
 
-def _eulerTour(parent, root):
+def _eulerTour(parent, roots):
     count = len(parent)
     children = [[] for _ in range(count)]
     for child, up in enumerate(parent):
@@ -726,7 +821,7 @@ def _eulerTour(parent, root):
     tin = np.zeros(count, dtype=np.int64)
     tout = np.zeros(count, dtype=np.int64)
     clock = 0
-    stack = [(root, False)]
+    stack = [(int(root), False) for root in reversed(np.atleast_1d(roots))]
     while stack:
         node, done = stack.pop()
         if done:
@@ -778,8 +873,9 @@ def _countLoops(graph, parent, distance, positionsMM, loopMinMM):
 
 def buildTree(skeleton, spacing, injectionKJI, vesselMask=None, spurMM=None, rootMaxMM=ROOT_MAX_MM,
               loopMinMM=LOOP_MIN_MM):
-    """Oriented centerline tree from a skeleton: spurs pruned, the component of the root kept, shortest-path tree
-    from the point nearest the injection point. vesselMask (optional) gives the radius at each point."""
+    """Oriented centerline tree from a skeleton: spurs pruned, the component(s) of the root(s) kept, shortest-path
+    tree from the point nearest the injection point (several injection points: every point from its nearest root).
+    vesselMask (optional) gives the radius at each point."""
     spurMM = SPUR_MM if spurMM is None else spurMM
     skeleton = np.asarray(skeleton, bool)
     points = np.argwhere(skeleton)
@@ -787,33 +883,45 @@ def buildTree(skeleton, spacing, injectionKJI, vesselMask=None, spurMM=None, roo
         raise ValueError("The arterial tree has no centerline (too small or empty).")
     spacing = tuple(float(v) for v in spacing)
     graph = _skeletonGraph(points, skeleton.shape, spacing)
-    rootIndex, rootDistance = _nearestPoint(points, injectionKJI, spacing)
-    if rootDistance > rootMaxMM:
-        raise ValueError(f"The injection point is {rootDistance:.0f} mm from the arterial tree (more than "
-                         f"{rootMaxMM:g} mm): place it inside the artery at the catheter tip.")
+    injections = injectionList(injectionKJI)
+    rootIndices = []
+    for number, point in enumerate(injections, start=1):
+        rootIndex, rootDistance = _nearestPoint(points, point, spacing)
+        if rootDistance > rootMaxMM:
+            which = f"Injection point I{number}" if len(injections) > 1 else "The injection point"
+            raise ValueError(f"{which} is {rootDistance:.0f} mm from the arterial tree (more than {rootMaxMM:g} mm): "
+                             "place it inside the artery at the catheter tip.")
+        if rootIndex not in rootIndices:
+            rootIndices.append(rootIndex)
     pointRadius = None
     if vesselMask is not None:
         radiusMap = ndimage.distance_transform_edt(np.asarray(vesselMask, bool), sampling=spacing)
         pointRadius = radiusMap[tuple(points.T)].astype(float)
-    alive = _pruneSpurs(graph, rootIndex, spurMM, radius=pointRadius)
+    alive = _pruneSpurs(graph, rootIndices, spurMM, radius=pointRadius)
     _, labels = csgraph.connected_components(graph[alive][:, alive], directed=False)
     aliveIndex = np.flatnonzero(alive)
-    rootLabel = labels[np.searchsorted(aliveIndex, rootIndex)]
-    keep = aliveIndex[labels == rootLabel]
+    rootLabels = {labels[np.searchsorted(aliveIndex, r)] for r in rootIndices}
+    keep = aliveIndex[np.isin(labels, list(rootLabels))]
     points = points[keep]
     graph = graph[keep][:, keep].tocsr()
-    root = int(np.searchsorted(keep, rootIndex))
-    distance, predecessors = csgraph.dijkstra(graph, directed=False, indices=root, return_predecessors=True)
+    roots = [int(np.searchsorted(keep, r)) for r in rootIndices]
+    if len(roots) == 1:
+        distance, predecessors = csgraph.dijkstra(graph, directed=False, indices=roots[0], return_predecessors=True)
+    else:   # every point from its nearest root (two roots in one connected tree: the arcades are split between them)
+        distance, predecessors, _ = csgraph.dijkstra(graph, directed=False, indices=roots, return_predecessors=True,
+                                                     min_only=True)
     parent = np.where(predecessors < 0, -1, predecessors).astype(np.int64)
-    parent[root] = -1
-    tin, tout = _eulerTour(parent, root)
+    parent[roots] = -1
+    root = roots[0]
+    tin, tout = _eulerTour(parent, roots)
     if pointRadius is not None:
         radius = pointRadius[keep]
     else:
         radius = np.zeros(len(points))
     positions = points * np.asarray(spacing)
     loops = _countLoops(graph, parent, distance, positions, loopMinMM)
-    return VesselTree(points, spacing, tuple(skeleton.shape), parent, distance, radius, root, tin, tout, loops)
+    return VesselTree(points, spacing, tuple(skeleton.shape), parent, distance, radius, root, tin, tout, loops,
+                      tuple(roots))
 
 
 def _nearestPoint(points, positionKJI, spacing):
@@ -835,10 +943,10 @@ def pruneTwigs(tree, seeded):
         leaves = np.flatnonzero(alive & (children == 0))
         removed = False
         for leaf in leaves:
-            if leaf == tree.root:
+            if tree.isRoot(leaf):
                 continue
             path, node = [], int(leaf)
-            while node >= 0 and node != tree.root and children[node] <= 1:
+            while node >= 0 and not tree.isRoot(node) and children[node] <= 1:
                 path.append(node)
                 node = int(tree.parent[node])
             if path and not seeded[path].any():
@@ -860,6 +968,49 @@ def maskOfKept(mask, tree, keep):
     kept = voxels[keep[nearest]]
     result[tuple(kept.T)] = True
     return result
+
+
+def nearestToLine(pointsMM, origin, direction, maxMM=None):
+    """(index, distance mm) of the point nearest to the line through origin along direction (a click in a 3D view:
+    the camera's viewing line through the clicked pixel); index None if none is within maxMM. Among points about
+    equally close (within 1 mm) the one nearest to the viewer (most negative along direction) wins."""
+    points = np.asarray(pointsMM, dtype=float)
+    if points.size == 0:
+        return None, float("inf")
+    direction = np.asarray(direction, dtype=float)
+    direction = direction / np.linalg.norm(direction)
+    offset = points - np.asarray(origin, dtype=float)
+    along = offset @ direction
+    perpendicular = np.linalg.norm(offset - along[:, None] * direction, axis=1)
+    best = float(perpendicular.min())
+    if maxMM is not None and best > maxMM:
+        return None, best
+    close = np.flatnonzero(perpendicular <= best + 1.0)
+    index = int(close[np.argmin(along[close])])
+    return index, float(perpendicular[index])
+
+
+def brightestOnLine(values, mask, originKJI, directionKJI, spacing, stepMM=0.5):
+    """Voxel (k, j, i) of the brightest value of `values` inside `mask` along the line through originKJI with
+    direction directionKJI (voxel units), or None: what a maximum intensity projection shows at a clicked pixel."""
+    values = np.asarray(values)
+    mask = np.asarray(mask, bool)
+    origin = np.asarray(originKJI, dtype=float)
+    direction = np.asarray(directionKJI, dtype=float) * np.asarray(spacing, dtype=float)
+    direction = direction / np.linalg.norm(direction)
+    length = float(np.linalg.norm(np.asarray(values.shape) * np.asarray(spacing, dtype=float)))
+    steps = np.arange(-length, length, stepMM)
+    samples = origin + steps[:, None] * (direction / np.asarray(spacing, dtype=float))
+    voxels = np.rint(samples).astype(int)
+    inside = np.all((voxels >= 0) & (voxels < np.asarray(values.shape)), axis=1)
+    voxels = voxels[inside]
+    if len(voxels) == 0:
+        return None
+    voxels = voxels[mask[tuple(voxels.T)]]
+    if len(voxels) == 0:
+        return None
+    best = voxels[int(np.argmax(values[tuple(voxels.T)]))]
+    return tuple(int(v) for v in best)
 
 
 def snapTip(tree, positionKJI, snapMM=SNAP_MM):
@@ -1028,7 +1179,7 @@ def lowestCommonAncestor(tree, indices):
     for node in tree.pathToRoot(indices[0]):
         if all(tree.isAncestor(node, other) for other in indices[1:]):
             return node
-    return tree.root
+    return tree.pathToRoot(indices[0])[-1]   # fed from two injection points: no common ancestor
 
 
 def tumourFeeders(tree, tumour, marginMM=FEEDER_MARGIN_MM):
@@ -1082,7 +1233,7 @@ def candidatePositions(tree, territoryMap, tumour, liverMask, voxelML, others=()
         path = [int(node)]
         while True:
             up = int(tree.parent[path[-1]])
-            if up < 0 or up == tree.root or children[up] >= 2:
+            if up < 0 or tree.isRoot(up) or children[up] >= 2:
                 break
             path.append(up)
         middle = tree.distance[path[0]] - (tree.distance[path[0]] - tree.distance[path[-1]]) / 2.0
