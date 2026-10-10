@@ -456,6 +456,7 @@ class RadioembolizationDosimetryAbsoluteWidget(DosimetryWidgetBase):
         # Absolute dosimetry only on a quantitative image (see _absoluteInputProblem)
         self.absoluteLockLabel = qt.QLabel()
         self.absoluteLockLabel.setWordWrap(True)
+        self.absoluteLockLabel.setSizePolicy(qt.QSizePolicy.Ignored, qt.QSizePolicy.Preferred)   # a quoted long name must not widen the panel
         self.absoluteLockLabel.setStyleSheet("color: #d32f2f; font-weight: bold;")
         self.absoluteLockLabel.hide()
         parametersLayout.addWidget(self.absoluteLockLabel)

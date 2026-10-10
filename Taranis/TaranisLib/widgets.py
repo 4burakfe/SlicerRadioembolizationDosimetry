@@ -34,9 +34,3 @@ def allowNarrowPanel(root):
                 parent = parent.parentWidget()
         except Exception:
             pass
-    # wrapped messages that quote a name follow the panel's width instead of setting it (a long name has no spaces)
-    for label in root.findChildren("QLabel"):
-        if label.wordWrap:
-            policy = label.sizePolicy
-            policy.setHorizontalPolicy(qt.QSizePolicy.Ignored)
-            label.setSizePolicy(policy)
