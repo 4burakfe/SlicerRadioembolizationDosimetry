@@ -42,6 +42,10 @@ All modules are available under `Nuclear Medicine` category.
 - Without a case it shows one button, **Start TARE dosimetry workflow**.
 - With a case: case name and ID, the steps **Data › Registration › Segmentation › Planning › LSF › Dosimetry › Report** with a status badge each (✓ done, ! done with warnings, ✕ error, ↻ outdated, » skipped, – not needed / waiting), and an issue counter whose menu jumps to the step concerned. Hover a step for its details.
 - It adapts to the window width: on smaller screens the explanation lines are dropped and the steps get narrower, then *Disable at startup* and *Close* move into a **⋯** menu, and finally the steps show only their badge (hover for the details).
+- **Save as DICOM** (three buttons left of *Disable at startup*; in the **⋯** menu on narrow screens), filed under the patient and study of the dosimetry image (else the reference image; a new study named after the case if no image came from DICOM), written to a folder you choose and added to Slicer's DICOM database (send them to a PACS from the DICOM browser). Series descriptions say *research use only*.
+  - *Scene*: the whole scene – every image, segments, markups, transforms, case settings and results – as 3D Slicer's *Slicer Data Bundle* (a secondary capture with a screenshot, the scene zipped in a private tag). Loading it from the DICOM browser opens the scene, also where none of the images exist. Only Slicer reads it, and some PACS, routers and anonymisers drop private tags: check once that yours keeps it.
+  - *Segments*: a DICOM Segmentation (SEG) referencing the anatomical image of the case (empty segments skipped).
+  - *Dose map*: RT Dose in Gy on the frame of reference of the dosimetry image (DICOM viewers and planning systems overlay it; Slicer loads it as a dose volume with SlicerRT).
 - **Close** hides it for this session. While it is not shown at startup (the default), it appears only when Taranis is opened or a case is started or resumed, and disappears when the case (scene) is closed.
 - Gating is soft: every step can be opened and skipped. Errors are only raised when a calculation would be impossible or wrong.
 

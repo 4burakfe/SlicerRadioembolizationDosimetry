@@ -2,7 +2,8 @@
 
 Idle (no case in the scene): one button "Start TARE dosimetry workflow".
 Active: case name and ID, the six steps with a status badge, an issue counter with a menu, and on the right
-"Disable at startup" and "Close". Visibility rules are in visibility.py.
+"Save scene / segments / dose map as DICOM" (dicomexport.py), "Disable at startup" and "Close". Visibility rules are in
+visibility.py.
 The Epona button (SPECT/PET review) is hidden for now (SHOW_EPONA): Epona is leaving the SlicerPETDenoise
 extension and will be released as an extension of its own.
 
@@ -36,27 +37,29 @@ EPONA_LOGO_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "Reso
 EPONA_MODULE = "Easy_fusion"
 EPONA_LOGO_SIZE = 40
 SHOW_EPONA = False             # temporarily hidden: Epona moves from SlicerPETDenoise to its own extension
+EXPORT_ICON_SIZE = (66, 46)    # "Save … as DICOM" buttons (px)
 CASE_TEXT_WIDTH_MAX = 240      # the case name is elided beyond this width
 WIDTH_SLACK = 24               # px kept free when choosing the compaction level
 WIDTH_CHECK_INTERVAL_MS = 1000  # fallback polling of the window width (resize events are the main trigger)
 
 # Compaction levels, tried in order until the toolbar fits in the width available to it.
 #   step: (text width or None = title width, explanation lines, show texts)  case: (max text width, lines)
-#   issues: (lines, show texts)  epona: (text width, lines, show texts)  fold: "Disable at startup" and "Close"
+#   issues: (lines, show texts)  epona: (text width, lines, show texts)  exports: the "Save … as DICOM" buttons
+#   (else in the "⋯" menu)  fold: "Disable at startup" and "Close"
 #   in the "⋯" menu  arrows: "›" between the steps  logo: Taranis logo
 COMPACT_LEVELS = [
     dict(step=(STEP_TEXT_WIDTH, 2, True), case=(CASE_TEXT_WIDTH_MAX, 1), issues=(1, True), epona=(150, 2, True),
-         fold=False, arrows=True, logo=True),
+         exports=True, fold=False, arrows=True, logo=True),
     dict(step=(STEP_TEXT_WIDTH, 2, True), case=(200, 1), issues=(1, True), epona=(None, 0, True),
-         fold=True, arrows=True, logo=True),
+         exports=True, fold=True, arrows=True, logo=True),
     dict(step=(125, 2, True), case=(160, 1), issues=(1, True), epona=(None, 0, True),
-         fold=True, arrows=True, logo=True),
+         exports=True, fold=True, arrows=True, logo=True),
     dict(step=(None, 0, True), case=(140, 1), issues=(0, True), epona=(None, 0, False),
-         fold=True, arrows=True, logo=True),
+         exports=True, fold=True, arrows=True, logo=True),
     dict(step=(None, 0, True), case=(110, 0), issues=(0, False), epona=(None, 0, False),
-         fold=True, arrows=False, logo=False),
+         exports=True, fold=True, arrows=False, logo=False),
     dict(step=(None, 0, False), case=(90, 0), issues=(0, False), epona=(None, 0, False),
-         fold=True, arrows=False, logo=False),
+         exports=False, fold=True, arrows=False, logo=False),
 ]
 
 _iconCache = {}
@@ -336,6 +339,29 @@ class WorkflowToolbar:
         spacer.setSizePolicy(qt.QSizePolicy.Expanding, qt.QSizePolicy.Preferred)
         self.toolbar.addWidget(spacer)
 
+        # Save as DICOM: scene, segments, dose map (left of "Disable at startup")
+        from . import dicomexport as DX
+        self.exportActions = []
+        self.exportMenuActions = []
+        for key, caption, function in (("scene", "Scene", DX.saveSceneAsDicom),
+                                       ("segments", "Segments", DX.saveSegmentsAsDicom),
+                                       ("dose", "Dose map", DX.saveDoseAsDicom)):
+            button = qt.QToolButton()
+            button.setAutoRaise(True)
+            # the picture as a label inside the button: Slicer's style draws toolbar icons at the toolbar's icon size
+            picture = qt.QLabel()
+            picture.setPixmap(DX.exportIcon(caption, EXPORT_ICON_SIZE).pixmap(EXPORT_ICON_SIZE[0], EXPORT_ICON_SIZE[1]))
+            picture.setAlignment(qt.Qt.AlignCenter)
+            picture.setAttribute(qt.Qt.WA_TransparentForMouseEvents)
+            pictureLayout = qt.QHBoxLayout(button)
+            pictureLayout.setContentsMargins(0, 0, 0, 0)
+            pictureLayout.addWidget(picture)
+            button.setToolTip(DX.TOOLTIPS[key])
+            button.connect("clicked()", lambda function=function: function())
+            self.exportActions.append(self.toolbar.addWidget(button))
+            button.setFixedSize(EXPORT_ICON_SIZE[0] + 6, min(BUTTON_HEIGHT, EXPORT_ICON_SIZE[1] + 6))
+        self.exportSeparatorAction = self.toolbar.addSeparator()
+
         self.disableAtStartupButton = qt.QToolButton()
         self.disableAtStartupButton.text = "Disable at startup"
         self.disableAtStartupButton.checkable = True
@@ -361,6 +387,14 @@ class WorkflowToolbar:
         self.optionsButton.setToolTip("Toolbar options")
         self.optionsButton.setPopupMode(qt.QToolButton.InstantPopup)
         self.optionsMenu = qt.QMenu(self.optionsButton)
+        self.optionsMenu.setToolTipsVisible(True)
+        for key, label, function in (("scene", "Save scene as DICOM", DX.saveSceneAsDicom),
+                                     ("segments", "Save segments as DICOM", DX.saveSegmentsAsDicom),
+                                     ("dose", "Save dose map as DICOM", DX.saveDoseAsDicom)):
+            action = self.optionsMenu.addAction(label)
+            action.setToolTip(DX.TOOLTIPS[key])
+            action.connect("triggered()", lambda function=function: function())
+        self.optionsMenu.addSeparator()
         self.disableMenuAction = self.optionsMenu.addAction("Disable at startup")
         self.disableMenuAction.checkable = True
         self.disableMenuAction.checked = self.disableAtStartupButton.checked
@@ -621,8 +655,10 @@ class WorkflowToolbar:
             action.setVisible(active and spec["arrows"])
         self.logoAction.setVisible(spec["logo"])
         self.disableAction.setVisible(not spec["fold"])
+        for action in self.exportActions + [self.exportSeparatorAction]:
+            action.setVisible(spec["exports"])
         self.closeAction.setVisible(not spec["fold"])
-        self.optionsAction.setVisible(spec["fold"])
+        self.optionsAction.setVisible(spec["fold"] or not spec["exports"])
 
     def updateLayout(self):
         """Choose the least compact level with which the toolbar fits in the window."""
