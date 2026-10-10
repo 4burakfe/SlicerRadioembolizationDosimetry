@@ -14,6 +14,7 @@ from . import roles as R
 STEP_DATA = "data"
 STEP_REGISTRATION = "registration"
 STEP_SEGMENTATION = "segmentation"
+STEP_PLANNING = "planning"
 STEP_LSF = "lsf"
 STEP_DOSIMETRY = "dosimetry"
 STEP_REPORT = "report"
@@ -22,6 +23,7 @@ STEPS = [
     (STEP_DATA, "Data"),
     (STEP_REGISTRATION, "Registration"),
     (STEP_SEGMENTATION, "Segmentation"),
+    (STEP_PLANNING, "Planning"),
     (STEP_LSF, "LSF"),
     (STEP_DOSIMETRY, "Dosimetry"),
     (STEP_REPORT, "Report"),
@@ -95,6 +97,10 @@ PATH_FUNCTIONAL = "functional"  # functional image registered directly (no anato
 
 JOB_DOSIMETRY = "dosimetry"
 JOB_METABOLIC = "metabolic"
+JOB_CBCT = "cbct"
+JOB_CBCT_PARENCHYMAL = "cbctParenchymal"
+CBCT_JOBS = (JOB_CBCT, JOB_CBCT_PARENCHYMAL)
+JOB_AUXILIARY = "auxiliary"   # + number (1, 2, 3)
 
 
 @dataclasses.dataclass
@@ -110,6 +116,7 @@ class RegistrationJob:
     method: str = ""
     followerFollows: bool = True        # the functional image moves with its anatomical image
     checked: bool = False               # the user confirmed the alignment
+    optional: bool = False              # auxiliary volume: does not hold up the workflow
 
     @property
     def complete(self):
@@ -156,6 +163,33 @@ def planRegistration(roleInfos):
             job = RegistrationJob(key, label, functionalRole, primary, None, PATH_FUNCTIONAL)
             job.alignedByAcquisition = _sameFrame(functional, fixed)
         jobs.append(job)
+    # CBCT: anatomy to anatomy (rigid, inside the liver). A parenchymal phase acquired in the same run (same frame
+    # of reference) follows the arterial CBCT; otherwise it is registered on its own.
+    arterial = roleInfos.get(R.ROLE_CBCT)
+    parenchymal = roleInfos.get(R.ROLE_CBCT_PARENCHYMAL)
+    if arterial is not None:
+        follows = parenchymal is not None and _sameFrame(arterial, parenchymal)
+        job = RegistrationJob(JOB_CBCT, "CBCT", R.ROLE_CBCT, primary,
+                              R.ROLE_CBCT_PARENCHYMAL if follows else None, PATH_HYBRID)
+        job.alignedByAcquisition = _sameFrame(arterial, fixed)
+        jobs.append(job)
+        if follows:
+            parenchymal = None
+    if parenchymal is not None:
+        job = RegistrationJob(JOB_CBCT_PARENCHYMAL, "Parenchymal CBCT", R.ROLE_CBCT_PARENCHYMAL, primary, None,
+                              PATH_HYBRID)
+        job.alignedByAcquisition = _sameFrame(parenchymal, fixed)
+        jobs.append(job)
+    # Auxiliary volumes: optional, anatomy to anatomy, or functional-only for a SPECT / PET
+    for index, role in enumerate(R.AUXILIARY_ROLES):
+        info = roleInfos.get(role)
+        if info is None:
+            continue
+        path = PATH_FUNCTIONAL if R.isFunctional(info) else PATH_HYBRID
+        job = RegistrationJob(f"{JOB_AUXILIARY}{index + 1}", f"Auxiliary volume {index + 1}", role, primary, None, path,
+                              optional=True)
+        job.alignedByAcquisition = _sameFrame(info, fixed)
+        jobs.append(job)
     return primary, jobs
 
 
@@ -167,6 +201,7 @@ SEGMENT_TUMOR = "tumor"
 SEGMENT_VIABLE = "viable"   # viable (e.g. FDG-avid) tumour: dosimetry like tumours, reported separately, may overlap them
 SEGMENT_NORMAL = "normal"
 SEGMENT_LUNGS = "lungs"
+SEGMENT_VESSELS = "vessels"   # arterial tree from the CBCT: ignored by dosimetry
 SEGMENT_OTHER = "other"
 
 # role -> (label, standard name for new segments, colour)
@@ -177,9 +212,20 @@ SEGMENT_ROLES = {
     SEGMENT_VIABLE: ("Viable tumour", "Viable tumor", (195 / 255.0, 33 / 255.0, 72 / 255.0)),   # #c32148
     SEGMENT_NORMAL: ("Normal tissue", "Normal liver", (0.25, 0.88, 0.82)),
     SEGMENT_LUNGS: ("Lungs", "Lungs", (0.45, 0.65, 1.00)),
+    SEGMENT_VESSELS: ("Vessels", "Arterial tree", (0.86, 0.16, 0.16)),
     SEGMENT_OTHER: ("Other", "Other", (0.6, 0.6, 0.6)),
 }
 SEGMENT_ROLE_KEYS = list(SEGMENT_ROLES)
+
+
+def perfusedColor(key):
+    """A red of its own for every perfused volume: full red, plus a little green and / or blue (together at most
+    0.3), chosen from the segment ID so it stays the same."""
+    import zlib
+    value = zlib.crc32(str(key).encode("utf-8"))
+    total = 0.08 + 0.22 * ((value % 1000) / 999.0)          # green + blue: 0.08 .. 0.30
+    share = ((value // 1000) % 1000) / 999.0                 # how it is split between green and blue
+    return (1.0, round(total * share, 4), round(total * (1.0 - share), 4))
 
 # Normal tissue segments: whole normal liver (liver − tumours) or perfused normal liver (perfused volume − tumours).
 # Tag on the segment, read by the dose checks (tumour-to-normal ratio against the perfused normal liver).
@@ -194,6 +240,8 @@ def guessSegmentRole(name):
     text = (name or "").lower()
     if "lung" in text:
         return SEGMENT_LUNGS
+    if any(word in text for word in ("arter", "vessel", "vascul")):
+        return SEGMENT_VESSELS
     if "viable" in text or "fdg" in text or "metabolic" in text:
         return SEGMENT_VIABLE
     if any(word in text for word in ("tumor", "tumour", "lesion", "hcc", "metasta", "nodule")) \
@@ -257,6 +305,13 @@ class CaseSnapshot:
     reportSaved: bool = False
     reportOutdated: bool = False
     studyIntervalLimitDays: int = 60
+    planningSkipped: bool = False
+    planningHasInjection: bool = False      # injection point placed
+    planningHasTree: bool = False           # arterial tree extracted
+    planningTips: int = 0                   # planned catheter positions
+    planningResults: dict = None            # stored result of the last territory prediction (see planningFindings)
+    planningOutdated: bool = False          # tree, markers or liver / tumour segments changed since
+    planningReviewed: bool = False          # extrahepatic findings of these results marked as reviewed
 
     @property
     def dosimetryType(self):
@@ -366,7 +421,9 @@ def evaluateData(s):
 def evaluateRegistration(s):
     issues = []
     jobs = s.jobs
-    pending = [job for job in jobs if not job.complete]
+    required = [job for job in jobs if not job.optional]
+    pending = [job for job in required if not job.complete]
+    optionalPending = [job for job in jobs if job.optional and not job.complete]
     if s.registrationSkipped:
         if pending:
             names = ", ".join(job.label.lower() for job in pending)
@@ -384,12 +441,17 @@ def evaluateRegistration(s):
                                                   "visually."))
         if job.method == "Deformable":
             issues.append(Issue(SEVERITY_INFO, f"{job.label}: deformable registration (kept live, not hardened)."))
-    done = len(jobs) - len(pending)
+    if optionalPending:
+        issues.append(Issue(SEVERITY_INFO, "Optional, not registered yet: "
+                            + ", ".join(job.label.lower() for job in optionalPending) + "."))
+    done = len(required) - len(pending)
     if pending:
         state = STATE_IN_PROGRESS if done else STATE_NOT_STARTED
         issues.append(Issue(SEVERITY_INFO, "Waiting: " + ", ".join(job.label.lower() for job in pending) + "."))
-        return StepStatus(state, f"{done} of {len(jobs)} registrations done.", issues)
-    return StepStatus(_stateFromIssues(issues), f"{len(jobs)} of {len(jobs)} registrations done.", issues)
+        return StepStatus(state, f"{done} of {len(required)} registrations done.", issues)
+    if not required:
+        return StepStatus(_stateFromIssues(issues), "Only optional registrations (auxiliary volumes).", issues)
+    return StepStatus(_stateFromIssues(issues), f"{len(required)} of {len(required)} registrations done.", issues)
 
 
 # Plausibility limits of the segmentation (warnings only; the user decides)
@@ -488,6 +550,119 @@ def evaluateSegmentation(s):
     return StepStatus(_stateFromIssues(issues), summary, issues)
 
 
+# Planning (CBCT territories) guardrails
+CBCT_LIVER_COVERAGE = 0.90         # less of the whole liver inside the CBCT field of view: territory beyond is unknown
+MAX_LOOPS = 3                      # more loops in the oriented tree: veins or bone in the tree segment?
+MAA_AGREEMENT_LOW = 0.6            # Dice of the territories with the MAA perfused volume
+MAA_COUNTS_LOW = 0.80              # fraction of the liver MAA counts inside the territories
+UNSUPPLIED_PERCENT = 10.0          # more of the liver not reached by the imaged tree: territories need the supplied
+TUMOUR_COVERAGE_LOW = 90.0         # % of a tumour inside the predicted territories
+EXTRAHEPATIC_FLAG = "Possible non-target vessel:"
+
+
+def planningFindings(results, reviewed=False):
+    """[Issue] from the stored result of a territory prediction (dict written by the CBCT planning module):
+    {"liverCoverage": 0-1, "loops": n, "positions": [{"label", "snapped", "snapDistanceMM", "territoryML",
+    "extrahepatic": [{"distanceMM", "lengthMM"}]}], "overlaps": [[a, b, mL]], "uncovered": [[tumour, coverage %]],
+    "maa": {"dice", "countsFraction"} or None}. reviewed: the extrahepatic findings were reviewed by the user."""
+    issues = []
+    coverage = results.get("liverCoverage")
+    if coverage is not None and coverage < CBCT_LIVER_COVERAGE:
+        issues.append(Issue(SEVERITY_WARNING, f"Only {100 * coverage:.0f}% of the whole liver is inside the CBCT field "
+                                              "of view: the territory beyond it is unknown."))
+    unsupplied = results.get("unsuppliedPercent")
+    if unsupplied is not None and unsupplied > UNSUPPLIED_PERCENT and not results.get("territoryLimitMM"):
+        issues.append(Issue(SEVERITY_WARNING, f"{unsupplied:.0f}% of the whole liver is far from every branch of the "
+                                              "imaged arterial tree (selective injection?): the territories claim "
+                                              "liver it may not feed. Turn on 'Limit each territory to liver near "
+                                              "its branches'."))
+    loops = results.get("loops") or 0
+    if loops > MAX_LOOPS:
+        issues.append(Issue(SEVERITY_WARNING, f"The arterial tree has {loops} loops: veins, bone or the catheter may "
+                                              "be included. Edit the tree segment and recompute."))
+    for position in results.get("positions", []):
+        label = position.get("label", "?")
+        if not position.get("snapped", True):
+            distance = position.get("snapDistanceMM")
+            where = f"is {distance:.0f} mm from the arterial tree" if distance is not None else "is not on the tree"
+            issues.append(Issue(SEVERITY_ERROR, f"Tip {label} {where}: move it onto an artery (no territory for this "
+                                                "position)."))
+            continue
+        volume = position.get("territoryML")
+        if volume is not None and volume < PERFUSED_MIN_ML:
+            issues.append(Issue(SEVERITY_WARNING, f"Territory of {label} is {volume:.0f} mL (less than "
+                                                  f"{PERFUSED_MIN_ML:.0f} mL): very selective, or the tree is "
+                                                  "incomplete."))
+        for finding in position.get("extrahepatic", []):
+            severity = SEVERITY_INFO if reviewed else SEVERITY_WARNING
+            issues.append(Issue(severity, f"{EXTRAHEPATIC_FLAG} a branch downstream of {label} runs "
+                                          f"{finding['distanceMM']:.0f} mm outside the liver "
+                                          f"({finding['lengthMM']:.0f} mm long; gastric, falciform, cystic?)."
+                                          + (" Marked as reviewed." if reviewed else " Review it on the CBCT.")))
+    for a, b, volume in results.get("overlaps", []):
+        issues.append(Issue(SEVERITY_WARNING, f"Territories {a} and {b} overlap by {volume:.0f} mL (nested tips): "
+                                              "subtract the downstream territory, or plan them as separate "
+                                              "sessions."))
+    for name, percent in results.get("uncovered", []):
+        text = (f"Tumour '{name}' is not in any predicted territory." if percent <= 0 else
+                f"Only {percent:.0f}% of tumour '{name}' is in the predicted territories.")
+        issues.append(Issue(SEVERITY_WARNING, text))
+    maa = results.get("maa")
+    if maa:
+        if maa.get("dice") is not None and maa["dice"] < MAA_AGREEMENT_LOW:
+            issues.append(Issue(SEVERITY_WARNING, f"The predicted territories agree poorly with the MAA perfused volume "
+                                                  f"(Dice {maa['dice']:.2f}): check the tip positions and the "
+                                                  "registration."))
+        if maa.get("countsFraction") is not None and maa["countsFraction"] < MAA_COUNTS_LOW:
+            issues.append(Issue(SEVERITY_WARNING, f"Only {100 * maa['countsFraction']:.0f}% of the liver MAA counts lie "
+                                                  "inside the predicted territories."))
+    return issues
+
+
+def evaluatePlanning(s):
+    cbct = s.roles.get(R.ROLE_CBCT) or s.roles.get(R.ROLE_CBCT_PARENCHYMAL)
+    if cbct is None:
+        return StepStatus(STATE_NOT_APPLICABLE, "Not needed: no CBCT assigned.")
+    if s.planningSkipped:
+        return StepStatus(STATE_SKIPPED, "Skipped by the user.")
+    issues = []
+    if not s.segmentationPresent:
+        issues.append(Issue(SEVERITY_ERROR, "No segmentation: segment the whole liver first (Segmentation step)."))
+    elif not segmentsWithRole(s, SEGMENT_LIVER):
+        issues.append(Issue(SEVERITY_ERROR, "No whole-liver segment: the territories need it (Segmentation step)."))
+    for job in s.jobs:
+        if job.key in CBCT_JOBS and not job.complete:
+            issues.append(Issue(SEVERITY_WARNING, f"The {job.label} is not registered to the primary image: "
+                                                  "register it in the Registration step (or confirm its alignment)."))
+    results = s.planningResults
+    if not results:
+        if not s.planningHasTree:
+            issues.append(Issue(SEVERITY_INFO, "Place the injection point and extract the arterial tree, or use the "
+                                               "perfused volume from CBCT enhancement (CBCT Planning)."))
+            state = STATE_ERROR if any(i.severity == SEVERITY_ERROR for i in issues) else STATE_NOT_STARTED
+            return StepStatus(state, "No territory predicted yet.", issues)
+        if not s.planningTips:
+            issues.append(Issue(SEVERITY_INFO, "Place the planned catheter tip(s) on the arterial tree."))
+        state = STATE_ERROR if any(i.severity == SEVERITY_ERROR for i in issues) else STATE_IN_PROGRESS
+        return StepStatus(state, "Arterial tree extracted; predict the territories.", issues)
+    issues += planningFindings(results, s.planningReviewed)
+    territoryIDs = set(results.get("segmentIDs", []))
+    pending = [x.name for x in s.segments if x.candidate and x.segmentID in territoryIDs]
+    if pending:
+        issues.append(Issue(SEVERITY_WARNING, "Predicted territory not accepted yet: " +
+                            ", ".join(f"'{n}'" for n in pending) + " (accept or discard it in the Segmentation "
+                            "step)."))
+    parts = [f"{p.get('label', '?')} {p['territoryML']:.0f} mL" for p in results.get("positions", [])
+             if p.get("territoryML") is not None]
+    parts += [f"enhancement {item.get('volumeML', 0):.0f} mL" for item in results.get("enhancement", [])]
+    summary = ("Territories: " + ", ".join(parts)) if parts else "No territory."
+    if s.planningOutdated:
+        issues.append(Issue(SEVERITY_WARNING, "The arterial tree, the catheter positions or the liver / tumour "
+                                              "segments changed: predict the territories again."))
+        return StepStatus(STATE_OUTDATED, summary, issues)
+    return StepStatus(_stateFromIssues(issues), summary, issues)
+
+
 LSF_WARNING_PERCENT = 10.0
 LSF_HIGH_PERCENT = 20.0
 Y90_GY_KG_PER_GBQ = 49.67                # MIRD: Gy per GBq fully absorbed in 1 kg
@@ -582,6 +757,7 @@ EVALUATORS = {
     STEP_DATA: evaluateData,
     STEP_REGISTRATION: evaluateRegistration,
     STEP_SEGMENTATION: evaluateSegmentation,
+    STEP_PLANNING: evaluatePlanning,
     STEP_LSF: evaluateLsf,
     STEP_DOSIMETRY: evaluateDosimetry,
     STEP_REPORT: evaluateReport,
@@ -591,6 +767,7 @@ EVALUATORS = {
 PREREQUISITES = {
     STEP_REGISTRATION: [STEP_DATA],
     STEP_SEGMENTATION: [STEP_DATA],
+    STEP_PLANNING: [STEP_DATA, STEP_SEGMENTATION],
     STEP_LSF: [STEP_DATA],
     STEP_DOSIMETRY: [STEP_DATA, STEP_SEGMENTATION],
     STEP_REPORT: [STEP_DOSIMETRY],

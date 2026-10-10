@@ -5,7 +5,7 @@ Used by the Taranis hub module and, over time, by the step modules (EasyReg, LSF
 
 import logging
 
-_SUBMODULES = ["roles", "workflow", "doseguard", "dosekernel", "visibility", "case", "controller", "segmentops", "ai", "segtools", "views", "lsf", "timing", "memory", "toolbar"]
+_SUBMODULES = ["roles", "workflow", "doseguard", "dosekernel", "visibility", "case", "controller", "segmentops", "ai", "segtools", "vascular", "cbct", "views", "widgets", "lsf", "timing", "memory", "toolbar"]
 
 # Instances replaced by a developer reload are kept alive: if Python frees their Qt widgets before Qt has
 # processed the deferred deletes (deleteLater), Slicer crashes.

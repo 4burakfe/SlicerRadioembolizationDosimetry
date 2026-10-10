@@ -14,13 +14,21 @@ Pipeline (register()):
      mask (e.g. the dilated liver) restricts the comparison. The number of samples per level is fixed by the quality
      preset (not a percentage of the voxels), so the run time depends little on the final resolution.
   4. The result is kept only if it improves the metric over the starting position (same sample points: fixed seed).
+  5. Optional iterative deformable stage (deformable=True), starting from the linear result: B-spline free-form
+     deformations in passes, coarse to fine control-point grid (e.g. 200, 100, 50 mm). Each pass registers the
+     remaining local differences with a new B-spline on top of the passes kept so far, and is kept only if it improves
+     the metric (a pass that does not is dropped; the next, finer one still runs). Only the first pass starts on a
+     coarse level. The control points cover the mask, or else the body (the air around it is left out), plus one
+     control-point spacing on each side; beyond that the deformation fades to the linear result. The result is a
+     displacement field (world RAS) on a coarse grid, with the minimum Jacobian determinant (folding check).
 
 Conventions (as in functional.py): arrays are [k, j, i]; ijkToWorld maps (i, j, k, 1) to world RAS in mm. The
 registration matrix M maps moving-image points (native RAS, no parent transform) to world RAS, i.e. it is the
 matrix to parent of the Slicer transform the moving image goes under.
 
 Methods: Mattes et al., IEEE TMI 2003 (mutual information); multi-resolution registration as in ITK (Yoo et al.,
-Insight Toolkit) and SimpleITK (Lowekamp et al., Front Neuroinform 2013).
+Insight Toolkit) and SimpleITK (Lowekamp et al., Front Neuroinform 2013); B-spline free-form deformation (Rueckert et
+al., IEEE TMI 1999) with coarse-to-fine control-point refinement.
 """
 
 import dataclasses
@@ -80,6 +88,27 @@ SEARCH_LATERAL_OFFSETS_MM = (-30.0, -15.0, 0.0, 15.0, 30.0)
 SEARCH_FINE_STEP_MM = 4.0
 SEARCH_MIN_OVERLAP = 0.6          # head-feet overlap of the two fields of view, fraction of the shorter one
 SEARCH_SAMPLES = 20_000
+
+# Iterative deformable stage (B-spline free-form deformation)
+# (label, final control-point spacing in mm). Coarser grids are stiffer.
+GRID_SPACING_CHOICES = [
+    ("80 mm (stiff; whole organs)", 80.0),
+    ("50 mm (recommended; liver)", 50.0),
+    ("30 mm (flexible; local differences)", 30.0),
+    ("20 mm (very flexible; check for distortion)", 20.0),
+]
+DEFAULT_GRID_SPACING_MM = 50.0
+DEFAULT_DEFORMABLE_PASSES = 3     # control-point spacing halves from pass to pass, ending at the chosen spacing
+MAX_DEFORMABLE_PASSES = 4
+DEFORMABLE_MIN_SPACING_MM = 2.0   # image resolution of a pass: grid spacing / 8, between these limits
+DEFORMABLE_MAX_SPACING_MM = 8.0
+DEFORMABLE_ITERATIONS = 25        # most L-BFGS-B iterations per pass and level (a pass usually converges earlier)
+MIN_DEFORMABLE_ITERATIONS = 10
+MAX_DEFORMABLE_ITERATIONS = 200
+FOREGROUND_FRACTION = 0.1         # body (no mask): voxels above 10 % of the reference's intensity range
+MIN_JACOBIAN = 0.1                # a pass that compresses any region below this volume ratio (or folds it) is dropped
+FIELD_SPACING_MM = 4.0            # displacement field grid (coarsened when larger than MAX_FIELD_VOXELS)
+MAX_FIELD_VOXELS = 4_000_000
 
 _LPS = np.diag([-1.0, -1.0, 1.0, 1.0])   # RAS <-> LPS (its own inverse)
 
@@ -550,17 +579,263 @@ def searchStart(fixedImage, movingImage, fixedCoarse, movingCoarse, matrix, cent
     return translationMatrix(offset) @ matrix, value, tried[0]
 
 
+def deformablePasses(gridSpacingMm, passes):
+    """Control-point spacings (mm) of the passes, coarse to fine, ending with gridSpacingMm."""
+    count = int(min(MAX_DEFORMABLE_PASSES, max(1, passes)))
+    return [float(gridSpacingMm) * 2 ** (count - 1 - index) for index in range(count)]
+
+
+def deformableShrink(gridSpacingMm, spacingMm, shape):
+    """Shrink factor of the working images for a pass with this control-point spacing (images of about 1/8 of it,
+    between DEFORMABLE_MIN_SPACING_MM and DEFORMABLE_MAX_SPACING_MM, at least MIN_LEVEL_VOXELS along each axis)."""
+    target = min(DEFORMABLE_MAX_SPACING_MM, max(DEFORMABLE_MIN_SPACING_MM, gridSpacingMm / 8.0))
+    factor = max(1, int(round(target / spacingMm)))
+    while factor > 1 and min(shape) / factor < MIN_LEVEL_VOXELS:
+        factor -= 1
+    return factor
+
+
+def paddedDomain(working, padMm):
+    """(size i j k, origin LPS, spacing, direction) of the working image's grid extended by padMm on each side: the
+    domain of a B-spline, so that its control points reach beyond the compared region and the deformation fades to
+    nothing outside it."""
+    matrix = np.asarray(working.ijkToWorld, dtype=float)
+    spacing = np.linalg.norm(matrix[:3, :3], axis=0)
+    pad = np.ceil(padMm / spacing).astype(int)
+    size = np.array(working.shape[::-1], dtype=int) + 2 * pad
+    shifted = matrix @ np.append(-pad.astype(float), 1.0)
+    direction = _LPS[:3, :3] @ (matrix[:3, :3] / spacing[None, :])
+    return ([int(v) for v in size], [float(v) for v in _LPS[:3, :3] @ shifted[:3]], [float(v) for v in spacing],
+            [float(v) for v in direction.flatten()])
+
+
+def deformableRegion(working, mask=None, fraction=FOREGROUND_FRACTION):
+    """Working view of the box the deformation is fitted in: the mask's bounding box, or without a mask the
+    foreground's (the body: voxels above `fraction` of the image's 1-99 percentile intensity range, so the air
+    around the patient gets no control points). Stray voxels are ignored (0.5-99.5 percentiles of the coordinates).
+    The whole image when the box would be empty."""
+    if mask is not None:
+        inside = np.asarray(mask, dtype=bool)
+    else:
+        sample = _sample(working.voxels)
+        if sample.size == 0:
+            return working
+        low, high = (float(v) for v in np.percentile(sample, (1.0, 99.0)))
+        if not high > low:
+            return working
+        inside = working.voxels > low + fraction * (high - low)
+    indices = np.nonzero(inside)
+    if indices[0].size == 0:
+        return working
+    start = [int(np.floor(np.percentile(axis, 0.5))) for axis in indices]
+    stop = [int(np.ceil(np.percentile(axis, 99.5))) + 1 for axis in indices]
+    box = tuple(slice(a, b) for a, b in zip(start, stop))
+    matrix = np.asarray(working.ijkToWorld, dtype=float) @ translationMatrix(start[::-1])
+    return Working(working.voxels[box], matrix)
+
+
+def fieldGrid(shape, ijkToWorld, spacingMm=FIELD_SPACING_MM, maxVoxels=MAX_FIELD_VOXELS):
+    """(shape [k, j, i], IJK-to-world) of the displacement field grid over an image: spacingMm, coarsened until it has
+    at most maxVoxels voxels."""
+    spacing = float(spacingMm)
+    while True:
+        fieldShape, matrix = gridFor(shape, ijkToWorld, spacing)
+        if int(np.prod(fieldShape)) <= maxVoxels:
+            return fieldShape, matrix
+        spacing *= 1.25
+
+
+def _evaluateTransform(fixedImage, movingImage, transform, voxelCount, fixedMask=None, samples=EVALUATION_SAMPLES):
+    """Mattes mutual information (lower is better) of the moving image mapped by a SimpleITK transform (fixed to
+    moving); inf when it cannot be evaluated."""
+    method = _method(samples, voxelCount, fixedMask=fixedMask)
+    method.SetInitialTransform(transform, False)
+    try:
+        value = float(method.MetricEvaluate(fixedImage, movingImage))
+    except RuntimeError:
+        return math.inf
+    return value if math.isfinite(value) else math.inf
+
+
+def _composite(transforms):
+    """SimpleITK composite transform: transforms[0](transforms[1](... x)) (the last one is applied first)."""
+    import SimpleITK as sitk
+    composite = sitk.CompositeTransform(3)
+    for transform in transforms:
+        composite.AddTransform(transform)
+    return composite
+
+
+def runDeformablePass(fixedImage, movingImage, fixedWorking, initialTransform, gridSpacingMm, spacingMm, voxelCount,
+                      samples, fixedMask=None, progress=None, isCancelled=None, label="", coarse=True, domain=None,
+                      iterations=DEFORMABLE_ITERATIONS):
+    """One B-spline pass: a new free-form deformation (control points gridSpacingMm apart) registered on top of
+    initialTransform (fixed to moving; linear, or linear and the displacement field of the previous passes). The
+    B-spline domain is domain (a Working box inside the fixed image, see deformableRegion; default the whole working
+    fixed image) extended by one control-point spacing, so the deformation fades out beyond the compared region.
+    With coarse, a coarse level first gives the capture range (needed in the first pass only: later passes start
+    close); the pass ends on the working images, the images the result is judged on. The run time grows with the
+    number of control points (SimpleITK's metrics handle the B-spline derivative as a dense vector), hence the
+    region. iterations: most optimiser iterations per level. Returns (B-spline transform, stop condition)."""
+    import SimpleITK as sitk
+    size, origin, spacing, direction = paddedDomain(domain if domain is not None else fixedWorking, gridSpacingMm)
+    domain = sitk.Image(size, sitk.sitkUInt8)
+    domain.SetOrigin(origin)
+    domain.SetSpacing(spacing)
+    domain.SetDirection(direction)
+    extent = [n * s for n, s in zip(size, spacing)]
+    mesh = [max(1, int(round(length / gridSpacingMm))) for length in extent]
+    bspline = sitk.BSplineTransformInitializer(domain, mesh, 3)
+    shrink = deformableShrink(gridSpacingMm, spacingMm, fixedWorking.shape)
+    factors = [shrink, 1] if shrink > 1 and coarse else [1]
+    method = _method(samples, voxelCount, factors, fixedMask)
+    iterations = int(min(MAX_DEFORMABLE_ITERATIONS, max(MIN_DEFORMABLE_ITERATIONS, iterations)))
+    method.SetOptimizerAsLBFGSB(gradientConvergenceTolerance=1e-5, numberOfIterations=iterations,
+                                maximumNumberOfCorrections=5,
+                                maximumNumberOfFunctionEvaluations=4 * iterations,
+                                costFunctionConvergenceFactor=1e7)
+    method.SetShrinkFactorsPerLevel([int(f) for f in factors])
+    method.SetSmoothingSigmasPerLevel(smoothingSigmas(factors, spacingMm))
+    method.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
+    # (ITK maps image gradients through the moving initial transform: it must not contain a B-spline)
+    method.SetMovingInitialTransform(initialTransform)
+    method.SetInitialTransform(bspline, True)
+    state = {"cancelled": False}
+
+    def onIteration():
+        if isCancelled is not None and isCancelled():
+            state["cancelled"] = True
+            _stop(method)
+            return
+        if progress is not None:
+            level = factors[min(method.GetCurrentLevel(), len(factors) - 1)]
+            progress(f"{label}control points {gridSpacingMm:g} mm apart, images {spacingMm * level:g} mm, "
+                     f"iteration {method.GetOptimizerIteration()}, metric {method.GetMetricValue():.4f}")
+
+    method.AddCommand(sitk.sitkIterationEvent, onIteration)
+    try:
+        method.Execute(fixedImage, movingImage)
+    except RuntimeError:
+        if state["cancelled"]:
+            raise RegistrationCancelled()
+        raise
+    if state["cancelled"]:
+        raise RegistrationCancelled()
+    return bspline, method.GetOptimizerStopConditionDescription()
+
+
+def _field(transform, shape, ijkToWorld):
+    """(SimpleITK displacement field image (LPS) of a transform on a grid, minimum Jacobian determinant)."""
+    import SimpleITK as sitk
+    reference = sitk.Image([int(v) for v in shape[::-1]], sitk.sitkUInt8)
+    _place(reference, ijkToWorld)
+    converter = sitk.TransformToDisplacementFieldFilter()
+    converter.SetReferenceImage(reference)
+    converter.SetOutputPixelType(sitk.sitkVectorFloat64)
+    field = converter.Execute(transform)
+    minimumJacobian = math.nan
+    if min(shape) >= 2:
+        try:
+            jacobian = sitk.DisplacementFieldJacobianDeterminant(field)   # kept alive while its array is read
+            minimumJacobian = float(np.min(sitk.GetArrayViewFromImage(jacobian)))
+        except RuntimeError:
+            pass
+    return field, minimumJacobian
+
+
+def fieldTransform(transform, shape, ijkToWorld):
+    """(SimpleITK displacement field transform equal to a transform (fixed to moving) on a grid, minimum Jacobian
+    determinant)."""
+    import SimpleITK as sitk
+    field, minimumJacobian = _field(transform, shape, ijkToWorld)
+    return sitk.DisplacementFieldTransform(field), minimumJacobian
+
+
+def displacementField(transform, shape, ijkToWorld):
+    """(displacement [k, j, i, 3] in world RAS mm, minimum Jacobian determinant) of a SimpleITK transform (fixed to
+    moving) on a grid: the moving-image point of world point x is x + displacement(x). This is the transform from
+    parent of a Slicer grid transform."""
+    import SimpleITK as sitk
+    field, minimumJacobian = _field(transform, shape, ijkToWorld)
+    displacement = np.array(sitk.GetArrayFromImage(field), dtype=np.float64)
+    displacement[..., :2] *= -1.0   # LPS -> RAS
+    return displacement, minimumJacobian
+
+
+def _deformableStage(fixedImage, movingImage, fixedWorking, matrix, kind, centreLps, spacing, voxelCount, samples,
+                     maskImage, maskWorking, gridSpacingMm, passes, fieldGeometry, progress, isCancelled, notes,
+                     iterations=DEFORMABLE_ITERATIONS):
+    """Iterative B-spline passes on top of the linear matrix (see the module doc). A pass that does not improve the
+    metric is dropped and the next, finer pass starts from the previous result. The deformation of the kept passes
+    is carried between passes as a displacement field on the working grid. Returns a dict: displacement (None when
+    no pass was kept), fieldIjkToWorld, minimumJacobian, passes [(grid mm, metric before, after, kept)], metric."""
+    linear = sitkTransform(matrix, kind, centreLps)
+    metric = _evaluateTransform(fixedImage, movingImage, linear, voxelCount, maskImage)
+    carried = None          # displacement field transform of the kept passes (fixed to fixed), or None
+    workShape, workMatrix = fieldGrid(fixedWorking.shape, fixedWorking.ijkToWorld)
+    region = deformableRegion(fixedWorking, maskWorking)
+    history = []
+    gridSpacings = deformablePasses(gridSpacingMm, passes)
+    for index, gridMm in enumerate(gridSpacings):
+        start = _composite([linear, carried]) if carried is not None else linear
+        bspline, _ = runDeformablePass(fixedImage, movingImage, fixedWorking, start, gridMm, spacing, voxelCount,
+                                       samples, maskImage, progress, isCancelled,
+                                       f"Deformable pass {index + 1} of {len(gridSpacings)}: ",
+                                       coarse=index == 0, domain=region, iterations=iterations)
+        local = _composite([carried, bspline]) if carried is not None else bspline
+        value = _evaluateTransform(fixedImage, movingImage, _composite([linear, local]), voxelCount, maskImage)
+        kept = math.isfinite(value) and value < metric
+        if kept:
+            candidate, jacobian = fieldTransform(local, workShape, workMatrix)
+            if math.isfinite(jacobian) and jacobian <= MIN_JACOBIAN:
+                kept = False
+                notes.append(f"Deformable pass {index + 1} ({gridMm:g} mm grid) was dropped: it folds the image "
+                             f"(minimum Jacobian determinant {jacobian:.2f}).")
+        history.append((gridMm, metric, value, kept))
+        if kept:
+            metric = value
+            carried = candidate
+    result = {"displacement": None, "fieldIjkToWorld": None, "minimumJacobian": math.nan, "passes": history,
+              "metric": metric}
+    keptGrids = [f"{grid:g}" for grid, _, _, ok in history if ok]
+    if carried is None:
+        notes.append("The deformable passes (control points " + ", ".join(f"{g:g}" for g in gridSpacings)
+                     + " mm apart) did not improve the match: the linear result was kept.")
+        return result
+    if progress is not None:
+        progress("Computing the displacement field")
+    if fieldGeometry is None:
+        fieldGeometry = (fixedWorking.shape, fixedWorking.ijkToWorld)
+    fieldShape, fieldMatrix = fieldGrid(*fieldGeometry)
+    displacement, minimumJacobian = displacementField(_composite([linear, carried]), fieldShape, fieldMatrix)
+    result.update(displacement=displacement, fieldIjkToWorld=fieldMatrix, minimumJacobian=minimumJacobian)
+    notes.append(f"Deformable: {len(keptGrids)} of {len(gridSpacings)} passes kept (control points "
+                 f"{', '.join(keptGrids)} mm apart); mutual information {history[0][1]:.4f} \u2192 {metric:.4f}.")
+    if math.isfinite(minimumJacobian) and minimumJacobian <= 0:
+        notes.append(f"Warning: the deformation folds (minimum Jacobian determinant {minimumJacobian:.2f}). Use a "
+                     "coarser grid or fewer passes.")
+    return result
+
+
 def register(fixed, moving, initialMatrix=None, transformType=RIGID, finalSpacingMm=DEFAULT_FINAL_SPACING_MM,
              quality=DEFAULT_QUALITY, fixedMask=None, initialization=INIT_CURRENT,
-             searchRangeMm=DEFAULT_SEARCH_RANGE_MM, progress=None, isCancelled=None):
+             searchRangeMm=DEFAULT_SEARCH_RANGE_MM, progress=None, isCancelled=None, deformable=False,
+             gridSpacingMm=DEFAULT_GRID_SPACING_MM, passes=DEFAULT_DEFORMABLE_PASSES, fieldGeometry=None,
+             deformableIterations=DEFORMABLE_ITERATIONS):
     """
     Register moving (ImageInput, native coordinates) to fixed (ImageInput). fixedMask: (bool [k, j, i], ijkToWorld)
     restricting the comparison, or None. initialMatrix: current moving-to-world matrix (identity if None).
     progress(text) is called during the run; isCancelled() -> True stops it (RegistrationCancelled).
+    deformable: after the linear stage (transformType), iterative B-spline passes (control points gridSpacingMm apart
+    in the last pass, at most deformableIterations optimiser iterations per pass and level); fieldGeometry: (shape
+    [k, j, i], ijkToWorld) of the image the displacement field must cover (default: the fixed image given).
 
     Returns a dict: matrix (moving-to-world RAS, to set on the transform), initialMatrix (after the starting
     position), refined (False: the result did not improve the match and the starting position is returned),
     initialMetric, finalMetric, spacing (final resolution used), levels (mm), notes [text], stop, seconds.
+    With deformable, also: displacement ([k, j, i, 3] world RAS, the transform from parent of the moving image; None
+    when no deformable pass improved the match), fieldIjkToWorld, minimumJacobian, deformablePasses
+    [(grid mm, metric before, after, kept)]; finalMetric is then the metric with the deformation.
     """
     start = time.time()
     notes = []
@@ -631,7 +906,18 @@ def register(fixed, moving, initialMatrix=None, transformType=RIGID, finalSpacin
         notes.append("The registration did not improve the match (mutual information "
                      f"{initialMetric:.4f} -> {finalMetric:.4f}): the starting position was kept.")
         matrix = matrix0
-    return {"matrix": matrix, "initialMatrix": matrix0, "refined": bool(refined),
-            "initialMetric": float(initialMetric), "finalMetric": float(finalMetric), "spacing": float(spacing),
-            "levels": levels, "notes": notes, "stop": stop, "seconds": time.time() - start,
-            "centreRas": centreRas}
+    result = {"matrix": matrix, "initialMatrix": matrix0, "refined": bool(refined),
+              "initialMetric": float(initialMetric), "finalMetric": float(finalMetric), "spacing": float(spacing),
+              "levels": levels, "notes": notes, "stop": stop, "seconds": time.time() - start,
+              "centreRas": centreRas}
+    if deformable:
+        stage = _deformableStage(fixedImage, movingImage, fixedWorking, matrix, transformType, centreLps, spacing,
+                                 voxelCount, samples, maskImage, maskWorking, gridSpacingMm, passes, fieldGeometry,
+                                 report, isCancelled, notes, deformableIterations)
+        result.update(displacement=stage["displacement"], fieldIjkToWorld=stage["fieldIjkToWorld"],
+                      minimumJacobian=stage["minimumJacobian"], deformablePasses=stage["passes"])
+        if stage["displacement"] is not None:
+            result["finalMetric"] = float(stage["metric"])
+            result["refined"] = True
+        result["seconds"] = time.time() - start
+    return result

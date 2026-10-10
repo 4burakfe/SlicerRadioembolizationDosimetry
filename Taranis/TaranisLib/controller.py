@@ -16,7 +16,8 @@ from . import roles as R
 from . import workflow as W
 from .case import (TaranisCase, volumeInfo, P_CURRENT_STEP, P_REGISTRATION_SKIPPED, P_REGISTRATION_CHECKED,
                    P_LSF_SOURCE, P_LSF_SKIPPED, P_DOSIMETRY_RESULT_KEY, P_DOSIMETRY_FINGERPRINT,
-                   P_SEGMENT_GEOMETRY, P_LSF_DETAILS, P_LSF_ISSUES)
+                   P_SEGMENT_GEOMETRY, P_LSF_DETAILS, P_LSF_ISSUES, P_PLANNING_SKIPPED, P_PLANNING_RESULTS,
+                   P_PLANNING_REVIEWED, REF_PLANNING_INJECTION, REF_PLANNING_TIPS, REF_PLANNING_TREE)
 
 # Attributes written by EasyReg on its registration transforms
 EASYREG_TRANSFORM = "EasyReg.Transform"
@@ -36,6 +37,7 @@ CATEGORY_ATTRIBUTE = "Taranis.SegmentCategories"
 CATEGORY_TO_ROLE = {"tumor": W.SEGMENT_TUMOR, "viable": W.SEGMENT_VIABLE, "normal": W.SEGMENT_NORMAL,
                     "lungs": W.SEGMENT_LUNGS, "other": W.SEGMENT_OTHER}
 ROLE_TO_CATEGORY = {role: category for category, role in CATEGORY_TO_ROLE.items()}
+ROLE_TO_CATEGORY[W.SEGMENT_VESSELS] = "ignored"   # arterial tree: not calculated and not shown by the dosimetry
 LSF_CANDIDATE_TAG = "LSFcalc.Candidate"
 TARANIS_CANDIDATE_TAG = "Taranis.Candidate"   # AI result of the hub (value: role it gets when accepted)
 
@@ -104,7 +106,9 @@ def setSegmentRole(segmentationNode, segmentID, role, recolor=True):
     else:
         categories.pop(segmentID, None)
     segmentationNode.SetAttribute(CATEGORY_ATTRIBUTE, json.dumps(dict(sorted(categories.items()))))
-    if recolor and role in W.SEGMENT_ROLES:
+    if recolor and role == W.SEGMENT_PERFUSED:
+        segment.SetColor(*W.perfusedColor(segmentID))   # every perfused volume a red of its own
+    elif recolor and role in W.SEGMENT_ROLES:
         segment.SetColor(*W.SEGMENT_ROLES[role][2])
 
 
@@ -282,7 +286,7 @@ def _placement(node):
 
 def inputsFingerprint(case):
     parts = {}
-    for role in R.VOLUME_ROLES:
+    for role in [role for role in R.VOLUME_ROLES if role not in R.NON_DOSIMETRY_ROLES]:   # not dosimetry inputs
         node = case.roleNode(role)
         if node is None:
             parts[role] = None
@@ -300,6 +304,57 @@ def inputsFingerprint(case):
         parts[R.ROLE_SEGMENTATION] = [segmentationNode.GetID(), _placement(segmentationNode), segments]
     text = json.dumps(parts, sort_keys=True, default=str)
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+
+
+# -- CBCT planning ------------------------------------------------------------------------------------------------
+
+def controlPoints(markupsNode):
+    """World positions [[r, a, s]] of the control points of a markups node ([] if None)."""
+    if markupsNode is None:
+        return []
+    points = []
+    for index in range(markupsNode.GetNumberOfControlPoints()):
+        position = [0.0, 0.0, 0.0]
+        markupsNode.GetNthControlPointPositionWorld(index, position)
+        points.append(position)
+    return points
+
+
+def segmentsVoxels(segmentationNode):
+    """[[segment ID, voxel count, centroid]] of every segment (labelmap statistics, cached)."""
+    if segmentationNode is None:
+        return None
+    segmentation = segmentationNode.GetSegmentation()
+    return [[segmentID, list((_labelmapStats(segmentation.GetSegment(segmentID)) or ())[:2])]
+            for segmentID in segmentIDs(segmentationNode)]
+
+
+def planningInputsKey(store, segmentationNode, cbctNode):
+    """Identifies the inputs of a territory prediction: injection point, tips, arterial tree, whole-liver and tumour
+    segments and the CBCT's position. store: the node holding the planning references (case or module node)."""
+    parts = {}
+    for reference in (REF_PLANNING_INJECTION, REF_PLANNING_TIPS):
+        parts[reference] = [[round(v, 1) for v in point] for point in controlPoints(store.GetNodeReference(reference))]
+    parts["tree"] = segmentsVoxels(store.GetNodeReference(REF_PLANNING_TREE))
+    roles = (W.SEGMENT_LIVER, W.SEGMENT_TUMOR, W.SEGMENT_VIABLE)
+    parts["segments"] = [[x.segmentID, x.voxels] for x in segmentInfos(segmentationNode)
+                         if x.role in roles and not x.candidate]
+    parts["cbct"] = [cbctNode.GetID(), _placement(cbctNode)] if cbctNode is not None else None
+    try:   # the territory limit changes the territories too
+        stored = json.loads(store.GetParameter("Planning.Settings") or "{}")
+    except ValueError:
+        stored = {}
+    parts["limit"] = [bool(stored.get("limitTerritories")), stored.get("supplyDistanceMM")]
+    text = json.dumps(parts, sort_keys=True, default=str)
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+
+
+def planningResults(store):
+    try:
+        results = json.loads(store.GetParameter(P_PLANNING_RESULTS) or "{}")
+    except ValueError:
+        return None
+    return results if isinstance(results, dict) and results else None
 
 
 # -- Dosimetry module results --------------------------------------------------------------------------------
@@ -405,6 +460,20 @@ def buildSnapshot(case, updateBookkeeping=True):
         s.lsfFromImage = bool(details.get("key"))
         image = case.roleNode(R.ROLE_DOSIMETRY)
         s.lsfOutdated = s.lsfFromImage and details.get("key") != inputsKey(s.segments, image.GetID() if image else "")
+
+    # CBCT planning
+    cbctNode = case.roleNode(R.ROLE_CBCT) or case.roleNode(R.ROLE_CBCT_PARENCHYMAL)
+    if cbctNode is not None:
+        s.planningSkipped = case.flag(P_PLANNING_SKIPPED)
+        s.planningHasInjection = bool(controlPoints(case.node.GetNodeReference(REF_PLANNING_INJECTION)))
+        s.planningTips = len(controlPoints(case.node.GetNodeReference(REF_PLANNING_TIPS)))
+        tree = segmentsVoxels(case.node.GetNodeReference(REF_PLANNING_TREE))
+        s.planningHasTree = bool(tree) and any(voxels and voxels[0] for _, voxels in tree)
+        s.planningResults = planningResults(case.node)
+        if s.planningResults:
+            key = planningInputsKey(case.node, segmentationNode, case.roleNode(R.ROLE_CBCT) or cbctNode)
+            s.planningOutdated = s.planningResults.get("key") != key
+            s.planningReviewed = case.param(P_PLANNING_REVIEWED) == s.planningResults.get("key")
 
     # Dosimetry results: prefer the module of the chosen mode
     modules = [R.MODE_MODULES[s.mode]] if s.mode else []
@@ -567,6 +636,17 @@ class WorkflowController(VTKObservationMixin):
                 if hasattr(slicer.vtkSegmentation, name):
                     events.append(getattr(slicer.vtkSegmentation, name))
             wanted[segmentationNode] = events
+        markupsEvents = []   # not ModifiedEvent: it fires on every mouse move while a tip is placed or dragged
+        for name in ("PointAddedEvent", "PointRemovedEvent", "PointEndInteractionEvent"):
+            if hasattr(slicer.vtkMRMLMarkupsNode, name):
+                markupsEvents.append(getattr(slicer.vtkMRMLMarkupsNode, name))
+        for reference in (REF_PLANNING_INJECTION, REF_PLANNING_TIPS):
+            node = self.case.node.GetNodeReference(reference)
+            if node is not None:
+                wanted[node] = markupsEvents
+        tree = self.case.node.GetNodeReference(REF_PLANNING_TREE)
+        if tree is not None:
+            wanted[tree] = [vtk.vtkCommand.ModifiedEvent]
         for moduleName in R.MODE_MODULES.values():
             parameterNode = dosimetryParameterNode(moduleName)
             if parameterNode is not None:

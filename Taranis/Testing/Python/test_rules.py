@@ -387,6 +387,139 @@ class OtherStepsTest(unittest.TestCase):
         self.assertEqual(W.allIssues(statuses)[0].severity, W.SEVERITY_ERROR)
 
 
+class CbctTest(unittest.TestCase):
+
+    def test_classification(self):
+        self.assertEqual(R.guessType(vol("a", "", modality="XA")), R.TYPE_CBCT)
+        self.assertEqual(R.guessType(vol("a", "CBCT hepatic arterial", modality="CT")), R.TYPE_CBCT)
+        self.assertEqual(R.guessType(vol("a", "Cone beam CT liver", minValue=-1000.0)), R.TYPE_CBCT)
+        self.assertEqual(R.guessType(vol("a", "DynaCT body", modality="CT")), R.TYPE_CBCT)
+        self.assertEqual(R.guessType(vol("a", "CT arterial phase", modality="CT")), R.TYPE_CT)
+        self.assertEqual(R.guessType(vol("a", "CT dynamic", modality="CT")), R.TYPE_CT)
+        self.assertEqual(R.guessType(vol("a", "CBCT", modality="MR")), R.TYPE_MRI)
+        self.assertFalse(R.isAnatomical(vol("a", "", modality="XA")))
+
+    def test_suggestion(self):
+        infos = [
+            vol("maa", "SPECT MAA", modality="NM", frameOfReferenceUID="1.1", fromDicom=True),
+            vol("ct", "CT", modality="CT", frameOfReferenceUID="1.1", fromDicom=True),
+            vol("cb1", "CBCT arterial", modality="XA", frameOfReferenceUID="5.5", fromDicom=True,
+                acquisitionDateTime="2026-03-01T11:00:00"),
+            vol("cb2", "CBCT delayed", modality="XA", frameOfReferenceUID="5.5", fromDicom=True,
+                acquisitionDateTime="2026-03-01T11:00:30"),
+        ]
+        s = R.suggestAssignments(infos)
+        self.assertEqual(s.assignments[R.ROLE_CBCT], "cb1")
+        self.assertEqual(s.assignments[R.ROLE_CBCT_PARENCHYMAL], "cb2")
+        self.assertEqual(s.types[R.ROLE_CBCT], R.TYPE_CBCT)
+        self.assertNotIn(R.ROLE_REFERENCE, s.assignments)   # a CBCT is never the reference image
+
+    def test_registrationJobs(self):
+        roles = {R.ROLE_DOSIMETRY: vol("s"), R.ROLE_DOSIMETRY_ANATOMY: vol("c"),
+                 R.ROLE_CBCT: vol("a", frameOfReferenceUID="9"),
+                 R.ROLE_CBCT_PARENCHYMAL: vol("p", frameOfReferenceUID="9")}
+        primary, jobs = W.planRegistration(roles)
+        self.assertEqual([j.key for j in jobs], [W.JOB_CBCT])
+        self.assertEqual(jobs[0].followerRole, R.ROLE_CBCT_PARENCHYMAL)
+        self.assertEqual(jobs[0].path, W.PATH_HYBRID)
+        self.assertEqual(jobs[0].fixedRole, primary)
+        roles[R.ROLE_CBCT_PARENCHYMAL] = vol("p", frameOfReferenceUID="10")
+        _, jobs = W.planRegistration(roles)
+        self.assertEqual([j.key for j in jobs], [W.JOB_CBCT, W.JOB_CBCT_PARENCHYMAL])
+        self.assertIsNone(jobs[0].followerRole)
+
+    def test_auxiliaryVolumes(self):
+        self.assertEqual(len(R.AUXILIARY_ROLES), 3)
+        for role in R.AUXILIARY_ROLES:
+            self.assertIn(role, R.VOLUME_ROLES)
+            self.assertIn(role, R.NON_DOSIMETRY_ROLES)
+            self.assertIn(R.TYPE_OTHER, R.ROLE_TYPES[role])
+            self.assertIn(R.TYPE_MRI, R.ROLE_TYPES[role])
+        roles = {R.ROLE_DOSIMETRY: vol("s"), R.ROLE_DOSIMETRY_ANATOMY: vol("c"),
+                 R.AUXILIARY_ROLES[0]: vol("mr", "T2 HASTE"), R.AUXILIARY_ROLES[2]: vol("pet", modality="PT")}
+        primary, jobs = W.planRegistration(roles)
+        self.assertEqual([j.key for j in jobs], ["auxiliary1", "auxiliary3"])
+        self.assertTrue(all(j.optional for j in jobs))
+        self.assertEqual([j.path for j in jobs], [W.PATH_HYBRID, W.PATH_FUNCTIONAL])
+        self.assertEqual(jobs[0].fixedRole, primary)
+        # unregistered auxiliary volumes do not hold up the registration step
+        status = W.evaluateRegistration(snapshot(roles=roles, primaryRole=primary, jobs=jobs))
+        self.assertIn(status.state, W.FINISHED_STATES)
+        self.assertTrue(any("auxiliary volume 1" in i.text for i in status.issues))
+        roles[R.ROLE_REFERENCE] = vol("ref", "diagnostic CT")
+        primary, jobs = W.planRegistration(roles)
+        status = W.evaluateRegistration(snapshot(roles=roles, primaryRole=primary, jobs=jobs))
+        self.assertEqual(status.state, W.STATE_NOT_STARTED)   # the dosimetry job still waits
+        self.assertIn("0 of 1", status.summary)
+
+    def _planning(self, **kwargs):
+        roles = {R.ROLE_DOSIMETRY: vol("s"), R.ROLE_DOSIMETRY_ANATOMY: vol("c"), R.ROLE_CBCT: vol("a")}
+        segments = [W.SegmentInfo("liver", "Whole liver", W.SEGMENT_LIVER, volumeML=1500.0)]
+        base = dict(roles=roles, segmentationPresent=True, segments=segments)
+        base.update(kwargs)
+        s = snapshot(**base)
+        return W.evaluatePlanning(s)
+
+    def test_planningStates(self):
+        self.assertEqual(W.evaluatePlanning(snapshot(roles={R.ROLE_DOSIMETRY: vol("s")})).state,
+                         W.STATE_NOT_APPLICABLE)
+        status = self._planning()
+        self.assertEqual(status.state, W.STATE_NOT_STARTED)
+        self.assertTrue(any(i.severity == W.SEVERITY_WARNING and "not registered" in i.text for i in status.issues))
+        self.assertEqual(self._planning(segments=[]).state, W.STATE_ERROR)
+        self.assertEqual(self._planning(planningHasTree=True).state, W.STATE_IN_PROGRESS)
+        self.assertEqual(self._planning(planningSkipped=True).state, W.STATE_SKIPPED)
+        results = {"positions": [{"label": "P1", "snapped": True, "territoryML": 420.0}], "liverCoverage": 0.97}
+        jobs = [W.RegistrationJob(W.JOB_CBCT, "CBCT", R.ROLE_CBCT, R.ROLE_DOSIMETRY_ANATOMY, registered=True)]
+        status = self._planning(planningResults=results, jobs=jobs, primaryRole=R.ROLE_DOSIMETRY_ANATOMY)
+        self.assertEqual(status.state, W.STATE_DONE)
+        self.assertIn("P1 420 mL", status.summary)
+        status = self._planning(planningResults=results, jobs=jobs, primaryRole=R.ROLE_DOSIMETRY_ANATOMY,
+                                planningOutdated=True)
+        self.assertEqual(status.state, W.STATE_OUTDATED)
+
+    def test_planningFindings(self):
+        results = {
+            "liverCoverage": 0.8, "loops": 5,
+            "positions": [{"label": "P1", "snapped": False, "snapDistanceMM": 7.0},
+                          {"label": "P2", "snapped": True, "territoryML": 60.0,
+                           "extrahepatic": [{"distanceMM": 12.0, "lengthMM": 30.0}]}],
+            "overlaps": [["P2", "P3", 50.0]], "uncovered": [["Tumor 1", 40.0], ["Tumor 2", 0.0]],
+            "maa": {"dice": 0.4, "countsFraction": 0.6}}
+        issues = W.planningFindings(results)
+        texts = " | ".join(i.text for i in issues)
+        for expected in ("80% of the whole liver", "5 loops", "Tip P1 is 7 mm", "Territory of P2 is 60 mL",
+                         W.EXTRAHEPATIC_FLAG, "overlap by 50 mL", "Only 40% of tumour 'Tumor 1'",
+                         "'Tumor 2' is not in any", "Dice 0.40", "Only 60% of the liver MAA counts"):
+            self.assertIn(expected, texts)
+        self.assertEqual(sum(1 for i in issues if i.severity == W.SEVERITY_ERROR), 1)
+        reviewed = W.planningFindings(results, reviewed=True)
+        flagged = [i for i in reviewed if i.text.startswith(W.EXTRAHEPATIC_FLAG)]
+        self.assertEqual(flagged[0].severity, W.SEVERITY_INFO)
+        self.assertEqual(W.planningFindings({"positions": [], "liverCoverage": 1.0, "maa": None}), [])
+
+    def test_pendingTerritoryCandidate(self):
+        segments = [W.SegmentInfo("liver", "Whole liver", W.SEGMENT_LIVER, volumeML=1500.0),
+                    W.SegmentInfo("t1", "Territory P1 (evaluate)", candidate=True)]
+        results = {"positions": [{"label": "P1", "snapped": True, "territoryML": 420.0}], "segmentIDs": ["t1"]}
+        status = self._planning(segments=segments, planningResults=results)
+        self.assertTrue(any("not accepted yet" in i.text for i in status.issues))
+
+    def test_perfusedColors(self):
+        colors = {W.perfusedColor(f"Segment_{n}") for n in range(20)}
+        self.assertGreater(len(colors), 15)
+        for r, g, b in colors:
+            self.assertEqual(r, 1.0)
+            self.assertTrue(0.08 - 1e-6 <= g + b <= 0.30 + 1e-6)   # green and blue together at most 0.3
+        self.assertEqual(W.perfusedColor("x"), W.perfusedColor("x"))
+
+    def test_vesselSegments(self):
+        self.assertEqual(W.guessSegmentRole("Arterial tree"), W.SEGMENT_VESSELS)
+        self.assertEqual(W.guessSegmentRole("Hepatic vessels"), W.SEGMENT_VESSELS)
+        self.assertEqual(W.guessSegmentRole("Territory P1"), W.SEGMENT_PERFUSED)
+        self.assertEqual(W.STEP_KEYS.index(W.STEP_PLANNING), W.STEP_KEYS.index(W.STEP_SEGMENTATION) + 1)
+
+
 class VisibilityTest(unittest.TestCase):
 
     def test_firstUse(self):

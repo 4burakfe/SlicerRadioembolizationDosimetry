@@ -1,36 +1,13 @@
 #-----------------------------------------------------------------------------
-set(MODULE_NAME Taranis)
+set(MODULE_NAME CBCTPlanning)
 
 #-----------------------------------------------------------------------------
 set(MODULE_PYTHON_SCRIPTS
   ${MODULE_NAME}.py
-  TaranisLib/__init__.py
-  TaranisLib/case.py
-  TaranisLib/lsf.py
-  TaranisLib/memory.py
-  TaranisLib/controller.py
-  TaranisLib/doseguard.py
-  TaranisLib/dosekernel.py
-  TaranisLib/dosimetry.py
-  TaranisLib/ai.py
-  TaranisLib/roles.py
-  TaranisLib/segmentops.py
-  TaranisLib/segtools.py
-  TaranisLib/vascular.py
-  TaranisLib/cbct.py
-  TaranisLib/widgets.py
-  TaranisLib/timing.py
-  TaranisLib/toolbar.py
-  TaranisLib/views.py
-  TaranisLib/visibility.py
-  TaranisLib/workflow.py
   )
 
 set(MODULE_PYTHON_RESOURCES
   Resources/Icons/${MODULE_NAME}.png
-  Resources/Icons/Epona.png
-  Resources/banner.png
-  Resources/DoseKernels/90Y_64.10H_beta.io_processed.csv
   )
 
 #-----------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 """Taranis hub: welcomes the user, manages the case and guides the radioembolization dosimetry workflow.
 
-Steps: 1 Data & roles, 2 Registration, 3 Segmentation, 4 Lung shunt fraction, 5 Dosimetry, 6 Report.
+Steps: 1 Data & roles, 2 Registration, 3 Segmentation, 4 CBCT planning (only with a CBCT), 5 Lung shunt fraction,
+6 Dosimetry, 7 Report.
 The step modules (EasyReg, LSF calculator, patient-relative and absolute dosimetry) stay usable on their own; from
 here they are opened with the inputs of the case.
 """
@@ -28,7 +29,7 @@ from TaranisLib.case import (TaranisCase, candidateVolumes, volumeInfo, settingB
                              SETTING_SHOW_AT_STARTUP, DEFAULT_SHOW_AT_STARTUP, SETTING_MODELS_FOLDER, P_MICROSPHERES, P_DOSE_METHOD,
                              P_DOSE_NUCLIDE,
                              P_TREATMENT_DATETIME, P_LSF_SKIPPED, P_REGISTRATION_SKIPPED, P_REGISTRATION_CHECKED,
-                             P_NAME, P_ID, P_LSF_LUNG_MASS, P_PLANNED_ACTIVITY)
+                             P_NAME, P_ID, P_LSF_LUNG_MASS, P_PLANNED_ACTIVITY, P_PLANNING_SKIPPED)
 from TaranisLib.controller import (WorkflowController, setSegmentRole, segmentIDs, segmentRole,
                                    persistSegmentRoles)
 from TaranisLib.toolbar import WorkflowToolbar, badgeIcon
@@ -36,6 +37,7 @@ from TaranisLib import ai, segtools, memory
 from TaranisLib import views as V
 from TaranisLib import lsf as L
 from TaranisLib import timing
+from TaranisLib.widgets import allowNarrowPanel
 from TaranisLib.case import _dicomHeader
 
 MODULE_VERSION = "0.1"
@@ -43,6 +45,7 @@ HOME = "home"
 
 EASYREG_MODULE = "easy_reg"
 LSF_MODULE = "LSFcalc"
+PLANNING_MODULE = "CBCTPlanning"
 SAMPLE_DATA = [("RadioembolizationDosimetry2", "CT + Tc-99m MAA SPECT (patient-relative)"),
                ("RadioembolizationDosimetry1", "MRI + Y-90 PET (absolute)")]
 SETTING_PERFUSED_PERCENT = "Taranis/PerfusedUptakePercentOfMax"   # new key: default changed from 15 to 5 %
@@ -72,6 +75,7 @@ STEP_TITLES = {
     W.STEP_DATA: "Data and imaging roles",
     W.STEP_REGISTRATION: "Registration",
     W.STEP_SEGMENTATION: "Segmentation",
+    W.STEP_PLANNING: "CBCT territory planning",
     W.STEP_LSF: "Lung shunt fraction",
     W.STEP_DOSIMETRY: "Dosimetry",
     W.STEP_REPORT: "Review and report",
@@ -81,13 +85,15 @@ WELCOME_HTML = """
 <h2>Welcome to Taranis</h2>
 <p>Voxel-based dosimetry for liver radioembolization (TARE / SIRT), from pre-therapy planning with
 Tc-99m MAA SPECT to post-therapy verification with Y-90 SPECT or Y-90 PET.</p>
-<p>A case guides you through six steps. The toolbar at the top shows where you are, which steps are done and
+<p>A case guides you through seven steps. The toolbar at the top shows where you are, which steps are done and
 any errors or warnings. Every step can be opened at any time.</p>
 <ol>
 <li><b>Data</b> &ndash; assign the images: the dosimetry image and at least one anatomical image are required;
 a reference CT/MRI and a metabolic PET (FDG, DOTATATE) are optional.</li>
 <li><b>Registration</b> &ndash; bring all images into one space (can be skipped when not needed).</li>
 <li><b>Segmentation</b> &ndash; whole liver, perfused volumes, tumours and lungs.</li>
+<li><b>Planning</b> &ndash; with a CBCT only: arterial tree, planned catheter tips and their predicted territories
+(perfused volumes).</li>
 <li><b>Lung shunt fraction</b> &ndash; calculate or enter manually.</li>
 <li><b>Dosimetry</b> &ndash; patient-relative (all images) or absolute (Y-90, post-therapy only).</li>
 <li><b>Report</b> &ndash; review and save.</li>
@@ -166,16 +172,20 @@ def environmentChecks():
     """[(ok, text)] for the modules and packages the suite relies on."""
     checks = []
     for label, moduleName in (("EasyReg (registration)", EASYREG_MODULE), ("LSF calculator", LSF_MODULE),
+                              ("CBCT planning", PLANNING_MODULE),
                               ("Patient-relative dosimetry", R.MODE_MODULES[R.MODE_RELATIVE]),
                               ("Absolute dosimetry", R.MODE_MODULES[R.MODE_ABSOLUTE]),
                               ("BRAINSFit (General Registration)", "BRAINSFit")):
         ok = moduleAvailable(moduleName)
         checks.append((ok, f"{label}: {'available' if ok else 'not loaded'}"))
-    for label, package in (("PyTorch", "torch"), ("MONAI", "monai"), ("pydicom", "pydicom")):
+    for label, package in (("PyTorch", "torch"), ("MONAI", "monai"), ("pydicom", "pydicom"),
+                           ("scikit-image", "skimage")):
         ok = importlib.util.find_spec(package) is not None
         text = "installed" if ok else "not installed"
         if not ok and package in ("torch", "monai"):
             text += " (needed only for AI segmentation)"
+        if not ok and package == "skimage":
+            text += " (needed only for CBCT centerlines; installed on first use)"
         checks.append((ok, f"{label}: {text}"))
     for spec in ai.MODELS:
         path = ai.findModel(spec)
@@ -362,7 +372,8 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.pages = {}
         for key, builder in ((HOME, self._buildHomePage), (W.STEP_DATA, self._buildDataPage),
                              (W.STEP_REGISTRATION, self._buildRegistrationPage),
-                             (W.STEP_SEGMENTATION, self._buildSegmentationPage), (W.STEP_LSF, self._buildLsfPage),
+                             (W.STEP_SEGMENTATION, self._buildSegmentationPage),
+                             (W.STEP_PLANNING, self._buildPlanningPage), (W.STEP_LSF, self._buildLsfPage),
                              (W.STEP_DOSIMETRY, self._buildDosimetryPage), (W.STEP_REPORT, self._buildReportPage)):
             page = qt.QWidget()
             pageLayout = qt.QVBoxLayout(page)
@@ -399,6 +410,7 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def enter(self):
         self._entered = True
+        allowNarrowPanel(self.parent)   # long names must not widen the panel
         toolbar = WorkflowToolbar.instance(create=False)
         if toolbar is not None:
             toolbar.onHubOpened()
@@ -633,6 +645,7 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 self._refreshData()
                 self._refreshRegistration()
                 self._refreshSegmentation()
+                self._refreshPlanning()
                 self._refreshLsf()
                 self._refreshDosimetry()
                 self._refreshReport()
@@ -1137,15 +1150,16 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 self._ensureValidMode()
         finally:
             case.node.EndModify(wasModifying)
-        if role in FUNCTIONAL_ROLES:
+        if role in FUNCTIONAL_ROLES or role in R.AUXILIARY_ROLES:
             self._colorFunctionalImages()
 
     def _colorFunctionalImages(self):
-        """Inferno for the dosimetry and metabolic images as soon as they are assigned, so the fused views show
-        them in colour whether or not the registration step was used."""
+        """Inferno for the dosimetry and metabolic images (and auxiliary SPECT / PET) as soon as they are assigned,
+        so the fused views show them in colour whether or not the registration step was used."""
         case = self.controller.case
         anatomy = case.primaryVolume()
-        for role in FUNCTIONAL_ROLES:
+        auxiliary = [role for role in R.AUXILIARY_ROLES if R.isFunctionalType(case.roleType(role))]
+        for role in list(FUNCTIONAL_ROLES) + auxiliary:
             node = case.roleNode(role)
             if node is not None and node is not anatomy:
                 try:
@@ -1160,6 +1174,8 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         case.setRoleType(role, self.roleTypeCombos[role].currentData or "")
         if role == R.ROLE_DOSIMETRY:
             self._ensureValidMode()
+        if role in R.AUXILIARY_ROLES:
+            self._colorFunctionalImages()
 
     def _ensureValidMode(self):
         case = self.controller.case
@@ -1294,7 +1310,7 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             elif job.checked:
                 state, status = W.STATE_WARNING, "Marked as aligned by the user."
             else:
-                state, status = W.STATE_NOT_STARTED, "Not registered yet."
+                state, status = W.STATE_NOT_STARTED, "Not registered yet." + (" Optional." if job.optional else "")
             widgets["badge"].setPixmap(badgeIcon(state).pixmap(18, 18))
             widgets["status"].text = status
             widgets["check"].checked = job.checked
@@ -1374,6 +1390,12 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             trySet("the following image", widget.spectSelector.setCurrentNode,
                    nodes.get(job.followerRole) if job.followerRole else None)
         trySet("the reference image", widget.referenceSelector.setCurrentNode, nodes.get(job.fixedRole))
+        if job.key in W.CBCT_JOBS and hasattr(widget, "finalSpacingComboBox"):
+            # CBCT -> CT/MRI: rigid, fine final resolution (the vessels are small); a liver ROI on the reference helps
+            for combo in (widget.finalSpacingComboBox, getattr(widget, "refineFinalSpacingComboBox", None)):
+                index = combo.findData("1") if combo is not None else -1
+                if index >= 0:
+                    combo.setCurrentIndex(index)
         segmentationNode = case.roleNode(R.ROLE_SEGMENTATION)
         if functional and segmentationNode is not None and hasattr(widget, "liverSegmentationSelector"):
             trySet("the liver segmentation", widget.liverSegmentationSelector.setCurrentNode, segmentationNode)
@@ -2271,7 +2293,87 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         slicer.app.restoreOverrideCursor()
 
     # =============================================================================================================
-    # 4. Lung shunt fraction
+    # 4. CBCT territory planning
+    # =============================================================================================================
+
+    def _buildPlanningPage(self, layout):
+        self.planningLabel = styledLabel()
+        self.planningLabel.setTextFormat(qt.Qt.RichText)
+        layout.addWidget(self.planningLabel)
+        self.planningTable = qt.QTableWidget(0, 3)
+        self.planningTable.setHorizontalHeaderLabels(["Tip", "Territory", "Tumours covered"])
+        self.planningTable.verticalHeader().visible = False
+        self.planningTable.horizontalHeader().setStretchLastSection(True)
+        self.planningTable.setEditTriggers(qt.QAbstractItemView.NoEditTriggers)
+        self.planningTable.setMaximumHeight(140)
+        layout.addWidget(self.planningTable)
+        self.openPlanningButton = qt.QPushButton("Open CBCT planning")
+        self.openPlanningButton.setStyleSheet("font-weight: bold; padding: 6px;")
+        self.openPlanningButton.setToolTip("Arterial tree, planned catheter tips, predicted territories, feeder "
+                                           "finder and perfused volume from CBCT enhancement, with the CBCT and the "
+                                           "segmentation of the case filled in.")
+        self.openPlanningButton.connect("clicked()", self.onOpenPlanning)
+        layout.addWidget(self.openPlanningButton)
+        self.skipPlanningCheckBox = qt.QCheckBox("Skip planning (no CBCT territory needed)")
+        self.skipPlanningCheckBox.connect("toggled(bool)", self.onSkipPlanningToggled)
+        layout.addWidget(self.skipPlanningCheckBox)
+        layout.addWidget(smallGray(
+            "Predicted territories arrive as yellow perfused-volume candidates in the case segmentation: review them "
+            "and accept them in the Segmentation step, then use them as perfused volumes in patient-relative "
+            "dosimetry. The prediction follows the visible arterial tree only (no flow model): compare it with the "
+            "angiography and the MAA uptake."))
+
+    def _refreshPlanning(self):
+        case = self.controller.case
+        snapshot = self.controller.snapshot
+        cbct = case.roleNode(R.ROLE_CBCT) or case.roleNode(R.ROLE_CBCT_PARENCHYMAL)
+        self.skipPlanningCheckBox.checked = case.flag(P_PLANNING_SKIPPED)
+        self.openPlanningButton.enabled = cbct is not None
+        self.skipPlanningCheckBox.enabled = cbct is not None
+        if cbct is None:
+            self.planningLabel.text = ("No CBCT in this case: planning is not needed. Assign a CBCT (arterial phase, "
+                                       "from catheter angiography) in the Data step to predict the territory of a "
+                                       "planned catheter position.")
+            self.planningTable.setRowCount(0)
+            self.planningTable.visible = False
+            return
+        results = snapshot.planningResults if snapshot is not None else None
+        lines = [f"CBCT: <b>{cbct.GetName()}</b>"]
+        if snapshot is not None:
+            lines.append(f"Injection point: {'placed' if snapshot.planningHasInjection else 'not placed'} &middot; "
+                         f"arterial tree: {'extracted' if snapshot.planningHasTree else 'not extracted'} &middot; "
+                         f"planned tips: {snapshot.planningTips}")
+        if results and results.get("maa"):
+            maa = results["maa"]
+            lines.append(f"MAA comparison: Dice {maa['dice']:.2f}, {100 * maa['countsFraction']:.0f}% of the liver "
+                         "counts inside the territories.")
+        self.planningLabel.text = "<br>".join(lines)
+        positions = [p for p in (results or {}).get("positions", [])]
+        self.planningTable.visible = bool(positions)
+        self.planningTable.setRowCount(len(positions))
+        for row, position in enumerate(positions):
+            territory = (f"{position['territoryML']:.0f} mL" if position.get("territoryML") is not None
+                         else "not on the tree")
+            tumours = ", ".join(f"{name} {percent:.0f}%" for name, percent in position.get("tumours", []))
+            for column, text in enumerate((position.get("label", ""), territory, tumours or "–")):
+                self.planningTable.setItem(row, column, qt.QTableWidgetItem(text))
+        self.planningTable.resizeColumnToContents(0)
+        self.planningTable.resizeColumnToContents(1)
+
+    def onOpenPlanning(self):
+        widget = moduleWidget(PLANNING_MODULE)
+        if widget is not None and hasattr(widget, "enter"):
+            try:
+                widget.onShowLayout()
+            except Exception as e:
+                logging.warning(f"Taranis: could not show the planning layout: {e}")
+
+    def onSkipPlanningToggled(self, checked):
+        if not self._updating and self.controller.isActive:
+            self.controller.case.setFlag(P_PLANNING_SKIPPED, checked)
+
+    # =============================================================================================================
+    # 5. Lung shunt fraction
     # =============================================================================================================
 
     def _buildLsfPage(self, layout):
@@ -2587,7 +2689,7 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.controller.case.setLsf(None, "")
 
     # =============================================================================================================
-    # 5. Dosimetry
+    # 6. Dosimetry
     # =============================================================================================================
 
     def _buildDosimetryPage(self, layout):
@@ -2746,7 +2848,7 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 f"{result['reference']:%Y-%m-%d %H:%M}, {result['basis']}. {caveat}{notes}")
 
     # =============================================================================================================
-    # 6. Report
+    # 7. Report
     # =============================================================================================================
 
     def _buildReportPage(self, layout):
@@ -2811,6 +2913,27 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             for segment in snapshot.segments:
                 role = W.SEGMENT_ROLES[segment.role][0] if segment.role else "no role"
                 html.append(f"<li>{segment.name} &ndash; {role}</li>")
+            html.append("</ul>")
+        planning = snapshot.planningResults
+        if planning and not snapshot.planningSkipped:
+            html.append(f"<h4>CBCT territory planning</h4><p>Rule: {planning.get('rule', '')}; liver inside the CBCT "
+                        f"field of view: {100 * (planning.get('liverCoverage') or 0):.0f}%"
+                        + (" (outdated)" if snapshot.planningOutdated else "") + "</p><ul>")
+            for position in planning.get("positions", []):
+                if position.get("territoryML") is None:
+                    html.append(f"<li>{position.get('label')}: not on the arterial tree</li>")
+                    continue
+                tumours = ", ".join(f"{name} {percent:.0f}%" for name, percent in position.get("tumours", []))
+                ras = ", ".join(f"{v:.1f}" for v in position.get("ras", []))
+                html.append(f"<li>{position.get('label')} (RAS {ras}): territory {position['territoryML']:.0f} mL"
+                            + (f"; tumour coverage {tumours}" if tumours else "") + "</li>")
+            for item in planning.get("enhancement", []):
+                html.append(f"<li>Perfused volume from CBCT enhancement ({item.get('image')}, {item.get('percent'):g}%):"
+                            f" {item.get('volumeML', 0):.0f} mL</li>")
+            maa = planning.get("maa")
+            if maa:
+                html.append(f"<li>MAA comparison: Dice {maa['dice']:.2f}, {100 * maa['countsFraction']:.0f}% of the "
+                            "liver counts inside the territories</li>")
             html.append("</ul>")
         issues = W.allIssues(controller.statuses)
         if issues:

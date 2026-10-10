@@ -38,6 +38,16 @@ P_SEGMENT_GEOMETRY = "Segmentation.GeometryCheck"   # JSON {"key": segments key,
 P_DOSIMETRY_RESULT_KEY = "Dosimetry.ResultKey"
 P_DOSIMETRY_FINGERPRINT = "Dosimetry.Fingerprint"
 P_ROLE_TYPE = "RoleType."                            # + role
+P_PLANNING_SKIPPED = "Planning.Skipped"
+P_PLANNING_RESULTS = "Planning.Results"              # JSON of the last territory prediction (+ inputs key)
+P_PLANNING_REVIEWED = "Planning.Reviewed"            # inputs key of the results whose extrahepatic flags were reviewed
+P_PLANNING_SETTINGS = "Planning.Settings"            # JSON: working resolution, thresholds, territory rule
+
+# Node references of the CBCT planning (on the case node, or on the planning module's node without a case)
+REF_PLANNING_INJECTION = "PlanningInjectionPoint"    # markups: injection point (catheter tip during the CBCT)
+REF_PLANNING_TIPS = "PlanningTips"                   # markups: planned catheter tip positions P1, P2, ...
+REF_PLANNING_TREE = "PlanningArterialTree"           # segmentation: arterial tree on the CBCT working grid
+REF_PLANNING_CENTERLINES = "PlanningCenterlines"     # model: centerlines of the arterial tree
 
 # Application settings
 SETTING_TOOLBAR_INITIALIZED = "Taranis/ToolbarInitialized"

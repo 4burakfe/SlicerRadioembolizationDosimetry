@@ -677,6 +677,8 @@ class RadioembolizationDosimetryRelativeWidget(DosimetryWidgetBase):
 
     def addPerfusedVolumeRow(self, *args):
         """Add a perfused volume selector and its activity slider. Rows 2+ get a Remove button."""
+        from TaranisLib.widgets import allowNarrowPanel
+        qt.QTimer.singleShot(0, lambda: allowNarrowPanel(self.parent))   # the new row's selectors too
         isFirst = not self.perfusedRows
         row = {}
 

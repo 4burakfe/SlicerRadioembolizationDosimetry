@@ -59,7 +59,48 @@ def movingFrom(fixedVoxels, fixedMatrix, truth, shape, movingMatrix):
                           fill=-1000.0).astype(np.float32)
 
 
+def bump(points, centre=(-60.0, -10.0, 20.0), amplitude=(8.0, 0.0, -6.0), sigma=45.0):
+    """Smooth local displacement (mm) at world points [n, 3]: a Gaussian bump around the liver."""
+    offset = np.asarray(points, dtype=float) - np.asarray(centre, dtype=float)
+    weight = np.exp(-np.sum(offset ** 2, axis=1) / (2.0 * sigma ** 2))
+    return weight[:, None] * np.asarray(amplitude, dtype=float)[None, :]
+
+
+def warpedMoving(fixedVoxels, fixedMatrix, shape, movingMatrix):
+    """Moving image whose native point p shows the fixed image at world p + bump(p) (a local deformation)."""
+    from scipy import ndimage
+    k, j, i = np.mgrid[0:shape[0], 0:shape[1], 0:shape[2]].astype(float)
+    native = (movingMatrix @ np.vstack([i.ravel(), j.ravel(), k.ravel(), np.ones(i.size)]))[:3].T
+    world = native + bump(native)
+    ijk = np.linalg.solve(fixedMatrix, np.c_[world, np.ones(len(world))].T)[:3]
+    values = ndimage.map_coordinates(fixedVoxels, ijk[::-1], order=1, cval=-1000.0)
+    return values.reshape(shape).astype(np.float32)
+
+
 class GeometryTest(unittest.TestCase):
+
+    def test_deformable_passes_and_shrink(self):
+        self.assertEqual(S.deformablePasses(50.0, 3), [200.0, 100.0, 50.0])
+        self.assertEqual(S.deformablePasses(30.0, 1), [30.0])
+        self.assertEqual(len(S.deformablePasses(30.0, 10)), S.MAX_DEFORMABLE_PASSES)
+        self.assertEqual(S.deformableShrink(200.0, 2.0, (100, 100, 100)), 4)   # 8 mm images for a 200 mm grid
+        self.assertEqual(S.deformableShrink(30.0, 2.0, (100, 100, 100)), 2)    # 3.75 mm -> 4 mm
+        self.assertEqual(S.deformableShrink(200.0, 1.0, (20, 100, 100)), 2)    # at least 8 voxels along each axis
+        shape, matrix = S.fieldGrid((400, 512, 512), grid((0.7, 0.7, 1.0), (0, 0, 0)), maxVoxels=1_000_000)
+        self.assertLessEqual(int(np.prod(shape)), 1_000_000)
+
+    def test_deformable_region(self):
+        voxels = np.full((20, 30, 40), -1000.0, dtype=np.float32)
+        voxels[5:15, 10:20, 8:30] = 40.0      # body
+        voxels[0, 0, 0] = 500.0               # a stray voxel in the air
+        working = S.Working(voxels, grid((2.0, 2.0, 2.0), (-10.0, 0.0, 5.0)))
+        region = S.deformableRegion(working)
+        self.assertEqual(region.shape, (10, 10, 22))
+        np.testing.assert_allclose(region.ijkToWorld[:3, 3], (-10.0 + 16.0, 20.0, 5.0 + 10.0))
+        mask = np.zeros(voxels.shape, dtype=bool)
+        mask[2:4, 3:6, 4:9] = True
+        self.assertEqual(S.deformableRegion(working, mask).shape, (2, 3, 5))
+        self.assertIs(S.deformableRegion(working, np.zeros(voxels.shape, dtype=bool)), working)
 
     def test_block_mean_keeps_positions(self):
         array = np.zeros((8, 8, 8), dtype=np.float32)
@@ -249,6 +290,45 @@ class RegistrationTest(unittest.TestCase):
         truth = S.translationMatrix((10.0, 0.0, 0.0))
         with self.assertRaises(S.RegistrationCancelled):
             S.register(self.fixed, self._moving(truth), finalSpacingMm=4.0, isCancelled=lambda: True)
+
+    def test_displacement_field_of_translation(self):
+        import SimpleITK as sitk
+        transform = sitk.TranslationTransform(3, (2.0, -3.0, 4.0))     # LPS: fixed point x -> moving x + t
+        shape, matrix = (5, 6, 7), grid((4.0, 4.0, 4.0), (-10.0, 20.0, 5.0))
+        displacement, jacobian = S.displacementField(transform, shape, matrix)
+        self.assertEqual(displacement.shape, shape + (3,))
+        np.testing.assert_allclose(displacement[2, 3, 4], (-2.0, 3.0, 4.0), atol=1e-9)   # RAS
+        self.assertAlmostEqual(jacobian, 1.0, places=6)
+
+    def test_deformable_recovers_local_deformation(self):
+        # textured tissue (as in a real CT) and a liver mask, as with an ROI around the liver
+        from scipy import ndimage
+        rng = np.random.default_rng(3)
+        texture = ndimage.gaussian_filter(rng.normal(0.0, 1.0, self.fixedVoxels.shape), 1.5)
+        textured = np.where(self.fixedVoxels > -500, self.fixedVoxels + 60.0 * texture / texture.std(),
+                            self.fixedVoxels).astype(np.float32)
+        mask = ndimage.binary_dilation(self.fixedVoxels == 110.0, iterations=4)
+        movingMatrix = grid((3.0, 3.5, 4.5), (-180.0, -140.0, -100.0))
+        voxels = warpedMoving(textured, self.fixedMatrix, (50, 70, 90), movingMatrix)
+        moving = S.ImageInput(voxels, movingMatrix, S.KIND_CT)
+        result = S.register(S.ImageInput(textured, self.fixedMatrix, S.KIND_CT), moving, finalSpacingMm=4.0,
+                            fixedMask=(mask, self.fixedMatrix), quality="Fast", deformable=True, gridSpacingMm=50.0,
+                            passes=2)
+        self.assertIsNotNone(result["displacement"], result["notes"])
+        self.assertGreater(result["minimumJacobian"], 0.0)
+        self.assertEqual([grid for grid, _, _, _ in result["deformablePasses"]], [100.0, 50.0])
+        self.assertLess(result["finalMetric"], result["initialMetric"])
+        # expected moving point of world x: y with y + bump(y) = x (fixed-point iteration)
+        field, fieldMatrix = result["displacement"], result["fieldIjkToWorld"]
+        points = np.array([[-60.0, -10.0, 20.0], [-90.0, -20.0, 0.0], [-30.0, 0.0, 40.0]])
+        expected = points.copy()
+        for _ in range(20):
+            expected = points - bump(expected)
+        ijk = np.linalg.solve(fieldMatrix, np.c_[points, np.ones(len(points))].T)[:3]
+        found = points + np.stack([ndimage.map_coordinates(field[..., c], ijk[::-1], order=1) for c in range(3)], 1)
+        errors = np.linalg.norm(found - expected, axis=1)
+        before = np.linalg.norm(points - expected, axis=1)
+        self.assertTrue(np.all(errors < 0.5 * before), f"errors {errors} mm, without deformation {before} mm")
 
     def test_deterministic(self):
         truth = S.translationMatrix((7.0, -5.0, 9.0)) @ rotation("z", 3.0)

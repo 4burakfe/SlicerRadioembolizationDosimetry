@@ -15,7 +15,7 @@ from EasyRegLib import functional as F
 from EasyRegLib import sitkreg as SR
 
 
-MODULE_VERSION = "2.1"
+MODULE_VERSION = "2.2"
 
 # (name, BRAINSFit transformType chain, result is linear, description)
 # Each chain starts with the simpler stages, so the later stages start from a good alignment.
@@ -24,9 +24,14 @@ METHODS = [
      "Rotation and translation only. Recommended default: the images are not distorted."),
     ("Affine", "Rigid,Affine", True,
      "Rigid, then affine (adds scaling and shearing). Compensates small size/scale differences."),
+    ("Deformable", "Rigid,Deformable", False,
+     "Rigid first, then deformable (B-spline) passes to fine-tune: a coarse-to-fine grid of control points, each "
+     "pass kept only if it improves the match. Compensates breathing and organ shape differences. "
+     "Multi-resolution engine only; use an ROI around the liver. The transform stays live (hardening resamples)."),
 ]
-# Deformable (B-spline) registration was removed: unacceptably slow and >10 GB of memory even at 0.2 % sampling.
-# Deformable transforms of older scenes are still recognised (NON_RIGID_METHODS) and can be undone.
+# The BRAINSFit B-spline registration was removed (unacceptably slow, >10 GB of memory even at 0.2 % sampling).
+# "Deformable" is the multi-resolution engine's iterative B-spline stage (sitkreg), stored as a grid transform.
+DEFORMABLE_METHOD = "Deformable"
 METHOD_BY_NAME = {name: (chain, linear, text) for name, chain, linear, text in METHODS}
 
 # Functional-only path (a SPECT/PET without its own CT registered directly to the reference CT/MRI)
@@ -77,6 +82,8 @@ DEFAULT_ENGINE = ENGINE_MULTIRES
 ENGINE_ATTRIBUTE = "EasyReg.Engine"                   # engine that made a registration transform
 FINAL_SPACING_ATTRIBUTE = "EasyReg.FinalSpacingMm"    # final resolution of a multi-resolution registration
 METRIC_ATTRIBUTE = "EasyReg.Metric"                   # "initial final" mutual information (multi-resolution)
+GRID_SPACING_ATTRIBUTE = "EasyReg.GridSpacingMm"      # control-point spacing of the last deformable pass
+JACOBIAN_ATTRIBUTE = "EasyReg.MinimumJacobian"        # folding check of a deformable registration (> 0: no folding)
 PROGRESS_INTERVAL_S = 0.1                              # the window is refreshed at most this often while registering
 
 
@@ -132,7 +139,9 @@ INFO_TEXT = (
     "2. Optional: create an ROI around the liver in each image. Only temporary copies are "
     "cropped for the registration; your images are never modified.\n"
     "3. Choose the engine, the method, the quality and (multi-resolution engine) the final resolution, then press "
-    "Register. The multi-resolution engine (default) registers coarse to fine, from about 16 mm down to the final "
+    "Register. Deformable (multi-resolution engine) adds iterative B-spline passes after the rigid stage, from a "
+    "coarse to the chosen control-point grid; use it with an ROI around the liver. The multi-resolution engine "
+    "(default) registers coarse to fine, from about 16 mm down to the final "
     "resolution (2 mm recommended for SPECT/CT; 1 mm for CBCT or small ROIs), and keeps the result only if it "
     "improves the match. For scans of different length choose the start position 'Search head-feet position'. "
     "The Classic (BRAINSFit) engine is kept for comparison. If the CT already has a transform (a previous rigid "
@@ -144,6 +153,8 @@ INFO_TEXT = (
     "5. If the alignment is acceptable, press Harden transform, then Next to continue the Taranis workflow "
     "(Registration overview: back to the list of registrations of the case). Otherwise press Undo and change the "
     "ROIs or method, or fine-tune manually.\n"
+    "By hand (before or after registering): 'Show move / rotate handles' or the Transforms module sliders move the "
+    "moving image; the SPECT and the segmentation follow it.\n"
     "This module is NOT a medical device. Research use only.\n"
     "Developed by: Burak Demir, MD, FEBNM\n"
     "For support and feedback: 4burakfe@gmail.com\n"
@@ -290,6 +301,19 @@ def nodesUnderTransform(transformNode):
             if node.GetTransformNodeID() == transformID and not isOverlayVolume(node)]
 
 
+def foreignTransform(volumeNode, reference):
+    """The transform that must be hardened before EasyReg can use the volume, or None: any non-EasyReg transform
+    on the reference, and a non-EasyReg deformable or nested transform on the moving image (a plain linear one is
+    taken over and restored by Undo). Example: the 'Acquisition transform' Slicer adds when it loads a series with
+    tilted or unevenly spaced slices (DICOM acquisition geometry regularization)."""
+    transformNode = volumeNode.GetParentTransformNode() if volumeNode is not None else None
+    if transformNode is None or transformNode.GetAttribute(TRANSFORM_ATTRIBUTE) == "1":
+        return None
+    if reference or not transformNode.IsLinear() or transformNode.GetParentTransformNode() is not None:
+        return transformNode
+    return None
+
+
 def hasPendingRegistration(volumeNode):
     """True if the volume is under a live (not yet hardened) EasyReg transform."""
     transformNode = volumeNode.GetParentTransformNode() if volumeNode is not None else None
@@ -377,6 +401,42 @@ def registerFusionLayout(*args):
             layoutNode.AddLayoutDescription(layoutID, xml)
 
 
+
+def allowNarrowPanel(root):
+    """Long volume / segment names must not widen the module panel: combo boxes size themselves from a few
+    characters instead of their longest item (long items are elided). Same as TaranisLib.widgets."""
+    if root is None:
+        return
+    for combo in root.findChildren("QComboBox"):
+        try:
+            combo.setSizeAdjustPolicy(qt.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(8)
+            policy = combo.sizePolicy
+            policy.setHorizontalPolicy(qt.QSizePolicy.Expanding)
+            combo.setSizePolicy(policy)
+            # Qt caches the minimum size hint from the longest item; an explicit minimum width replaces it
+            if combo.minimumWidth == 0:
+                combo.setMinimumWidth(60)
+            # node selectors (ctkComboBox) keep asking for their current item's full width whatever the policy;
+            # containers that may not shrink below their preferred width (collapsible sections) would pass that on
+            parent = combo.parentWidget()
+            while parent is not None:
+                policy = parent.sizePolicy
+                if policy.horizontalPolicy() == qt.QSizePolicy.Minimum:
+                    policy.setHorizontalPolicy(qt.QSizePolicy.Preferred)
+                    parent.setSizePolicy(policy)
+                if parent is root:
+                    break
+                parent = parent.parentWidget()
+        except Exception:
+            pass
+    # wrapped messages that quote a name follow the panel's width instead of setting it (a long name has no spaces)
+    for label in root.findChildren("QLabel"):
+        if label.wordWrap:
+            policy = label.sizePolicy
+            policy.setHorizontalPolicy(qt.QSizePolicy.Ignored)
+            label.setSizePolicy(policy)
+
 class SliceViewSynchronizer:
     """Keeps slice position, orientation, pan and zoom identical within groups of slice views (one group per
     row of the fusion layout). Slicer's own view linking is not used because it also synchronises the displayed
@@ -451,6 +511,30 @@ def numpyToMatrix(array):
         for c in range(4):
             matrix.SetElement(r, c, float(array[r][c]))
     return matrix
+
+
+def setDisplacementField(transformNode, displacement, ijkToWorld):
+    """Displacement field [k, j, i, 3] (world RAS mm; moving-image point = world point + displacement) on a grid
+    placed by ijkToWorld, as the transform from parent of a grid transform node."""
+    from vtk.util import numpy_support
+    matrix = np.asarray(ijkToWorld, dtype=float)
+    spacing = np.linalg.norm(matrix[:3, :3], axis=0)
+    direction = np.eye(4)
+    direction[:3, :3] = matrix[:3, :3] / spacing[None, :]
+    nk, nj, ni = displacement.shape[:3]
+    grid = vtk.vtkImageData()
+    grid.SetOrigin(*matrix[:3, 3])
+    grid.SetSpacing(*spacing)
+    grid.SetExtent(0, ni - 1, 0, nj - 1, 0, nk - 1)
+    vectors = numpy_support.numpy_to_vtk(np.ascontiguousarray(displacement, dtype=np.float64).reshape(-1, 3),
+                                         deep=True, array_type=vtk.VTK_DOUBLE)
+    vectors.SetNumberOfComponents(3)
+    grid.GetPointData().SetScalars(vectors)
+    gridTransform = slicer.vtkOrientedGridTransform()
+    gridTransform.SetDisplacementGridData(grid)
+    gridTransform.SetGridDirectionMatrix(numpyToMatrix(direction))
+    gridTransform.SetInterpolationModeToCubic()
+    transformNode.SetAndObserveTransformFromParent(gridTransform)
 
 
 def transformToWorld(node):
@@ -755,6 +839,35 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.methodButtons["Rigid"].setChecked(True)
         registerLayout.addRow("Method: ", methodColumn)
 
+        self.gridSpacingComboBox = qt.QComboBox()
+        for label, spacing in SR.GRID_SPACING_CHOICES:
+            self.gridSpacingComboBox.addItem(label, f"{spacing:g}")
+        self.gridSpacingComboBox.setCurrentIndex(self.gridSpacingComboBox.findData(f"{SR.DEFAULT_GRID_SPACING_MM:g}"))
+        self.gridSpacingComboBox.setToolTip(
+            "Distance between the control points of the last deformable pass. A coarser grid is stiffer (whole-organ "
+            "differences only); a finer grid follows local differences but can distort the image. The run time grows "
+            "with the number of control points: a finer grid takes longer, an ROI around the liver keeps it short.")
+        self.gridSpacingLabel = qt.QLabel("Deformation grid: ")
+        registerLayout.addRow(self.gridSpacingLabel, self.gridSpacingComboBox)
+        self.passesSpinBox = qt.QSpinBox()
+        self.passesSpinBox.setRange(1, SR.MAX_DEFORMABLE_PASSES)
+        self.passesSpinBox.value = SR.DEFAULT_DEFORMABLE_PASSES
+        self.passesSpinBox.setToolTip(
+            "Number of deformable passes. The control-point spacing halves from pass to pass and ends at the grid "
+            "above (3 passes with 50 mm: 200, 100, 50 mm). Each pass starts from the previous result and is kept only "
+            "if it improves the match.")
+        self.passesLabel = qt.QLabel("Deformable passes: ")
+        registerLayout.addRow(self.passesLabel, self.passesSpinBox)
+        self.iterationsSpinBox = qt.QSpinBox()
+        self.iterationsSpinBox.setRange(SR.MIN_DEFORMABLE_ITERATIONS, SR.MAX_DEFORMABLE_ITERATIONS)
+        self.iterationsSpinBox.setSingleStep(5)
+        self.iterationsSpinBox.value = SR.DEFORMABLE_ITERATIONS
+        self.iterationsSpinBox.setToolTip(
+            "Most optimiser iterations of each deformable pass (a pass stops earlier when the match no longer "
+            "improves). Fewer iterations are faster; the rigid stage before has already done the large alignment.")
+        self.iterationsLabel = qt.QLabel("Iterations per pass: ")
+        registerLayout.addRow(self.iterationsLabel, self.iterationsSpinBox)
+
         self.qualityComboBox = qt.QComboBox()
         for label, _ in QUALITY_PRESETS:
             self.qualityComboBox.addItem(label, label)
@@ -788,6 +901,17 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             "Affine results are never hardened automatically.")
         registerLayout.addRow("", self.hardenRigidCheckBox)
 
+        hybridManualBox = qt.QGroupBox("By hand (optional, before or after registering)")
+        hybridManualLayout = qt.QHBoxLayout(hybridManualBox)
+        self.hybridHandlesButton = qt.QPushButton("Show move / rotate handles")
+        self.hybridHandlesButton.checkable = True
+        self.hybridHandlesButton.setToolTip("Interaction handles on the CT of the SPECT/CT in the slice and 3D views; "
+                                            "the SPECT and the segmentation follow it.")
+        self.hybridTransformsModuleButton = qt.QPushButton("Transforms module")
+        self.hybridTransformsModuleButton.setToolTip("Translation and rotation sliders for fine adjustment.")
+        hybridManualLayout.addWidget(self.hybridHandlesButton)
+        hybridManualLayout.addWidget(self.hybridTransformsModuleButton)
+        registerLayout.addRow(hybridManualBox)
 
         buttonRow = qt.QHBoxLayout()
         self.registerButton = qt.QPushButton("Register")
@@ -977,6 +1101,9 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.showReferenceButton.connect("clicked()", self.showReference)
         self.methodGroup.connect("buttonClicked(QAbstractButton*)", self.updateParameterNodeFromGUI)
         self.qualityComboBox.connect("currentIndexChanged(int)", self.updateParameterNodeFromGUI)
+        self.gridSpacingComboBox.connect("currentIndexChanged(int)", self.updateParameterNodeFromGUI)
+        self.passesSpinBox.connect("valueChanged(int)", self.updateParameterNodeFromGUI)
+        self.iterationsSpinBox.connect("valueChanged(int)", self.updateParameterNodeFromGUI)
         self.finalSpacingComboBox.connect("currentIndexChanged(int)", self.updateParameterNodeFromGUI)
         self.refineFinalSpacingComboBox.connect("currentIndexChanged(int)", self.updateParameterNodeFromGUI)
         self.refineQualityComboBox.connect("currentIndexChanged(int)", self.updateParameterNodeFromGUI)
@@ -995,8 +1122,10 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.landmarkButton.connect("clicked()", self.onAlignLandmarks)
         self.centreButton.connect("clicked()", self.onCentreOnReference)
         self.resetPositionButton.connect("clicked()", self.onResetPosition)
-        self.handlesButton.connect("toggled(bool)", self.onHandlesToggled)
-        self.transformsModuleButton.connect("clicked()", self.onTransformsModule)
+        for button in (self.handlesButton, self.hybridHandlesButton):
+            button.connect("toggled(bool)", lambda checked, button=button: self.onHandlesToggled(checked, button))
+        for button in (self.transformsModuleButton, self.hybridTransformsModuleButton):
+            button.connect("clicked()", self.onTransformsModule)
         self.refineButton.connect("clicked()", self.onRefine)
         self.refineCancelButton.connect("clicked()", self.onCancelButton)
         self.cancelButton.connect("clicked()", self.onCancelButton)
@@ -1070,6 +1199,17 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             pass   # not greyed out; BRAINSFit replaces the search by 'Align centres' anyway
         if not multires and self.initializationComboBox.currentData == INIT_SEARCH_MODE:
             self.initializationComboBox.setCurrentIndex(self.initializationComboBox.findData("useGeometryAlign"))
+        # deformable: multi-resolution engine only (the BRAINSFit B-spline needed far too much memory)
+        deformableButton = self.methodButtons[DEFORMABLE_METHOD]
+        deformableButton.enabled = multires
+        deformableButton.setToolTip(METHOD_BY_NAME[DEFORMABLE_METHOD][2] if multires else
+                                    "Deformable registration needs the multi-resolution engine.")
+        if not multires and deformableButton.isChecked():
+            self.methodButtons["Rigid"].setChecked(True)
+        deformable = multires and deformableButton.isChecked()
+        for widget in (self.gridSpacingLabel, self.gridSpacingComboBox, self.passesLabel, self.passesSpinBox,
+                       self.iterationsLabel, self.iterationsSpinBox):
+            widget.visible = deformable
 
     def _makeNodeSelector(self, nodeType, toolTip, allowNone=False, allowCreate=False):
         selector = slicer.qMRMLNodeComboBox()
@@ -1131,6 +1271,7 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._hideHandles()
 
     def enter(self):
+        allowNarrowPanel(self.parent)   # long names must not widen the panel
         self.initializeParameterNode()
         # show the images in EasyReg's own layout right away (after the inputs are restored or filled in)
         qt.QTimer.singleShot(0, self._showLayoutOnEnter)
@@ -1200,6 +1341,11 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self._setComboData(self.finalSpacingComboBox, p.GetParameter("FinalSpacing"))
             self._setComboData(self.refineFinalSpacingComboBox, p.GetParameter("RefineFinalSpacing"))
             self._setComboData(self.refineQualityComboBox, p.GetParameter("RefineQuality"))
+            self._setComboData(self.gridSpacingComboBox, p.GetParameter("GridSpacing"))
+            if p.GetParameter("DeformablePasses"):
+                self.passesSpinBox.value = int(p.GetParameter("DeformablePasses"))
+            if p.GetParameter("DeformableIterations"):
+                self.iterationsSpinBox.value = int(p.GetParameter("DeformableIterations"))
             self._refreshEngineWidgets()
             self.hardenRigidCheckBox.setChecked(p.GetParameter("HardenRigid") == "true")
         finally:
@@ -1222,6 +1368,9 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             p.SetParameter("FinalSpacing", self.finalSpacingComboBox.currentData)
             p.SetParameter("RefineFinalSpacing", self.refineFinalSpacingComboBox.currentData)
             p.SetParameter("RefineQuality", self.refineQualityComboBox.currentData)
+            p.SetParameter("GridSpacing", self.gridSpacingComboBox.currentData)
+            p.SetParameter("DeformablePasses", str(self.passesSpinBox.value))
+            p.SetParameter("DeformableIterations", str(self.iterationsSpinBox.value))
             p.SetParameter("HardenRigid", "true" if self.hardenRigidCheckBox.checked else "false")
             p.SetParameter("Path", self.currentPath())
             p.SetParameter("LiverSegmentID", self.liverSegmentComboBox.currentData or "")
@@ -1363,6 +1512,25 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         _, moving = self.landmarkNodes()
         return [moving] if moving is not None else []
 
+    def _offerHardening(self, moving, reference):
+        """If the reference (or the moving image) is under a transform EasyReg cannot work with, e.g. the
+        acquisition transform Slicer adds to a series with tilted slices, offer to harden it. Returns False when
+        the user declines (the action is then not run)."""
+        volumes = [(volume, isReference) for volume, isReference in ((reference, True), (moving, False))
+                   if foreignTransform(volume, isReference) is not None]
+        if not volumes:
+            return True
+        lines = "\n".join(f"'{volume.GetName()}' is under '{foreignTransform(volume, isReference).GetName()}'."
+                           for volume, isReference in volumes)
+        if not slicer.util.confirmYesNoDisplay(
+                f"{lines}\n\nSlicer adds such a transform when it loads a series with tilted or unevenly spaced "
+                "slices (acquisition geometry regularization). EasyReg needs it applied to the image first.\n\n"
+                "Harden it into the image now?", windowTitle="EasyReg"):
+            return False
+        with slicer.util.WaitCursor():
+            self.logic.hardenForeignTransforms(volumes)
+        return True
+
     def _checkFunctionalInputs(self):
         spect, reference = self.spectSelector.currentNode(), self.referenceSelector.currentNode()
         if spect is None or reference is None:
@@ -1370,6 +1538,8 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             return None, None
         if spect is reference:
             slicer.util.errorDisplay("The SPECT/PET and the reference must be different images.")
+            return None, None
+        if not self._offerHardening(spect, reference):
             return None, None
         return spect, reference
 
@@ -1412,23 +1582,40 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                                          + ("Check that the pairs match." if rms > 10 else ""))
         self._afterAlignment(transform, f"Aligned with {len(residuals)} landmark pairs (RMS {rms:.1f} mm).")
 
-    def onHandlesToggled(self, checked):
-        spect, reference = self.spectSelector.currentNode(), self.referenceSelector.currentNode()
-        if checked and (spect is None or reference is None):
-            self.handlesButton.checked = False
-            slicer.util.errorDisplay("Select the SPECT/PET and the reference image.")
+    def _manualInputs(self):
+        """(moving image, reference, followers) of the manual adjustment: the SPECT/PET and its landmarks on the
+        functional-only path, the CT of the SPECT/CT with the SPECT and the segmentation on the hybrid path; None
+        when the images are not selected (an error is shown)."""
+        moving, reference = self.movingVolume(), self.referenceSelector.currentNode()
+        if moving is None or reference is None:
+            slicer.util.errorDisplay("Select the SPECT/PET and the reference image." if self.isFunctional() else
+                                     "Select the CT of the SPECT/CT and the reference image.")
+            return None
+        if moving is reference:
+            slicer.util.errorDisplay("The moving image and the reference must be different images.")
+            return None
+        if not self._offerHardening(moving, reference):
+            return None
+        return moving, reference, self._positionFollowers()
+
+    def onHandlesToggled(self, checked, button=None):
+        button = button or self.handlesButton
+        inputs = self._manualInputs() if checked else None
+        if checked and inputs is None:
+            button.checked = False
             return
         transform = None
         if checked:
+            moving, reference, followers = inputs
             try:
-                transform = self.logic.alignmentTransform(spect, reference, self._functionalFollowers())
+                transform = self.logic.alignmentTransform(moving, reference, followers)
             except ValueError as error:
-                self.handlesButton.checked = False
+                button.checked = False
                 slicer.util.errorDisplay(str(error))
                 return
             method = transform.GetAttribute(METHOD_ATTRIBUTE)
             if not method:
-                self.logic.alignmentTransform(spect, reference, self._functionalFollowers(), method="Manual")
+                self.logic.alignmentTransform(moving, reference, followers, method="Manual")
             elif "manual" not in method.lower():
                 transform.SetAttribute(METHOD_ATTRIBUTE, f"{method} + manual")
             if self._parameterNode is not None:
@@ -1445,7 +1632,19 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 display.SetEditorSliceIntersectionVisibility(checked)
         if checked:
             self.showFusionLayout()
+            self._centreHandles(transform, inputs[1])
         self.updateButtonStates()
+
+    def _centreHandles(self, transform, reference):
+        """Put the move / rotate handles on the centre of the reference image (rotations turn about it) and move
+        every slice view through that point, so the handles show in the axial, coronal and sagittal views."""
+        centre = defaultRoiGeometry(reference)[0]
+        self.logic.centreHandles(transform, centre)
+        layoutManager = slicer.app.layoutManager()
+        for name in layoutManager.sliceViewNames():
+            sliceWidget = layoutManager.sliceWidget(name)
+            if sliceWidget is not None:
+                sliceWidget.mrmlSliceNode().JumpSliceByOffsetting(*centre)
 
     def _hideHandles(self):
         """Turn the move / rotate handles off on every EasyReg transform and uncheck their button (after hardening,
@@ -1460,10 +1659,11 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 display.SetEditorVisibility(False)
             if hasattr(display, "GetEditorSliceIntersectionVisibility") and display.GetEditorSliceIntersectionVisibility():
                 display.SetEditorSliceIntersectionVisibility(False)
-        if self.handlesButton.checked:
-            wasBlocked = self.handlesButton.blockSignals(True)
-            self.handlesButton.checked = False
-            self.handlesButton.blockSignals(wasBlocked)
+        for button in (self.handlesButton, self.hybridHandlesButton):
+            if button.checked:
+                wasBlocked = button.blockSignals(True)
+                button.checked = False
+                button.blockSignals(wasBlocked)
 
     def _showLayoutAfterReset(self):
         """After Undo / Reset: stay in EasyReg's layout, with the images back in their previous position."""
@@ -1473,12 +1673,18 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             logging.warning(f"EasyReg: could not show the registration layout: {e}")
 
     def onTransformsModule(self):
-        spect, reference = self._checkFunctionalInputs()
-        if spect is None:
+        inputs = self._manualInputs()
+        if inputs is None:
             return
-        transform = self.logic.alignmentTransform(spect, reference, self._functionalFollowers())
+        moving, reference, followers = inputs
+        self._hideHandles()
+        try:
+            transform = self.logic.alignmentTransform(moving, reference, followers)
+        except ValueError as error:
+            slicer.util.errorDisplay(str(error))
+            return
         if not transform.GetAttribute(METHOD_ATTRIBUTE):
-            self.logic.alignmentTransform(spect, reference, self._functionalFollowers(), method="Manual")
+            self.logic.alignmentTransform(moving, reference, followers, method="Manual")
         if self._parameterNode is not None:
             self._parameterNode.SetNodeReferenceID("Transform", transform.GetID())
         self.onFineTuneButton()
@@ -1588,6 +1794,8 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if moving is reference:
             slicer.util.errorDisplay("The moving image and the reference must be different images.")
             return
+        if not self._offerHardening(moving, reference):
+            return
         try:
             shift = self.logic.centreOnReference(moving, reference, self._positionFollowers())
         except ValueError as error:
@@ -1644,6 +1852,10 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             "reference first.")
         self.refineCancelButton.enabled = busy and self.isFunctional()
         self.handlesButton.enabled = functionalReady or self.handlesButton.checked
+        hybridReady = (not self.isFunctional() and not busy and spectCT is not None and reference is not None
+                       and spectCT is not reference)
+        self.hybridHandlesButton.enabled = hybridReady or self.hybridHandlesButton.checked
+        self.hybridTransformsModuleButton.enabled = hybridReady
         self._updateLandmarkCounts()
         self.registerButton.enabled = (not busy and spectCT is not None and reference is not None
                                        and spectCT is not reference)
@@ -1738,6 +1950,8 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if spect in (spectCT, reference):
             slicer.util.errorDisplay("The SPECT must be a different image from the CT and the reference.")
             return
+        if not self._offerHardening(spectCT, reference):
+            return
 
         method = self.currentMethod()
         engine = self.currentEngine()
@@ -1766,7 +1980,9 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 hardenRigid=self.hardenRigidCheckBox.checked,
                 onFinished=self.onRegistrationFinished, engine=engine,
                 finalSpacingMm=float(self.finalSpacingComboBox.currentData or SR.DEFAULT_FINAL_SPACING_MM),
-                quality=self.qualityComboBox.currentData, progress=self._onProgress)
+                quality=self.qualityComboBox.currentData, progress=self._onProgress,
+                gridSpacingMm=float(self.gridSpacingComboBox.currentData or SR.DEFAULT_GRID_SPACING_MM),
+                deformablePasses=self.passesSpinBox.value, deformableIterations=self.iterationsSpinBox.value)
         except (ValueError, RuntimeError) as error:
             self._elapsedTimer.stop()
             self._startTime = None
@@ -2063,7 +2279,10 @@ class easy_regLogic(ScriptedLoadableModuleLogic):
         defaults = {"Method": "Rigid", "Path": PATH_HYBRID, "Quality": "Standard", "Initialization": "useGeometryAlign",
                     "HardenRigid": "false", "SplineGridSize": ",".join(str(v) for v in DEFAULT_SPLINE_GRID),
                     "Engine": DEFAULT_ENGINE, "FinalSpacing": f"{SR.DEFAULT_FINAL_SPACING_MM:g}",
-                    "RefineFinalSpacing": f"{SR.DEFAULT_FINAL_SPACING_MM:g}", "RefineQuality": "Thorough"}
+                    "RefineFinalSpacing": f"{SR.DEFAULT_FINAL_SPACING_MM:g}", "RefineQuality": "Thorough",
+                    "GridSpacing": f"{SR.DEFAULT_GRID_SPACING_MM:g}",
+                    "DeformablePasses": str(SR.DEFAULT_DEFORMABLE_PASSES),
+                    "DeformableIterations": str(SR.DEFORMABLE_ITERATIONS)}
         for name, value in defaults.items():
             if not parameterNode.GetParameter(name):
                 parameterNode.SetParameter(name, value)
@@ -2098,14 +2317,18 @@ class easy_regLogic(ScriptedLoadableModuleLogic):
                           initializeMode="useGeometryAlign", fixedRoi=None, movingRoi=None, followers=(),
                           splineGridSize=DEFAULT_SPLINE_GRID, hardenRigid=False, onFinished=None, wait=False,
                           fixedMask=None, preprocessMoving=False, temporaryNodes=None, engine=DEFAULT_ENGINE,
-                          finalSpacingMm=SR.DEFAULT_FINAL_SPACING_MM, quality=None, progress=None):
+                          finalSpacingMm=SR.DEFAULT_FINAL_SPACING_MM, quality=None, progress=None,
+                          gridSpacingMm=SR.DEFAULT_GRID_SPACING_MM, deformablePasses=SR.DEFAULT_DEFORMABLE_PASSES,
+                          deformableIterations=SR.DEFORMABLE_ITERATIONS):
         """Register movingVolume to fixedVolume and apply the result to movingVolume and the followers.
         engine ENGINE_MULTIRES: SimpleITK multi-resolution registration (sitkreg), run inside this call; finalSpacingMm
         is the voxel size of its last level, quality a QUALITY_PRESETS label (default: from samplingPercentage),
         progress(text) is called while it runs. engine ENGINE_BRAINSFIT: BRAINSFit, in the background unless
         wait=True. preprocessMoving: the moving image is functional (SPECT/PET). onFinished(result) receives
         {"status": "completed" | "cancelled" | "failed", "message": str, "transform": node or None}; the same dict is
-        returned when the registration finished inside the call."""
+        returned when the registration finished inside the call. method "Deformable" (multi-resolution engine only):
+        rigid, then deformablePasses B-spline passes (at most deformableIterations iterations each) ending with
+        control points gridSpacingMm apart; the result is a grid transform covering the reference image."""
         if self.job is not None:
             raise RuntimeError("A registration is already running.")
         if engine not in (ENGINE_MULTIRES, ENGINE_BRAINSFIT):
@@ -2117,6 +2340,8 @@ class easy_regLogic(ScriptedLoadableModuleLogic):
         if method not in METHOD_BY_NAME:
             raise ValueError(f"Unknown registration method '{method}'.")
         transformType, linear, _ = METHOD_BY_NAME[method]
+        if not linear and engine != ENGINE_MULTIRES:
+            raise ValueError("Deformable registration needs the multi-resolution engine.")
 
         if fixedVolume.GetParentTransformNode() is not None:
             raise ValueError(f"The reference image '{fixedVolume.GetName()}' is under a transform. "
@@ -2131,7 +2356,8 @@ class easy_regLogic(ScriptedLoadableModuleLogic):
             return self._runMultiresolution(
                 fixedVolume, movingVolume, method, transformType, initializeMode, fixedRoi, movingRoi, followers,
                 hardenRigid, onFinished, fixedMask, preprocessMoving, temporaryNodes, finalSpacingMm,
-                quality or qualityLabelFor(samplingPercentage), progress)
+                quality or qualityLabelFor(samplingPercentage), progress, gridSpacingMm, deformablePasses,
+                deformableIterations)
         if initializeMode == INIT_SEARCH_MODE:
             initializeMode = "useGeometryAlign"   # the search is only offered by the multi-resolution engine
 
@@ -2201,9 +2427,13 @@ class easy_regLogic(ScriptedLoadableModuleLogic):
 
     def _runMultiresolution(self, fixedVolume, movingVolume, method, transformType, initializeMode, fixedRoi,
                             movingRoi, followers, hardenRigid, onFinished, fixedMask, functionalMoving,
-                            temporaryNodes, finalSpacingMm, quality, progress):
+                            temporaryNodes, finalSpacingMm, quality, progress, gridSpacingMm=SR.DEFAULT_GRID_SPACING_MM,
+                            deformablePasses=SR.DEFAULT_DEFORMABLE_PASSES,
+                            deformableIterations=SR.DEFORMABLE_ITERATIONS):
         """SimpleITK multi-resolution registration (EasyRegLib.sitkreg), inside this call. The images are read in
-        their own (native) coordinates; the moving image's current transform is the starting position."""
+        their own (native) coordinates; the moving image's current transform is the starting position. A
+        deformable method adds sitkreg's iterative B-spline passes; their displacement field covers the whole
+        reference image (outside the ROI it is the linear result)."""
         initialTransform = movingVolume.GetParentTransformNode()
         self.job = {"method": method, "linear": True, "moving": movingVolume, "followers": list(followers),
                     "transform": None, "initialTransform": initialTransform,
@@ -2232,10 +2462,18 @@ class easy_regLogic(ScriptedLoadableModuleLogic):
                 # as with BRAINSFit, an existing transform is the start; a search is made around it
                 initialization = SR.INIT_SEARCH_CURRENT if initialization == SR.INIT_SEARCH else SR.INIT_CURRENT
             kind = SR.AFFINE if "Affine" in transformType else SR.RIGID
+            deformable = "Deformable" in transformType
+            fieldGeometry = None
+            if deformable:
+                fieldGeometry = (slicer.util.arrayFromVolume(fixedVolume).shape, self.nativeIjkToRas(fixedVolume))
             logging.info(f"EasyReg: starting {method} multi-resolution registration, final resolution "
-                         f"{finalSpacingMm:g} mm, quality {quality}, start {initialization}")
+                         f"{finalSpacingMm:g} mm, quality {quality}, start {initialization}"
+                         + (f", {deformablePasses} deformable passes to {gridSpacingMm:g} mm, at most "
+                            f"{deformableIterations} iterations each" if deformable else ""))
             result = SR.register(images[0], images[1], initialMatrix, kind, finalSpacingMm, quality, mask,
-                                 initialization, progress=progress, isCancelled=lambda: job["cancelRequested"])
+                                 initialization, progress=progress, isCancelled=lambda: job["cancelRequested"],
+                                 deformable=deformable, gridSpacingMm=gridSpacingMm, passes=deformablePasses,
+                                 fieldGeometry=fieldGeometry, deformableIterations=deformableIterations)
         except SR.RegistrationCancelled:
             return self._finishMultiresolution("cancelled")
         except Exception as error:
@@ -2252,16 +2490,30 @@ class easy_regLogic(ScriptedLoadableModuleLogic):
         transform = None
         if state == "completed":
             moving = job["moving"]
+            method = job["method"]
+            displacement = result.get("displacement")
+            if METHOD_BY_NAME[method][1] is False and displacement is None:
+                method = "Rigid"    # no deformable pass improved the match: the result is the rigid stage
+                job["method"] = method
+            job["linear"] = displacement is None
             transform = slicer.mrmlScene.AddNewNodeByClass(
-                "vtkMRMLLinearTransformNode", f"EasyReg {job['method']}: {moving.GetName()} to {job['fixedName']}")
+                "vtkMRMLLinearTransformNode" if displacement is None else "vtkMRMLGridTransformNode",
+                f"EasyReg {method}: {moving.GetName()} to {job['fixedName']}")
             transform.SetAttribute(TRANSFORM_ATTRIBUTE, "1")
-            transform.SetAttribute(METHOD_ATTRIBUTE, job["method"])
+            transform.SetAttribute(METHOD_ATTRIBUTE, method)
             transform.SetAttribute(ENGINE_ATTRIBUTE, ENGINE_MULTIRES)
             transform.SetAttribute(FINAL_SPACING_ATTRIBUTE, f"{result['spacing']:g}")
             transform.SetAttribute(METRIC_ATTRIBUTE, f"{result['initialMetric']:.6g} {result['finalMetric']:.6g}")
             if job["initialTransform"] is not None:
                 transform.SetAttribute(PREVIOUS_TRANSFORM_ATTRIBUTE, job["initialTransform"].GetID())
-            self.setTransformMatrix(transform, result["matrix"])
+            if displacement is None:
+                self.setTransformMatrix(transform, result["matrix"])
+            else:
+                setDisplacementField(transform, displacement, result["fieldIjkToWorld"])
+                kept = [grid for grid, _, _, ok in result.get("deformablePasses", []) if ok]
+                if kept:
+                    transform.SetAttribute(GRID_SPACING_ATTRIBUTE, f"{kept[-1]:g}")
+                transform.SetAttribute(JACOBIAN_ATTRIBUTE, f"{result.get('minimumJacobian', float('nan')):.3g}")
             job["transform"] = transform
             levels = ", ".join(f"{level:g}" for level in result["levels"])
             summary = (f"Levels {levels} mm; mutual information {result['initialMetric']:.4f} \u2192 "
@@ -2346,6 +2598,20 @@ class easy_regLogic(ScriptedLoadableModuleLogic):
                                    ",".join(node.GetID() for node in nodes) if rigid else "")
         return nodes
 
+    def hardenForeignTransforms(self, volumes):
+        """Harden the foreign transform (see foreignTransform) of each (volume, isReference) pair into the volume;
+        a transform no node uses any more is removed. Returns the names of the hardened volumes."""
+        hardened = []
+        for volume, reference in volumes:
+            transformNode = foreignTransform(volume, reference)
+            if transformNode is None:
+                continue
+            slicer.vtkSlicerTransformLogic().hardenTransform(volume)
+            hardened.append(volume.GetName())
+            if transformNode.GetScene() is not None and not nodesUnderTransform(transformNode):
+                slicer.mrmlScene.RemoveNode(transformNode)
+        return hardened
+
     def undoRegistration(self, transformNode):
         """Return the images to their position before the registration and remove the transform.
         Returns the names of the images that were moved back."""
@@ -2425,6 +2691,15 @@ class easy_regLogic(ScriptedLoadableModuleLogic):
             transform.SetAttribute(METHOD_ATTRIBUTE, method)
             transform.SetAttribute(REGISTERED_NODES_ATTRIBUTE, ",".join(node.GetID() for node in nodes))
         return transform
+
+    def centreHandles(self, transformNode, worldCentre):
+        """Place the interaction handles of transformNode at worldCentre. Slicer draws them at the transform's centre
+        of transformation (in the transform's own coordinates, so they move with the image), which is the origin
+        by default and then far from the images."""
+        if not hasattr(transformNode, "SetCenterOfTransformation"):
+            return   # Slicer before 5.4: handles at the origin
+        local = np.linalg.inv(self.transformMatrix(transformNode)) @ np.append(np.asarray(worldCentre, float), 1.0)
+        transformNode.SetCenterOfTransformation([float(v) for v in local[:3]])
 
     @staticmethod
     def setTransformMatrix(transformNode, matrix):
@@ -2617,6 +2892,12 @@ class easy_regTest(ScriptedLoadableModuleTest):
         self.test_functionalRefinement(engine=ENGINE_BRAINSFIT)
         self.setUp()
         self.test_centreOnReference()
+        self.setUp()
+        self.test_hybridManualAdjustment()
+        self.setUp()
+        self.test_deformableGridTransform()
+        self.setUp()
+        self.test_hardenForeignTransforms()
         self.delayDisplay("EasyReg tests passed")
 
     @staticmethod
@@ -2831,6 +3112,58 @@ class easy_regTest(ScriptedLoadableModuleTest):
         assert moving.GetParentTransformNode() is None and follower.GetParentTransformNode() is None
         assert np.allclose(follower.GetNthControlPointPositionWorld(0), (10.0, 10.0, 1310.0), atol=1e-3)
         self.delayDisplay("Centre on reference and reset OK")
+
+    def test_hybridManualAdjustment(self):
+        """CT to CT: the manual transform moves the CT and its followers (SPECT, segmentation) together."""
+        fixed = self._phantom("reference CT")
+        moving = self._phantom("SPECT-CT CT", origin=(10.0, 0.0, 0.0))
+        spect = self._spectPhantom("SPECT", origin=(10.0, 0.0, 0.0))
+        logic = easy_regLogic()
+        transform = logic.alignmentTransform(moving, fixed, [spect], method="Manual")
+        logic.setTransformMatrix(transform, F.translationMatrix((-10.0, 0.0, 0.0)))
+        assert moving.GetParentTransformNode() is transform and spect.GetParentTransformNode() is transform
+        assert np.allclose(transformToWorld(spect)[:3, 3], transformToWorld(fixed)[:3, 3], atol=1e-6)
+        centre = defaultRoiGeometry(fixed)[0]
+        logic.centreHandles(transform, centre)
+        if hasattr(transform, "GetCenterOfTransformation"):   # the handles sit on the reference centre
+            local = list(transform.GetCenterOfTransformation())
+            assert np.allclose((logic.transformMatrix(transform) @ np.append(local, 1.0))[:3], centre, atol=1e-6)
+        logic.undoRegistration(transform)
+        assert moving.GetParentTransformNode() is None and spect.GetParentTransformNode() is None
+        self.delayDisplay("Manual CT to CT adjustment OK")
+
+    def test_deformableGridTransform(self):
+        """A displacement field from the deformable stage becomes a grid transform with the same mapping."""
+        node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLGridTransformNode")
+        matrix = np.diag([5.0, 5.0, 5.0, 1.0])
+        matrix[:3, 3] = (-20.0, -20.0, -20.0)
+        displacement = np.zeros((9, 9, 9, 3))
+        displacement[..., 0] = 4.0      # every world point maps to the moving-image point 4 mm to the right
+        setDisplacementField(node, displacement, matrix)
+        point = node.GetTransformFromParent().TransformPoint((1.0, 2.0, 3.0))
+        assert np.allclose(point, (5.0, 2.0, 3.0), atol=1e-3), point
+        assert not node.IsLinear()
+        self.delayDisplay("Deformable grid transform OK")
+
+    def test_hardenForeignTransforms(self):
+        """A transform Slicer put on the reference at loading (acquisition transform) is hardened on request; a
+        plain linear transform on the moving image is left for EasyReg to take over."""
+        fixed = self._phantom("reference MRI")
+        moving = self._phantom("SPECT-CT CT", origin=(10.0, 0.0, 0.0))
+        acquisition = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode", "Acquisition transform")
+        acquisition.SetMatrixTransformToParent(slicer.util.vtkMatrixFromArray(F.translationMatrix((0.0, 0.0, 2.0))))
+        fixed.SetAndObserveTransformNodeID(acquisition.GetID())
+        before = ijkToWorld(fixed)
+        shift = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode", "user shift")
+        moving.SetAndObserveTransformNodeID(shift.GetID())
+        assert foreignTransform(fixed, True) is acquisition and foreignTransform(moving, False) is None
+        logic = easy_regLogic()
+        assert logic.hardenForeignTransforms([(fixed, True), (moving, False)]) == [fixed.GetName()]
+        assert fixed.GetParentTransformNode() is None and acquisition.GetScene() is None
+        assert np.allclose(ijkToWorld(fixed), before, atol=1e-6)   # same position, now in the image itself
+        assert moving.GetParentTransformNode() is shift
+        logic.centreOnReference(moving, fixed)   # no longer refused
+        self.delayDisplay("Hardening of a foreign reference transform OK")
 
     def test_functionalRefinement(self, engine=ENGINE_MULTIRES):
         if engine == ENGINE_MULTIRES and not SR.sitkAvailable():

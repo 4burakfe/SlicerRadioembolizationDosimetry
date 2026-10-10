@@ -2085,6 +2085,8 @@ class DosimetryWidgetBase(ScriptedLoadableModuleWidget):
 
     def enter(self):
         """Opening the module shows the results layout (single or dual monitor)."""
+        from .widgets import allowNarrowPanel
+        allowNarrowPanel(self.parent)   # long names must not widen the panel
         self._entered = True
         self._writeActiveModuleFlag(True)
         self._applyLayout()

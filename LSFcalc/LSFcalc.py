@@ -496,6 +496,42 @@ def lookFromAnterior(viewNode):
 # Module
 # ---------------------------------------------------------------------------------------------------
 
+
+def allowNarrowPanel(root):
+    """Long volume / segment names must not widen the module panel: combo boxes size themselves from a few
+    characters instead of their longest item (long items are elided). Same as TaranisLib.widgets."""
+    if root is None:
+        return
+    for combo in root.findChildren("QComboBox"):
+        try:
+            combo.setSizeAdjustPolicy(qt.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(8)
+            policy = combo.sizePolicy
+            policy.setHorizontalPolicy(qt.QSizePolicy.Expanding)
+            combo.setSizePolicy(policy)
+            # Qt caches the minimum size hint from the longest item; an explicit minimum width replaces it
+            if combo.minimumWidth == 0:
+                combo.setMinimumWidth(60)
+            # node selectors (ctkComboBox) keep asking for their current item's full width whatever the policy;
+            # containers that may not shrink below their preferred width (collapsible sections) would pass that on
+            parent = combo.parentWidget()
+            while parent is not None:
+                policy = parent.sizePolicy
+                if policy.horizontalPolicy() == qt.QSizePolicy.Minimum:
+                    policy.setHorizontalPolicy(qt.QSizePolicy.Preferred)
+                    parent.setSizePolicy(policy)
+                if parent is root:
+                    break
+                parent = parent.parentWidget()
+        except Exception:
+            pass
+    # wrapped messages that quote a name follow the panel's width instead of setting it (a long name has no spaces)
+    for label in root.findChildren("QLabel"):
+        if label.wordWrap:
+            policy = label.sizePolicy
+            policy.setHorizontalPolicy(qt.QSizePolicy.Ignored)
+            label.setSizePolicy(policy)
+
 class LSFcalc(ScriptedLoadableModule):
     def __init__(self, parent):
         ScriptedLoadableModule.__init__(self, parent)
@@ -848,6 +884,7 @@ class LSFcalcWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.removeObservers()
 
     def enter(self):
+        allowNarrowPanel(self.parent)   # long names must not widen the panel
         self.initializeParameterNode()
 
     def onSceneStartClose(self, caller, event):

@@ -22,6 +22,7 @@ include(${Slicer_USE_FILE})
 add_subdirectory(Taranis)
 add_subdirectory(easy_reg)
 add_subdirectory(LSFcalc)
+add_subdirectory(CBCTPlanning)
 add_subdirectory(RadioembolizationDosimetryAbsolute)
 add_subdirectory(RadioembolizationDosimetryRelative)
 ## NEXT_MODULE

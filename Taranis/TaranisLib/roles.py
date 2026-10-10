@@ -14,9 +14,16 @@ ROLE_DOSIMETRY_ANATOMY = "DosimetryAnatomy"
 ROLE_REFERENCE = "ReferenceImage"
 ROLE_METABOLIC = "MetabolicImage"
 ROLE_METABOLIC_ANATOMY = "MetabolicAnatomy"
+ROLE_CBCT = "CBCTImage"                       # arterial-phase CBCT (catheter angiography), for territory planning
+ROLE_CBCT_PARENCHYMAL = "CBCTParenchymal"     # optional parenchymal / delayed phase or selective CBCT
 ROLE_SEGMENTATION = "Segmentation"
+# Auxiliary volumes: any other images the user keeps with the case (registered like the others, not used by dosimetry)
+AUXILIARY_ROLES = ["AuxiliaryImage1", "AuxiliaryImage2", "AuxiliaryImage3"]
 
-VOLUME_ROLES = [ROLE_DOSIMETRY, ROLE_DOSIMETRY_ANATOMY, ROLE_REFERENCE, ROLE_METABOLIC, ROLE_METABOLIC_ANATOMY]
+VOLUME_ROLES = [ROLE_DOSIMETRY, ROLE_DOSIMETRY_ANATOMY, ROLE_REFERENCE, ROLE_METABOLIC, ROLE_METABOLIC_ANATOMY,
+                ROLE_CBCT, ROLE_CBCT_PARENCHYMAL] + AUXILIARY_ROLES
+CBCT_ROLES = [ROLE_CBCT, ROLE_CBCT_PARENCHYMAL]
+NON_DOSIMETRY_ROLES = CBCT_ROLES + AUXILIARY_ROLES   # their changes do not make the dosimetry outdated
 
 # -- Image types -------------------------------------------------------------------------------------------
 
@@ -28,6 +35,8 @@ TYPE_DOTATATE_PET = "DOTATATE_PET"
 TYPE_OTHER_PET = "OTHER_PET"
 TYPE_CT = "CT"
 TYPE_MRI = "MRI"
+TYPE_CBCT = "CBCT"
+TYPE_OTHER = "OTHER"
 
 TYPE_LABELS = {
     TYPE_MAA_SPECT: "Tc-99m MAA SPECT",
@@ -38,6 +47,8 @@ TYPE_LABELS = {
     TYPE_OTHER_PET: "Other PET",
     TYPE_CT: "CT",
     TYPE_MRI: "MRI",
+    TYPE_CBCT: "CBCT",
+    TYPE_OTHER: "Other",
 }
 
 DOSIMETRY_TYPES = [TYPE_MAA_SPECT, TYPE_Y90_SPECT, TYPE_Y90_PET]
@@ -50,7 +61,11 @@ ROLE_TYPES = {
     ROLE_REFERENCE: ANATOMY_TYPES,
     ROLE_METABOLIC: METABOLIC_TYPES,
     ROLE_METABOLIC_ANATOMY: ANATOMY_TYPES,
+    ROLE_CBCT: [TYPE_CBCT],
+    ROLE_CBCT_PARENCHYMAL: [TYPE_CBCT],
 }
+ROLE_TYPES.update({role: DOSIMETRY_TYPES + METABOLIC_TYPES + ANATOMY_TYPES + [TYPE_CBCT, TYPE_OTHER]
+                   for role in AUXILIARY_ROLES})
 
 # role -> (label, requirement text, tooltip)
 ROLE_INFO = {
@@ -71,10 +86,27 @@ ROLE_INFO = {
     ROLE_METABOLIC_ANATOMY: (
         "Its anatomical image", "Optional (recommended with a metabolic image)",
         "The CT (or MRI) of the metabolic PET/CT. Makes registration of the metabolic image robust."),
+    ROLE_CBCT: (
+        "CBCT (arterial)", "Optional: territory planning",
+        "Cone-beam CT acquired during catheter angiography with contrast injected at the catheter tip. Used to "
+        "extract the arterial tree and predict the territory of a planned catheter position (Planning step)."),
+    ROLE_CBCT_PARENCHYMAL: (
+        "CBCT (parenchymal)", "Optional",
+        "Parenchymal / delayed phase of a dual-phase CBCT, or a selective CBCT from the planned position. Used "
+        "for the perfused volume from contrast enhancement."),
     ROLE_SEGMENTATION: (
         "Segmentation", "Required for dosimetry",
         "The master segmentation of the case (whole liver, perfused volumes, tumours, lungs, ...)."),
 }
+ROLE_INFO.update({role: (
+    f"Auxiliary volume {index + 1}", "Optional",
+    "Any other image to keep with the case, e.g. another MRI phase, a prior CT or another PET. It can be registered "
+    "to the primary image (Registration step, optional) and shown with the case; it is not used by the dosimetry.")
+    for index, role in enumerate(AUXILIARY_ROLES)})
+
+
+def isFunctionalType(imageType):
+    return imageType in DOSIMETRY_TYPES or imageType in METABOLIC_TYPES
 
 # -- Scenario and processing mode ------------------------------------------------------------------------
 
@@ -285,6 +317,11 @@ _CT_TOKENS = {"ct", "cect", "ldct", "ctac", "ac_ct", "ctpv", "cta"}
 _REFERENCE_WORDS = ["diagnostic", "contrast", "arterial", "portal", "venous", "cect", "triphasic", "late",
                     "delayed", "hbp", "eob", "dynamic"]
 _SUV_WORDS = ["suv"]
+# Cone-beam CT: generic words only (no product names in the code); DICOM XA (or CT) with these words in the name
+_CBCT_WORDS = ["cbct", "cone beam", "cone-beam", "conebeam", "rotational", "c-arm", "carm", "3d angio",
+               "3dra", "3d-ra"]
+_CBCT_TOKENS = {"cbct", "xa", "dyna", "dynact", "xper", "xperct", "innova"}
+_CBCT_PARENCHYMAL_WORDS = ["parench", "delay", "late", "venous", "2nd", "second", "phase 2", "pv", "selective"]
 
 
 def _text(info):
@@ -300,8 +337,25 @@ def _contains(text, words):
     return any(word in text for word in words)
 
 
+def isCbct(info):
+    """Cone-beam CT from catheter angiography: DICOM XA (3D), or a CT / unknown series named as a CBCT."""
+    if (info.modality or "").upper() == "XA":
+        return True
+    if info.modality and info.modality not in ("CT", "OT"):
+        return False
+    text = _text(info)
+    return _contains(text, _CBCT_WORDS) or bool(_tokens(text) & _CBCT_TOKENS)
+
+
+def looksParenchymal(info):
+    return _contains(_text(info), _CBCT_PARENCHYMAL_WORDS)
+
+
 def guessModality(info):
-    """NM, PT, CT, MR or "" (DICOM modality wins; otherwise the name and the value range are used)."""
+    """NM, PT, CT, MR, XA (cone-beam CT) or "" (DICOM modality wins; otherwise the name and the value range are
+    used). A CT-labelled series named as a CBCT is XA: its grey values are not calibrated HU."""
+    if isCbct(info):
+        return "XA"
     if info.modality in ("NM", "PT", "CT", "MR"):
         return info.modality
     text = _text(info)
@@ -349,6 +403,8 @@ def guessType(info):
         return TYPE_CT
     if modality == "MR":
         return TYPE_MRI
+    if modality == "XA":
+        return TYPE_CBCT
     return None
 
 
@@ -466,7 +522,23 @@ def suggestAssignments(infos):
                 notes.append(f"'{candidate.name}' paired with '{functionalInfo.name}': {reason}.")
                 break
 
-    # 4. Reference image: remaining anatomical image, preferring diagnostic-looking ones, then the newest
+    # 4. CBCT (arterial, then a second CBCT as the parenchymal / selective one)
+    cbcts = [info for info in infos if info.nodeID not in used and isCbct(info)]
+    if cbcts:
+        arterial = [c for c in cbcts if not looksParenchymal(c)] or cbcts
+        first = arterial[0] if len(arterial) == 1 else min(
+            arterial, key=lambda c: c.dateTime() or datetime.datetime.max)
+        assignments[ROLE_CBCT] = first.nodeID
+        types[ROLE_CBCT] = TYPE_CBCT
+        used.add(first.nodeID)
+        rest = [c for c in cbcts if c.nodeID not in used]
+        if rest:
+            second = ([c for c in rest if looksParenchymal(c)] or rest)[0]
+            assignments[ROLE_CBCT_PARENCHYMAL] = second.nodeID
+            types[ROLE_CBCT_PARENCHYMAL] = TYPE_CBCT
+            used.add(second.nodeID)
+
+    # 5. Reference image: remaining anatomical image, preferring diagnostic-looking ones, then the newest
     remaining = [a for a in anatomical if a.nodeID not in used]
     if remaining:
         preferred = [a for a in remaining if looksLikeReference(a)] or remaining
