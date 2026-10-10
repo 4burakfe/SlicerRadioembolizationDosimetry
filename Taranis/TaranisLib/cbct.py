@@ -572,7 +572,8 @@ class PlanningSession:
     # -- Tree --
 
     def searchRegion(self):
-        return V.searchRegion(self.values, self.parenchyma if self.parenchyma.any() else self.liver, self.spacing,
+        # tumours are searched too (their feeding arteries run into them); only the statistics use the parenchyma
+        return V.searchRegion(self.values, self.liver, self.spacing,
                               self.statistics, self.injectionKji(), self.fov)
 
     def localContrast(self):
@@ -597,7 +598,7 @@ class PlanningSession:
             self.tube = V.tubeShape(contrast.z, self.spacing, region & (contrast.z >= min(growSD, vesselSD)),
                                     progress=self.progress)
         self.progress("Arterial tree from the injection point")
-        segment = V.arterialTree(self.denoised, contrast, region, injection, self.spacing, self.parenchyma, vesselSD,
+        segment = V.arterialTree(self.denoised, contrast, region, injection, self.spacing, self.liver, vesselSD,
                                  growSD, self.tube, voxelML=self.grid.voxelML)
         self.region = region
         self.metalML = segment.metalML
