@@ -1559,9 +1559,28 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                                      "FDG PET."), base + 1, 0, 1, 5)
         self.aiStatus = styledLabel("")
         aiLayout.addWidget(self.aiStatus, base + 2, 0, 1, 5)
+        aiLayout.addWidget(qt.QLabel("Dependencies:"), base + 3, 0)
+        dependencyButtons = qt.QHBoxLayout()
+        installMonaiButton = qt.QPushButton("Install MONAI + einops")
+        installMonaiButton.setToolTip("Install the MONAI and einops Python packages into Slicer's Python (needed by "
+                                      "the Taranis AI models). PyTorch is not changed. Restart Slicer afterwards.")
+        installMonaiButton.connect("clicked()", self.onInstallMonai)
+        dependencyButtons.addWidget(installMonaiButton)
+        pytorchButton = qt.QPushButton("PyTorch Utils")
+        pytorchButton.setToolTip("Open the PyTorch Utils module (PyTorch extension) to install PyTorch for your "
+                                 "computer (GPU or CPU).")
+        pytorchButton.connect("clicked()", lambda: self.onOpenDependencyModule("PyTorchUtils", "PyTorch"))
+        dependencyButtons.addWidget(pytorchButton)
+        totalSegButton = qt.QPushButton("TotalSegmentator")
+        totalSegButton.setToolTip("Open the TotalSegmentator module (TotalSegmentator extension), e.g. to install "
+                                  "its Python package or a licence.")
+        totalSegButton.connect("clicked()",
+                               lambda: self.onOpenDependencyModule("TotalSegmentator", "TotalSegmentator"))
+        dependencyButtons.addWidget(totalSegButton)
+        aiLayout.addLayout(dependencyButtons, base + 3, 1, 1, 4)
         # never squeezed by the boxes below (e.g. when Tools is expanded)
         aiBox.setSizePolicy(qt.QSizePolicy.Preferred, qt.QSizePolicy.Minimum)
-        aiBox.setMinimumHeight(470)
+        aiBox.setMinimumHeight(500)
         layout.addWidget(aiBox)
 
         # -- Tools --
@@ -2116,6 +2135,44 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.aiStatus.text = f"Downloaded to {path}."
         self._aiDefaultsKey = None
         self._refresh()
+
+    def onInstallMonai(self):
+        missing = ai.missingPackage()
+        if missing is None:
+            slicer.util.infoDisplay("PyTorch, MONAI and einops are already installed.", windowTitle="AI packages")
+            return
+        text = ("Install the MONAI and einops Python packages into Slicer's Python?\n\n"
+                "PyTorch is not changed (the packages are installed without dependencies).")
+        if missing == "torch":
+            text += ("\n\nPyTorch is not installed yet: install it with the PyTorch Utils module as well, "
+                     "otherwise AI segmentation will still not run.")
+        if not slicer.util.confirmOkCancelDisplay(text, windowTitle="Install MONAI"):
+            return
+        try:
+            with slicer.util.WaitCursor():
+                slicer.util.pip_install(["monai", "einops", "--no-deps"])
+        except Exception as error:
+            slicer.util.errorDisplay(f"Installation of MONAI / einops failed: {error}")
+            return
+        importlib.invalidate_caches()
+        self._refresh()
+        if slicer.util.confirmYesNoDisplay("MONAI and einops are installed.\n\nRestart Slicer now so that they "
+                                           "are loaded cleanly? (Save your scene first.)",
+                                           windowTitle="Restart Slicer"):
+            slicer.util.restart()
+
+    def onOpenDependencyModule(self, moduleName, extensionName):
+        if moduleAvailable(moduleName):
+            slicer.util.selectModule(moduleName)
+            return
+        text = (f"The {moduleName} module is not available.\n\nInstall the '{extensionName}' extension from the "
+                "Extensions Manager, then restart Slicer.")
+        if slicer.util.confirmOkCancelDisplay(text + "\n\nOpen the Extensions Manager now?",
+                                              windowTitle=f"{extensionName} extension required"):
+            try:
+                slicer.app.openExtensionsManagerDialog()
+            except Exception as e:
+                logging.warning(f"Taranis: could not open the Extensions Manager: {e}")
 
     def onShowModelRoi(self, key):
         spec = ai.MODELS_BY_KEY[key]
