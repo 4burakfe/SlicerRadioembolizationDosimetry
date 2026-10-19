@@ -51,6 +51,7 @@ SAMPLE_DATA = [("RadioembolizationDosimetry2", "CT + Tc-99m MAA SPECT (patient-r
 SETTING_PERFUSED_PERCENT = "Taranis/PerfusedUptakePercentOfMax"   # new key: default changed from 15 to 5 %
 DEFAULT_PERFUSED_PERCENT = 5.0   # empirical starting point (no derivation): adjust and review every result
 EDITOR_NODE_TAG = "TaranisSegmentEditor"
+EDITOR_HEIGHT = 750   # px, embedded Segment Editor in the Segmentation step
 TOTALSEG_LIVER = "totalseg_liver"
 TOTALSEG_LUNGS = "totalseg_lungs"
 TOTALSEG_TUMOR = "totalseg_tumor"
@@ -1639,7 +1640,15 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 setattr(self.segmentEditorWidget, propertyName, value)
             except Exception:
                 pass
-        editorLayout.addWidget(self.segmentEditorWidget)
+        # constant height: on its own the editor grows and shrinks with the segment list and the effect options,
+        # moving everything around it; content taller than this scrolls inside the box
+        editorScroll = qt.QScrollArea()
+        editorScroll.setWidgetResizable(True)
+        editorScroll.setFrameShape(qt.QFrame.NoFrame)
+        editorScroll.setHorizontalScrollBarPolicy(qt.Qt.ScrollBarAlwaysOff)
+        editorScroll.setWidget(self.segmentEditorWidget)
+        editorScroll.setFixedHeight(EDITOR_HEIGHT)
+        editorLayout.addWidget(editorScroll)
         layout.addWidget(editorBox)
         self.editorBox = editorBox
         self._editorShortcuts = False
