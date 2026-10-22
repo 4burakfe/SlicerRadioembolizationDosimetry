@@ -37,7 +37,7 @@ EPONA_LOGO_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "Reso
 EPONA_MODULE = "Easy_fusion"
 EPONA_LOGO_SIZE = 40
 SHOW_EPONA = False             # temporarily hidden: Epona moves from SlicerPETDenoise to its own extension
-EXPORT_ICON_SIZE = (66, 46)    # "Save … as DICOM" buttons (px)
+EXPORT_ICON_SIZE = (143, 44)   # "Save … as DICOM" banners (px, the images' aspect ratio)
 CASE_TEXT_WIDTH_MAX = 240      # the case name is elided beyond this width
 WIDTH_SLACK = 24               # px kept free when choosing the compaction level
 WIDTH_CHECK_INTERVAL_MS = 1000  # fallback polling of the window width (resize events are the main trigger)
@@ -343,14 +343,14 @@ class WorkflowToolbar:
         from . import dicomexport as DX
         self.exportActions = []
         self.exportMenuActions = []
-        for key, caption, function in (("scene", "Scene", DX.saveSceneAsDicom),
-                                       ("segments", "Segments", DX.saveSegmentsAsDicom),
-                                       ("dose", "Dose map", DX.saveDoseAsDicom)):
+        for key, function in (("scene", DX.saveSceneAsDicom),
+                              ("segments", DX.saveSegmentsAsDicom),
+                              ("dose", DX.saveDoseAsDicom)):
             button = qt.QToolButton()
             button.setAutoRaise(True)
             # the picture as a label inside the button: Slicer's style draws toolbar icons at the toolbar's icon size
             picture = qt.QLabel()
-            picture.setPixmap(DX.exportIcon(caption, EXPORT_ICON_SIZE).pixmap(EXPORT_ICON_SIZE[0], EXPORT_ICON_SIZE[1]))
+            picture.setPixmap(DX.exportIcon(key, EXPORT_ICON_SIZE).pixmap(EXPORT_ICON_SIZE[0], EXPORT_ICON_SIZE[1]))
             picture.setAlignment(qt.Qt.AlignCenter)
             picture.setAttribute(qt.Qt.WA_TransparentForMouseEvents)
             pictureLayout = qt.QHBoxLayout(button)

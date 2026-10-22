@@ -432,51 +432,16 @@ def _choose(title, nodes):
 
 # -- Icons -------------------------------------------------------------------------------------------------------
 
-def exportIcon(caption, size=(64, 48)):
-    """A floppy disk with 'DICOM' beside it and the caption (Scene / Segments / Dose map) under them."""
+EXPORT_ICON_FILES = {"scene": "SaveDicomScene.png", "segments": "SaveDicomSegments.png", "dose": "SaveDicomDose.png"}
+
+
+def exportIcon(key, size=(143, 44)):
+    """'Save as DICOM: Scene / Segments / Dose map' banner (Resources/Icons) on its own dark rounded background,
+    so it reads the same on light and dark Slicer themes."""
     width, height = size
     scale = int(max(1, round(slicer.app.devicePixelRatio()))) if hasattr(slicer.app, 'devicePixelRatio') else 1
-    pixmap = qt.QPixmap(width * scale, height * scale)
-    pixmap.fill(qt.QColor(0, 0, 0, 0))
-    painter = qt.QPainter(pixmap)
-    painter.setRenderHint(qt.QPainter.Antialiasing)
-    painter.scale(scale, scale)
-    # floppy disk (drawn in a 32 x 32 box, scaled to the icon height)
-    painter.save()
-    painter.translate(1, 2)
-    floppy = (height - 18) / 30.0
-    painter.scale(floppy, floppy)
-    body = qt.QColor("#2f7ed8")
-    painter.setPen(qt.QPen(qt.QColor("#1b4f8a"), 1.2))
-    painter.setBrush(qt.QBrush(body))
-    painter.drawRoundedRect(qt.QRectF(3, 3, 26, 26), 3, 3)
-    painter.setPen(qt.Qt.NoPen)
-    painter.setBrush(qt.QBrush(qt.QColor("#dfe8f2")))
-    painter.drawRect(qt.QRectF(9, 4, 13, 9))                   # metal shutter
-    painter.setBrush(qt.QBrush(qt.QColor("#1b4f8a")))
-    painter.drawRect(qt.QRectF(17, 5.5, 3, 6))                 # shutter window
-    painter.setBrush(qt.QBrush(qt.QColor("#ffffff")))
-    painter.drawRoundedRect(qt.QRectF(7, 17, 18, 11), 1.5, 1.5)  # label
-    painter.setPen(qt.QPen(qt.QColor("#9aa3ab"), 0.8))
-    for y in (20.5, 23.5):
-        painter.drawLine(qt.QPointF(9.5, y), qt.QPointF(22.5, y))
-    painter.restore()
-    left = 2 + 30 * floppy
-    # "DICOM" beside it
-    font = qt.QFont()
-    font.setBold(True)
-    font.setPixelSize(9)
-    painter.setFont(font)
-    text = slicer.app.palette().color(qt.QPalette.WindowText)
-    painter.setPen(qt.QPen(text))
-    painter.drawText(qt.QRectF(left, 2, width - left, height - 18), qt.Qt.AlignLeft | qt.Qt.AlignVCenter, "DICOM")
-    # caption under them
-    font.setBold(False)
-    font.setPixelSize(10)
-    painter.setFont(font)
-    painter.setPen(qt.QPen(text))
-    painter.drawText(qt.QRectF(0, height - 15, width, 14), qt.Qt.AlignHCenter | qt.Qt.AlignVCenter, caption)
-    painter.end()
+    path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "Resources", "Icons", EXPORT_ICON_FILES[key])
+    pixmap = qt.QPixmap(path).scaled(width * scale, height * scale, qt.Qt.KeepAspectRatio, qt.Qt.SmoothTransformation)
     if scale != 1:
         pixmap.setDevicePixelRatio(scale)
     return qt.QIcon(pixmap)
