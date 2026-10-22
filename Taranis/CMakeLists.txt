@@ -30,6 +30,9 @@ set(MODULE_PYTHON_SCRIPTS
 set(MODULE_PYTHON_RESOURCES
   Resources/Icons/${MODULE_NAME}.png
   Resources/Icons/Epona.png
+  Resources/Icons/SaveDicomScene.png
+  Resources/Icons/SaveDicomSegments.png
+  Resources/Icons/SaveDicomDose.png
   Resources/banner.png
   Resources/DoseKernels/90Y_64.10H_beta.io_processed.csv
   )
