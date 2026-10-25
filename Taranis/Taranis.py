@@ -2337,7 +2337,8 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                     f"• {text}" for severity, text in issues)
 
     def _checkGeometry(self, grid):
-        issues = segtools.geometryCheck(grid, self.controller.case.mode)
+        case = self.controller.case
+        issues = segtools.geometryCheck(grid, case.mode, segtools.ctImages(case))
         segtools.storeGeometryCheck(self.controller.case, grid.node, issues)
         return issues
 

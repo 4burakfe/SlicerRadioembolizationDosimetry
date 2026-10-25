@@ -67,6 +67,15 @@ class SegmentOpsTest(unittest.TestCase):
         self.assertEqual(outside[0][0], "C")
         self.assertTrue(0 < outside[0][2] < 1)
 
+    def test_borderReport(self):
+        mask = np.zeros((10, 10, 10), bool)
+        mask[0:4, 3:6, 3:6] = True                      # touches the first slice
+        self.assertEqual(S.borderReport(mask, 1.0, (1, 1, 1)), [(0, 0, 9.0)])
+        self.assertEqual(S.borderReport(mask, 1.0, (2, 4, 1)), [(0, 0, 18.0), (1, 0, 12.0)])   # wider slabs
+        mask[:] = False
+        mask[2:8, 2:8, 2:8] = True                      # inside: nothing near the edges
+        self.assertEqual(S.borderReport(mask, 1.0, (1, 1, 1)), [])
+
     def test_suvFactor(self):
         injection = datetime.datetime(2026, 3, 1, 9, 0, 0)
         scan = injection + datetime.timedelta(minutes=110)     # one F-18 half-life

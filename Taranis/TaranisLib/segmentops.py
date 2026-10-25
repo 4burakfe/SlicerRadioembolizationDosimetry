@@ -99,6 +99,21 @@ def perfusionReport(namedMasks, perfusedUnion, voxelML):
     return result
 
 
+def borderReport(mask, voxelML, widths):
+    """[(axis, side, mL)] of the mask within widths[axis] voxels of each face of its array (axis 0, 1, 2 = k, j, i;
+    side 0: index 0, side 1: last index). Only faces the mask reaches."""
+    result = []
+    for axis in range(3):
+        width = max(1, min(int(widths[axis]), mask.shape[axis]))
+        for side, index in ((0, slice(0, width)), (1, slice(mask.shape[axis] - width, mask.shape[axis]))):
+            slab = [slice(None)] * 3
+            slab[axis] = index
+            count = np.count_nonzero(mask[tuple(slab)])
+            if count:
+                result.append((axis, side, count * voxelML))
+    return result
+
+
 def latticeOffset(imageToWorld, referenceToWorld, tolerance=1e-3, indexTolerance=0.05):
     """Whole-voxel index offset (i, j, k) that re-numbers an image in the index space of a reference image lying on
     the same voxel lattice: same voxel size and axis directions (4x4 image-to-world matrices equal in their 3x3

@@ -23,6 +23,8 @@ UNPERFUSED_TUMOUR_FRACTION = 0.10   # more of a tumour outside the perfused volu
 TUMOUR_BURDEN_WARNING = 0.50        # tumours / whole liver
 NORMAL_MISMATCH_NOTE = 0.10         # normal tissue differs from liver − tumours (and perfused − tumours) by more
 LUNGS_MIN_ML = 1500.0
+LUNG_BORDER_MM = 5.0                # lungs this close to the edge of their CT: may be truncated
+LUNG_ON_IMAGE_FRACTION = 0.9        # the CT the lungs were drawn on contains (nearly) all of them
 
 
 MAX_GRID_VOXELS = 250e6     # larger extended grids fall back to the primary image grid
@@ -536,10 +538,11 @@ def perfusedFromUptake(grid, uptakeVolume, percent, minML=5.0):
 
 # -- Geometry check -----------------------------------------------------------------------------------------------
 
-def geometryCheck(grid, mode=None):
-    """[(severity, text)] of overlaps, parts outside the liver or the perfused volumes, tumour burden and outdated
-    normal tissue. mode: the case's processing mode (the texts mention what patient-relative dosimetry does).
-    The whole-liver and perfused volume sizes are checked by the workflow validator (always up to date)."""
+def geometryCheck(grid, mode=None, images=()):
+    """[(severity, text)] of overlaps, parts outside the liver or the perfused volumes, lungs at the edge of their
+    CT, tumour burden and outdated normal tissue. mode: the case's processing mode (the texts mention what
+    patient-relative dosimetry does). images: the CT volumes of the case (ctImages). The whole-liver and perfused
+    volume sizes are checked by the workflow validator (always up to date)."""
     issues = []
     ml = grid.voxelML
     names = {i: grid.name(i) for i in grid.ids()}
@@ -567,6 +570,7 @@ def geometryCheck(grid, mode=None):
         if 0 < lungML < LUNGS_MIN_ML:
             issues.append((W.SEVERITY_INFO, f"'{names[lungID]}' is {lungML:.0f} mL: the lungs may be cut by the "
                                             "field of view (lung mass and lung dose would be too high)."))
+    issues += lungBorderCheck(grid, images)
     perfused = {names[i]: grid.mask(i) for i in byRole[W.SEGMENT_PERFUSED]}
     for a, b, volume in S.overlapReport(perfused, ml):
         if volume >= MIN_REPORT_ML:
@@ -629,6 +633,58 @@ def geometryCheck(grid, mode=None):
                                                 "whole liver − tumours and from perfused − tumours: if the "
                                                 "segments were edited afterwards, recreate it with 'Normal liver = "
                                                 "liver − tumours' or 'Perfused normal = perfused − tumours'."))
+    return issues
+
+
+_RAS_DIRECTIONS = (("left", "right"), ("posterior", "anterior"), ("inferior", "superior"))
+
+
+def ctImages(case):
+    """The case's CT volumes (each once), for the lung border check."""
+    images = []
+    for role in R.VOLUME_ROLES:
+        node = case.roleNode(role)
+        if node is not None and case.roleType(role) == R.TYPE_CT and node not in images:
+            images.append(node)
+    return images
+
+
+def lungBorderCheck(grid, images):
+    """[(severity, text)]: lungs that reach the edge of the CT they lie on (within LUNG_BORDER_MM), so the CT may
+    not cover them entirely. Only CTs containing nearly all of the lung segment are checked: another CT (e.g. an
+    abdominal one next to the chest CT) cutting the lungs is expected."""
+    issues = []
+    for lungID in grid.ids(W.SEGMENT_LUNGS):
+        lungML = S.volumeML(grid.mask(lungID), grid.voxelML)
+        if not lungML:
+            continue
+        for volume in images:
+            if volume is None or volume.GetImageData() is None:
+                continue
+            onImage = np.asarray(slicer.util.arrayFromSegmentBinaryLabelmap(grid.node, lungID, volume)) > 0
+            spacing = volume.GetSpacing()                                   # (i, j, k)
+            voxelML = spacing[0] * spacing[1] * spacing[2] / 1000.0
+            if S.volumeML(onImage, voxelML) < LUNG_ON_IMAGE_FRACTION * lungML:
+                continue
+            widths = [int(np.ceil(LUNG_BORDER_MM / spacing[2 - axis] - 1e-6)) for axis in range(3)]
+            report = [(axis, side, ml) for axis, side, ml in S.borderReport(onImage, voxelML, widths)
+                      if ml >= MIN_REPORT_ML]
+            if not report:
+                continue
+            matrix = _matrix(volume)
+            edges = []
+            for axis, side, _ in report:
+                column = matrix[:3, 2 - axis] * (1 if side else -1)   # outward direction of that face
+                component = int(np.argmax(np.abs(column)))
+                edge = _RAS_DIRECTIONS[component][int(column[component] > 0)]
+                if edge not in edges:
+                    edges.append(edge)
+            touching = sum(ml for _, _, ml in report)
+            issues.append((W.SEVERITY_WARNING, f"'{grid.name(lungID)}' reaches the {' / '.join(edges)} edge of "
+                                               f"'{volume.GetName()}' ({touching:.1f} mL within "
+                                               f"{LUNG_BORDER_MM:.0f} mm): the lungs may be truncated (LSF, lung "
+                                               "mass and lung dose would be wrong). Check that the CT covers both "
+                                               "lungs entirely."))
     return issues
 
 

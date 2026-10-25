@@ -212,5 +212,50 @@ class GeometryCheckTest(unittest.TestCase):
         self.assertFalse(any("differs" in t for _, t in self.check(segments)))
 
 
+
+class LungBorderTest(unittest.TestCase):
+    """segtools.lungBorderCheck: lungs at the edge of the CT they lie on may be truncated."""
+
+    def setUp(self):
+        matrix = np.diag([-2.0, -2.0, 2.0, 1.0])          # LPS-like i / j, k towards superior; 2 mm voxels
+        patcher = mock.patch.object(segtools, "_matrix", lambda volume: matrix)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.ct = mock.MagicMock()
+        self.ct.GetName.return_value = "Chest CT"
+        self.ct.GetSpacing.return_value = (2.0, 2.0, 2.0)
+        self.onImage = None
+        patcher = mock.patch.object(segtools.slicer.util, "arrayFromSegmentBinaryLabelmap",
+                                    lambda node, segmentID, volume: self.onImage, create=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def check(self, lungs, onImage):
+        self.onImage = onImage
+        grid = EditableGrid({"Lu": ("Lungs", W.SEGMENT_LUNGS, lungs)})
+        grid.voxelML = 0.008                                 # same 2 mm voxels as the CT
+        return segtools.lungBorderCheck(grid, [self.ct])
+
+    def test_lungs_at_the_top_of_the_ct(self):
+        lungs = box((20, 30), (5, 25), (5, 25))              # up to the last (most superior) slice
+        issues = self.check(lungs, lungs)
+        self.assertEqual(len(issues), 1)
+        severity, text = issues[0]
+        self.assertEqual(severity, W.SEVERITY_WARNING)
+        self.assertIn("'Lungs' reaches the superior edge of 'Chest CT'", text)
+        self.assertIn("may be truncated", text)
+        # the right side too (i = 0 lies towards the patient's right in this orientation)
+        lungs = box((20, 30), (5, 25), (0, 25))
+        self.assertIn("superior / right edge", self.check(lungs, lungs)[0][1])
+
+    def test_lungs_inside_the_ct(self):
+        lungs = box((5, 25), (5, 25), (5, 25))
+        self.assertEqual(self.check(lungs, lungs), [])
+
+    def test_ct_with_only_part_of_the_lungs_is_not_checked(self):
+        lungs = box((0, 30), (5, 25), (5, 25))
+        onImage = box((0, 5), (5, 25), (5, 25))              # e.g. an abdominal CT: only the lung bases
+        self.assertEqual(self.check(lungs, onImage), [])
+
 if __name__ == "__main__":
     unittest.main()
