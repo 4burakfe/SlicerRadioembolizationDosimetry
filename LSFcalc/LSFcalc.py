@@ -1,6 +1,7 @@
 import os
 import re
 import ast
+import importlib
 import time
 import logging
 
@@ -20,6 +21,14 @@ MODULE_VERSION = "2.0"
 ORGANS = {
     "lung": ("Lungs", "CTLUNGswin12_segmenter.pth", (0.45, 0.65, 1.00), (380.0, 260.0, 320.0)),
     "liver": ("Liver", "Liver_SwinUNETR24.pth", (0.85, 0.35, 0.25), (260.0, 240.0, 240.0)),
+}
+# Release that holds the model files (same as the Taranis Segmentation step) and the SHA256 of each file
+MODEL_RELEASE_URL = "https://github.com/4burakfe/SlicerAether/releases/download/Trained_Models/"
+MODEL_CHECKSUMS = {
+    "CTLUNGswin12_segmenter.pth": ("96aba3607a0d21bf15e7a98f163dd12e4e0c20ef5e7dce1a37233115cc7a8b39",
+                                   "88a42620435735d0f5fc3c9951e9a21777ea39734ffa9a4a76560a3bf05f4041"),
+    "Liver_SwinUNETR24.pth": ("ef0d0bbb576f9ce363b4f841c877996fdd5b1c78b5d084f7f4217680208c793c",
+                              "a958d586573dc041bcc62fa2724517916da4b35a6bbda84dbb63fb5f1fa34909"),
 }
 CANDIDATE_COLOR = (1.0, 0.9, 0.0)
 CANDIDATE_TAG = "LSFcalc.Candidate"     # segment tag of an AI result that is not accepted yet
@@ -109,8 +118,9 @@ INFO_TEXT = (
     "(the liver keeps the overlapping voxels).\n"
     "5. Evaluate the segments and results, press Accept, then send the LSF to the relative dosimetry module.\n"
     "LSF = lung counts / (lung counts + liver counts), counted on the SPECT voxel grid.\n\n"
-    "AI segmentation needs PyTorch (installed with the PyTorch Utils module of the SlicerPyTorch extension) "
-    "and MONAI.\n"
+    "AI segmentation needs the model files (Download, or the AI models folder of the Taranis settings), PyTorch "
+    "(installed with the PyTorch Utils module of the SlicerPyTorch extension) and MONAI + einops (Install MONAI "
+    "+ einops).\n"
     "This module is NOT a medical device. It is for research purposes only.\n"
     "Prepared by: Burak Demir, MD, FEBNM\n"
     "For support, feedback, and suggestions: 4burakfe@gmail.com\n"
@@ -167,14 +177,20 @@ def rescaleIntensity(array, inputRange, outputRange):
 # Model files and descriptors
 # ---------------------------------------------------------------------------------------------------
 
+def modelDownloadFolder():
+    """Folder the models are downloaded to (shared with the Taranis Segmentation step)."""
+    base = qt.QStandardPaths.writableLocation(qt.QStandardPaths.GenericDataLocation)
+    return os.path.join(base, "slicer.org", "Taranis", "Models")
+
+
 def modelSearchFolders():
-    """The AI models folder chosen in the Taranis settings (if any), then the module folder."""
+    """The AI models folder chosen in the Taranis settings (if any), the download folder, then the module folder."""
     moduleDir = os.path.dirname(os.path.abspath(__file__))
     folders = []
     customFolder = slicer.util.settingsValue(MODELS_FOLDER_SETTING, "")
     if isinstance(customFolder, str) and customFolder:
         folders.append(customFolder)
-    return folders + [moduleDir, os.path.join(moduleDir, "Resources", "Models")]
+    return folders + [modelDownloadFolder(), moduleDir, os.path.join(moduleDir, "Resources", "Models")]
 
 
 def findModelFile(fileName):
@@ -183,6 +199,23 @@ def findModelFile(fileName):
         if os.path.isfile(path):
             return path
     return None
+
+
+def downloadModel(fileName):
+    """Download the model and its descriptor from the release into the download folder (SHA256 checked).
+    Returns the path of the model."""
+    import SampleData
+    folder = modelDownloadFolder()
+    os.makedirs(folder, exist_ok=True)
+    logic = SampleData.SampleDataLogic()
+    modelChecksum, descriptorChecksum = MODEL_CHECKSUMS.get(fileName, ("", ""))
+    descriptorName = os.path.splitext(fileName)[0] + ".txt"
+    for name, checksum in ((descriptorName, descriptorChecksum), (fileName, modelChecksum)):
+        path = logic.downloadFile(MODEL_RELEASE_URL + name, folder, name,
+                                  f"SHA256:{checksum}" if checksum else None)
+        if not path or not os.path.isfile(path):
+            raise RuntimeError(f"Could not download {name} from {MODEL_RELEASE_URL}.")
+    return os.path.join(folder, fileName)
 
 
 def parseDescriptorValue(text):
@@ -211,16 +244,12 @@ def readModelDescriptor(modelPath):
 
 
 def missingAiPackage():
-    """None if PyTorch, MONAI and einops can be imported, otherwise the missing package name."""
-    try:
-        import torch  # noqa: F401
-    except ImportError:
-        return "torch"
-    try:
-        import monai  # noqa: F401
-        import einops  # noqa: F401
-    except ImportError:
-        return "monai"
+    """None if PyTorch, MONAI and einops are installed, otherwise the missing package name (found without importing
+    them: the status is shown when the module opens, and importing PyTorch takes seconds)."""
+    import importlib.util
+    for package in ("torch", "monai", "einops"):
+        if importlib.util.find_spec(package) is None:
+            return package
     return None
 
 
@@ -691,6 +720,28 @@ class LSFcalcWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.modelStatusLabel = qt.QLabel()
         self.modelStatusLabel.setWordWrap(True)
         aiLayout.addRow(self.modelStatusLabel)
+        self.downloadButtons = {}
+        downloadRow = qt.QHBoxLayout()
+        for organ, (name, fileName, _, _) in ORGANS.items():
+            button = qt.QPushButton(f"Download {name.lower()} model")
+            button.setToolTip(f"Download {fileName} and its descriptor from the Taranis GitHub release into "
+                              f"{modelDownloadFolder()} (shared with the Taranis Segmentation step).")
+            button.connect("clicked()", lambda organ=organ: self.onDownloadModel(organ))
+            downloadRow.addWidget(button)
+            self.downloadButtons[organ] = button
+        aiLayout.addRow(downloadRow)
+        dependencyRow = qt.QHBoxLayout()
+        installMonaiButton = qt.QPushButton("Install MONAI + einops")
+        installMonaiButton.setToolTip("Install the MONAI and einops Python packages into Slicer's Python (needed by "
+                                      "the AI models). PyTorch is not changed. Restart Slicer afterwards.")
+        installMonaiButton.connect("clicked()", self.onInstallMonai)
+        dependencyRow.addWidget(installMonaiButton)
+        pytorchButton = qt.QPushButton("PyTorch Utils")
+        pytorchButton.setToolTip("Open the PyTorch Utils module (PyTorch extension) to install PyTorch for your "
+                                 "computer (GPU or CPU).")
+        pytorchButton.connect("clicked()", self.onOpenPyTorchUtils)
+        dependencyRow.addWidget(pytorchButton)
+        aiLayout.addRow("Dependencies: ", dependencyRow)
 
         self.lungRoiSelector = self._makeNodeSelector("vtkMRMLMarkupsROINode", "ROI covering both lungs.",
                                                       allowNone=True, allowCreate=True)
@@ -862,11 +913,20 @@ class LSFcalcWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         for organ, (name, fileName, _, _) in ORGANS.items():
             path = findModelFile(fileName)
             if path is None:
-                lines.append(f"{name} model: not found ({fileName})")
+                lines.append(f"{name} model: not found ({fileName}): download it or set the AI models folder "
+                             "(Taranis settings)")
             elif not os.path.isfile(os.path.splitext(path)[0] + ".txt"):
                 lines.append(f"{name} model: descriptor missing ({os.path.splitext(fileName)[0]}.txt)")
             else:
                 lines.append(f"{name} model: available")
+            self.downloadButtons[organ].visible = path is None or not os.path.isfile(os.path.splitext(path)[0]
+                                                                                     + ".txt")
+        missing = missingAiPackage()
+        if missing:
+            lines.append(f"Python package '{missing}' missing: "
+                         + ("install PyTorch with PyTorch Utils." if missing == "torch" else "Install MONAI + einops."))
+        else:
+            lines.append("PyTorch, MONAI and einops: installed")
         self.modelStatusLabel.text = "\n".join(lines)
         self.modelStatusLabel.setToolTip("Model files are searched in:\n" + "\n".join(modelSearchFolders()))
 
@@ -1234,7 +1294,76 @@ class LSFcalcWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         except Exception as error:
             slicer.util.errorDisplay(f"Installation of MONAI failed: {error}")
             return False
+        importlib.invalidate_caches()
+        self._updateModelStatus()
         return missingAiPackage() is None
+
+    def onDownloadModel(self, organ):
+        name, fileName, _, _ = ORGANS[organ]
+        self.statusLabel.text = f"Downloading {fileName} ..."
+        slicer.app.processEvents()
+        try:
+            with slicer.util.WaitCursor():
+                path = downloadModel(fileName)
+        except Exception as error:
+            logging.exception("Model download failed")
+            self.statusLabel.text = f"Download of the {name.lower()} model failed."
+            slicer.util.errorDisplay(f"Download of {fileName} failed: {error}")
+            return False
+        finally:
+            self._updateModelStatus()
+        self.statusLabel.text = f"Downloaded to {path}."
+        return True
+
+    def onInstallMonai(self):
+        missing = missingAiPackage()
+        if missing is None:
+            slicer.util.infoDisplay("PyTorch, MONAI and einops are already installed.", windowTitle="AI packages")
+            return
+        text = ("Install the MONAI and einops Python packages into Slicer's Python?\n\n"
+                "PyTorch is not changed (the packages are installed without dependencies).")
+        if missing == "torch":
+            text += ("\n\nPyTorch is not installed yet: install it with the PyTorch Utils module as well, "
+                     "otherwise AI segmentation will still not run.")
+        if not slicer.util.confirmOkCancelDisplay(text, windowTitle="Install MONAI"):
+            return
+        try:
+            with slicer.util.WaitCursor():
+                slicer.util.pip_install(["monai", "einops", "--no-deps"])
+        except Exception as error:
+            slicer.util.errorDisplay(f"Installation of MONAI / einops failed: {error}")
+            return
+        importlib.invalidate_caches()
+        self._updateModelStatus()
+        if slicer.util.confirmYesNoDisplay("MONAI and einops are installed.\n\nRestart Slicer now so that they "
+                                           "are loaded cleanly? (Save your scene first.)",
+                                           windowTitle="Restart Slicer"):
+            slicer.util.restart()
+
+    def onOpenPyTorchUtils(self):
+        if hasattr(slicer.modules, "pytorchutils"):
+            slicer.util.selectModule("PyTorchUtils")
+            return
+        if slicer.util.confirmOkCancelDisplay("The PyTorchUtils module is not available.\n\nInstall the 'PyTorch' "
+                                              "extension from the Extensions Manager, then restart Slicer.\n\n"
+                                              "Open the Extensions Manager now?",
+                                              windowTitle="PyTorch extension required"):
+            try:
+                slicer.app.openExtensionsManagerDialog()
+            except Exception as error:
+                logging.warning(f"LSFcalc: could not open the Extensions Manager: {error}")
+
+    def _checkModel(self, organ):
+        """True if the model and its descriptor are found; otherwise offers to download them."""
+        name, fileName, _, _ = ORGANS[organ]
+        path = findModelFile(fileName)
+        if path is not None and os.path.isfile(os.path.splitext(path)[0] + ".txt"):
+            return True
+        if not slicer.util.confirmOkCancelDisplay(
+                f"The {name.lower()} model ({fileName}) is not on this computer.\n\nDownload it now from the "
+                f"Taranis GitHub release (into {modelDownloadFolder()})?", windowTitle="AI model required"):
+            return False
+        return self.onDownloadModel(organ)
 
     def onSegmentOrgan(self, organ):
         ct = self.ctSelector.currentNode()
@@ -1247,7 +1376,7 @@ class LSFcalcWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             slicer.util.errorDisplay(f"An ROI is required for AI {name.lower()} segmentation. Create the "
                                      f"{name.lower()} ROI and make it cover the whole organ.")
             return
-        if not self._checkAiPackages():
+        if not self._checkModel(organ) or not self._checkAiPackages():
             return
         segmentation = self.segmentationSelector.currentNode() or self._createSegmentation()
 
@@ -1547,8 +1676,8 @@ class LSFcalcLogic(ScriptedLoadableModuleLogic):
             raise ValueError(f"The {name.lower()} ROI does not overlap the CT. Move the ROI onto the organ.")
         modelPath = findModelFile(fileName)
         if modelPath is None:
-            raise ValueError(f"Model file '{fileName}' not found. Place it next to LSFcalc.py:\n"
-                             + "\n".join(modelSearchFolders()))
+            raise ValueError(f"Model file '{fileName}' not found. Download it (AI-assisted segmentation) or place "
+                             "it in one of these folders:\n" + "\n".join(modelSearchFolders()))
         descriptor = readModelDescriptor(modelPath)
         if descriptor["dual_channel"]:
             raise ValueError(f"{fileName} is a dual-channel model; this module runs CT-only models.")
