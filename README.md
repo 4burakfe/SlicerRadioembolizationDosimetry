@@ -372,6 +372,7 @@ Geometry check (voxel masks; runs on *Next* and with *Check geometry*, shown unt
 | Tumour, viable tumour, perfused volume or normal tissue partly outside the whole liver (≥ *MIN_REPORT_ML* 0.5 mL and 1 %) | W |
 | Lungs overlap the whole liver | W |
 | Lung segment below *LUNGS_MIN_ML* (1500 mL): cut by the field of view? | N |
+| Lung segment within *LUNG_BORDER_MM* (5 mm, at least one slice) of an edge of the CT it lies on (a CT of the case containing ≥ 90 % of it): the lungs may be truncated | W |
 | Perfused volumes overlap each other | W |
 | Tumours overlap each other | N |
 | Normal tissue contains tumour | W |
