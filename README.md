@@ -110,6 +110,8 @@ All modules are available under `Nuclear Medicine` category.
 5. Click **Calculate**.
 6. View counts and LSF result in UI.
 
+**AI-assisted segmentation** (lungs and whole liver on the CT of the SPECT/CT): missing models can be downloaded with *Download lung / liver model* (or when you press *Segment*), from the same GitHub release and into the same folder as the Taranis Segmentation step (SHA256 checked). The status line shows which models and Python packages are missing; *Install MONAI + einops* installs those packages and *PyTorch Utils* opens the module that installs PyTorch.
+
 ### 📌 Taranis - Patient Relative Dosimetry
 **Purpose**: Predictive voxel-based dosimetry before treatment. The activity planned for each perfused volume (vascular territory of an injection position) is distributed inside that perfused volume in proportion to image counts, and the dose maps of all perfused volumes are added.
 
