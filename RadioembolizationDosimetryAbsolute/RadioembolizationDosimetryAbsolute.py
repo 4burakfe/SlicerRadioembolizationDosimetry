@@ -85,7 +85,7 @@ class RadioembolizationDosimetryAbsolute(ScriptedLoadableModule):
     def __init__(self, parent):
         ScriptedLoadableModule.__init__(self, parent)
         parent.title = "Taranis - Radioembolization Dosimetry - Absolute"
-        parent.categories = ["Nuclear Medicine"]
+        parent.categories = ["Nuclear Medicine.Taranis - Submodules"]
         parent.dependencies = []
         parent.contributors = ["Burak Demir, MD, FEBNM"]
         parent.helpText = """

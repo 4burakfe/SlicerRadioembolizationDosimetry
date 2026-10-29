@@ -19,7 +19,7 @@ Sample images to test the modules can be found in here: https://github.com/4bura
 
 ## 📦 Modules Included
 
-All modules are available under `Nuclear Medicine` category.
+The `Taranis` hub is in the `Nuclear Medicine` category; the other modules are in its `Taranis - Submodules` subfolder (`Nuclear Medicine › Taranis - Submodules` in the module menu and module finder).
 
 - `Taranis`: the hub. Welcomes you, manages the case (name and ID) and guides the whole workflow; adds the **workflow toolbar**
 - `LSF Calculator`: Lung Shunt Fraction Calculator
@@ -27,6 +27,7 @@ All modules are available under `Nuclear Medicine` category.
 - `Taranis - Absolute Dosimetry`: Post-treatment dosimetry from quantitative PET/SPECT (e.g. Y-90 PET)
 - `EasyReg`: Registration of SPECT/CT to diagnostic CT/MRI
 - `Taranis - CBCT Planning`: CBCT territory planning – arterial tree, planned catheter tips and their predicted territories (perfused volumes), feeder finder, perfused volume from CBCT enhancement
+- `Taranis - Segmentation` and `Taranis - Data Roles`: shortcuts to the hub's Segmentation and Data and roles steps. They open the Taranis hub on that step for the open case, so the case, the step status and the page are the hub's and the workflow is unchanged (without a case they open the case overview)
 
 > ℹ️ The combined `Taranis - Dosimetry` module has been split into `Taranis - Patient Relative Dosimetry` and `Taranis - Absolute Dosimetry`, so that the patient-relative module can support complex treatment plans with multiple perfused volumes. Both modules share the same results layout, segment categories, tables and report.
 

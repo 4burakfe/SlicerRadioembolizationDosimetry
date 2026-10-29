@@ -25,6 +25,8 @@ add_subdirectory(LSFcalc)
 add_subdirectory(CBCTPlanning)
 add_subdirectory(RadioembolizationDosimetryAbsolute)
 add_subdirectory(RadioembolizationDosimetryRelative)
+add_subdirectory(TaranisSegmentation)
+add_subdirectory(TaranisDataRoles)
 ## NEXT_MODULE
 
 #-----------------------------------------------------------------------------

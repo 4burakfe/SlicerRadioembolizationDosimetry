@@ -25,6 +25,7 @@ set(MODULE_PYTHON_SCRIPTS
   TaranisLib/views.py
   TaranisLib/visibility.py
   TaranisLib/workflow.py
+  TaranisLib/shortcut.py
   )
 
 set(MODULE_PYTHON_RESOURCES
