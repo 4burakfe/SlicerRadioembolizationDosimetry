@@ -559,7 +559,7 @@ class LSFcalc(ScriptedLoadableModule):
     def __init__(self, parent):
         ScriptedLoadableModule.__init__(self, parent)
         parent.title = "Taranis - LSF Calculator"
-        parent.categories = ["Nuclear Medicine"]
+        parent.categories = ["Nuclear Medicine.Taranis - Submodules"]
         parent.dependencies = []  # PyTorch is optional (AI segmentation only), so no hard dependency
         parent.contributors = ["Burak Demir, MD, FEBNM"]
         parent.helpText = """

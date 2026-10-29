@@ -657,7 +657,7 @@ class easy_reg(ScriptedLoadableModule):
     def __init__(self, parent):
         ScriptedLoadableModule.__init__(self, parent)
         parent.title = "Taranis - EasyReg"
-        parent.categories = ["Nuclear Medicine"]
+        parent.categories = ["Nuclear Medicine.Taranis - Submodules"]
         parent.dependencies = []
         parent.contributors = ["Burak Demir, MD, FEBNM"]
         parent.helpText = """
