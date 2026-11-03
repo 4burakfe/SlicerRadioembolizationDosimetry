@@ -7,10 +7,14 @@ appears in their views.
     +-------------------+-------------------+-----------+
     | axial fused       | axial reference   |           |
     | (anatomy + SPECT) | + segments        |    3D     |
-    +-------------------+-------------------+ segments  |
-    | coronal fused     | coronal reference | wireframe |
-    |                   | + segments        |           |
+    | + segments        |                   | segments  |
+    +-------------------+-------------------+ wireframe |
+    | coronal fused     | coronal reference |           |
+    | + segments        | + segments        |           |
     +-------------------+-------------------+-----------+
+
+The four slice views are linked (scrolling, zooming and panning one moves the others) and show the segments, so the
+embedded Segment Editor works in the fused views too (it only acts in views where the segmentation is shown).
 
 Dual monitor (SEGMENTATION_DUAL_LAYOUT_ID): the four slice views (2 x 2) stay in the main window and the 3D view
 opens in its own window, maximized on the second screen. Same view nodes as the single monitor layout. The layout
@@ -44,7 +48,7 @@ FUNCTIONAL_COLORMAP = "Inferno"
 SEGMENTATION_3D_ATTRIBUTE = "Taranis.Segmentation3D"       # on the extra display node of the 3D view
 SAVED_VIEWS_ATTRIBUTE = "Taranis.SavedViewNodeIDs"         # on the main display node while the layout is shown
 SAVED_FILL_ATTRIBUTE = "Taranis.SavedFillOpacity"          # idem: 2D fill opacity before the layout
-FILL_OPACITY_2D = 0.2                                      # segment fill in the reference slice views
+FILL_OPACITY_2D = 0.2                                      # segment fill in the slice views of the layout
 # Wireframe opacity per role, as in the dosimetry modules (dense meshes: low opacity)
 SEGMENT_3D_OPACITY = {W.SEGMENT_LIVER: 0.03, W.SEGMENT_PERFUSED: 0.05, W.SEGMENT_TUMOR: 0.10, W.SEGMENT_VIABLE: 0.10,
                       W.SEGMENT_LUNGS: 0.03, W.SEGMENT_OTHER: 0.05, "": 0.05}
@@ -407,6 +411,7 @@ def showLayout(anatomy, functional, segmentationNode, fit=True, fusionOpacity=FU
         compositeNode.EndModify(wasModifying)
         if fit:
             sliceWidget.sliceController().fitSliceToBackground()
+    setSliceViewsLinked(True)
 
     viewNode = nodes["3d"]
     if viewNode is not None:
@@ -427,8 +432,25 @@ def showLayout(anatomy, functional, segmentationNode, fit=True, fusionOpacity=FU
     return nodes
 
 
+def setSliceViewsLinked(linked):
+    """Linked: scrolling, zooming and panning one slice view of the layout moves the others (the fused views follow
+    the reference views and back). Programmatic changes are not broadcast, so the per-view layers (SPECT/PET only in
+    the fused views) are kept."""
+    layoutManager = slicer.app.layoutManager()
+    if layoutManager is None:
+        return
+    for tag, _, _, _, _ in SLICE_VIEWS.values():
+        sliceWidget = layoutManager.sliceWidget(tag)
+        if sliceWidget is None:
+            continue
+        compositeNode = sliceWidget.mrmlSliceCompositeNode()
+        compositeNode.SetLinkedControl(linked)
+        compositeNode.SetHotLinkedControl(linked)   # follow continuously while dragging
+
+
 def showSegmentation(segmentationNode, nodes=None):
-    """Segments in the reference slice views (outline + fill, the segmentation's own settings) and as wireframe in
+    """Segments in the four slice views (outline + fill, the segmentation's own settings; the Segment Editor only
+    acts in views where the segmentation is shown, so the fused views need them too) and as wireframe in
     the 3D view. The previous view list of the segmentation is kept and restored by leaveLayout."""
     nodes = nodes or viewNodes()
     displayNode = _mainDisplayNode(segmentationNode)
@@ -439,9 +461,9 @@ def showSegmentation(segmentationNode, nodes=None):
     if not displayNode.GetAttribute(SAVED_FILL_ATTRIBUTE):
         displayNode.SetAttribute(SAVED_FILL_ATTRIBUTE, repr(displayNode.GetOpacity2DFill()))
     displayNode.SetOpacity2DFill(FILL_OPACITY_2D)
-    referenceViews = [nodes[key].GetID() for key in ("axialReference", "coronalReference") if nodes.get(key)]
-    if referenceViews:
-        displayNode.SetViewNodeIDs(referenceViews)
+    sliceViews = [nodes[key].GetID() for key in SLICE_VIEWS if nodes.get(key)]
+    if sliceViews:
+        displayNode.SetViewNodeIDs(sliceViews)
     displayNode.SetVisibility(True)
     displayNode.SetVisibility2D(True)
 
