@@ -3333,7 +3333,7 @@ class TaranisTest(ScriptedLoadableModuleTest):
         self.assertTrue(segtools.extendSegmentationGeometry(segmentationNode, ct, [ct, chestCT]))
 
     def test_segmentationLayout(self):
-        """Own views; segments in the four slice views and as wireframe in 3D; slice views linked; foreign renderings kept out;
+        """Own views; segments in the reference views, outlines in the fused views, wireframe in 3D; slice views linked; foreign renderings kept out;
         the segmentation's view list is restored when leaving."""
         import numpy as np
         ct = self._volume("CT", 0.0)
@@ -3353,7 +3353,18 @@ class TaranisTest(ScriptedLoadableModuleTest):
             self.assertIn(layoutManager.layout, V.SEGMENTATION_LAYOUT_IDS)   # single or dual monitor
             self.assertTrue(all(nodes[key] is not None for key in list(V.SLICE_VIEWS) + ["3d"]))
             main = segmentationNode.GetDisplayNode()
-            self.assertEqual(sorted(V._viewIDs(main)), sorted(nodes[key].GetID() for key in V.SLICE_VIEWS))
+            self.assertEqual(sorted(V._viewIDs(main)),
+                             sorted([nodes["axialReference"].GetID(), nodes["coronalReference"].GetID()]))
+            self.assertIs(segmentationNode.GetDisplayNode(), main)   # Fill between slices works with the first one
+            fused = V.fusedDisplayNode(segmentationNode, create=False)
+            self.assertEqual(sorted(V._viewIDs(fused)),
+                             sorted([nodes["axialFused"].GetID(), nodes["coronalFused"].GetID()]))
+            self.assertFalse(fused.GetVisibility2DFill())
+            self.assertTrue(fused.GetVisibility2DOutline())
+            main.SetSegmentVisibility(liverID, False)   # eye button / Fill between slices isolation
+            self.assertFalse(fused.GetSegmentVisibility(liverID))
+            main.SetSegmentVisibility(liverID, True)
+            self.assertTrue(fused.GetSegmentVisibility(liverID))
             for tag, _, _, _, _ in V.SLICE_VIEWS.values():
                 self.assertTrue(layoutManager.sliceWidget(tag).mrmlSliceCompositeNode().GetLinkedControl())
             V.styleSegmentation3D(segmentationNode, nodes["3d"].GetID(), {liverID: W.SEGMENT_LIVER}, set())
@@ -3370,6 +3381,7 @@ class TaranisTest(ScriptedLoadableModuleTest):
             layoutManager.setLayout(previousLayout)
         self.assertEqual(V._viewIDs(segmentationNode.GetDisplayNode()), [])   # all views again
         self.assertFalse(V.segmentation3DDisplayNode(segmentationNode, create=False).GetVisibility())
+        self.assertFalse(V.fusedDisplayNode(segmentationNode, create=False).GetVisibility())
 
     def test_lsfFromCase(self):
         """Image-based LSF of the case, lung mass from the CT, outdated when the segments change."""
