@@ -492,6 +492,8 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                          placeWindow=placeWindow)
             self._segLayoutSegmentation = segmentationNode
             self._style3D(force=True)
+            if self._editorShortcuts:
+                self.segmentEditorWidget.setupViewObservations()   # the layout's views did not exist before
         except Exception as e:
             logging.exception(f"Taranis: could not show the segmentation layout: {e}")
 
@@ -1840,9 +1842,11 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         try:
             if active:
                 editor.installKeyboardShortcuts()
+                editor.setupViewObservations()   # effects act in the slice views (as the Segment Editor module does)
             else:
                 editor.setActiveEffect(None)
                 editor.uninstallKeyboardShortcuts()
+                editor.removeViewObservations()
         except Exception as e:
             logging.warning(f"Taranis: Segment Editor shortcuts: {e}")
         self._editorShortcuts = active
@@ -3329,7 +3333,7 @@ class TaranisTest(ScriptedLoadableModuleTest):
         self.assertTrue(segtools.extendSegmentationGeometry(segmentationNode, ct, [ct, chestCT]))
 
     def test_segmentationLayout(self):
-        """Own views; segments in the reference views and as wireframe in 3D; foreign renderings kept out;
+        """Own views; segments in the four slice views and as wireframe in 3D; slice views linked; foreign renderings kept out;
         the segmentation's view list is restored when leaving."""
         import numpy as np
         ct = self._volume("CT", 0.0)
@@ -3349,8 +3353,9 @@ class TaranisTest(ScriptedLoadableModuleTest):
             self.assertIn(layoutManager.layout, V.SEGMENTATION_LAYOUT_IDS)   # single or dual monitor
             self.assertTrue(all(nodes[key] is not None for key in list(V.SLICE_VIEWS) + ["3d"]))
             main = segmentationNode.GetDisplayNode()
-            self.assertEqual(sorted(V._viewIDs(main)),
-                             sorted([nodes["axialReference"].GetID(), nodes["coronalReference"].GetID()]))
+            self.assertEqual(sorted(V._viewIDs(main)), sorted(nodes[key].GetID() for key in V.SLICE_VIEWS))
+            for tag, _, _, _, _ in V.SLICE_VIEWS.values():
+                self.assertTrue(layoutManager.sliceWidget(tag).mrmlSliceCompositeNode().GetLinkedControl())
             V.styleSegmentation3D(segmentationNode, nodes["3d"].GetID(), {liverID: W.SEGMENT_LIVER}, set())
             extra = V.segmentation3DDisplayNode(segmentationNode, create=False)
             self.assertEqual(V._viewIDs(extra), [nodes["3d"].GetID()])
