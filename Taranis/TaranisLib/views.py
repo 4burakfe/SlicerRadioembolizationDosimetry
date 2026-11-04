@@ -7,14 +7,17 @@ appears in their views.
     +-------------------+-------------------+-----------+
     | axial fused       | axial reference   |           |
     | (anatomy + SPECT) | + segments        |    3D     |
-    | + segments        |                   | segments  |
+    | + outlines        |                   | segments  |
     +-------------------+-------------------+ wireframe |
     | coronal fused     | coronal reference |           |
-    | + segments        | + segments        |           |
+    | + outlines        | + segments        |           |
     +-------------------+-------------------+-----------+
 
-The four slice views are linked (scrolling, zooming and panning one moves the others) and show the segments, so the
-embedded Segment Editor works in the fused views too (it only acts in views where the segmentation is shown).
+The four slice views are linked (scrolling, zooming and panning one moves the others) and all show the segments, so
+the embedded Segment Editor works in the fused views too (it only acts in views where the segmentation is shown).
+The fused views get outlines only, from an extra display node that follows the segment visibility of the main one
+(the main display node stays the segmentation's first one: the Segment Editor, Fill between slices included,
+works with it).
 
 Dual monitor (SEGMENTATION_DUAL_LAYOUT_ID): the four slice views (2 x 2) stay in the main window and the 3D view
 opens in its own window, maximized on the second screen. Same view nodes as the single monitor layout. The layout
@@ -27,6 +30,7 @@ import logging
 
 import qt
 import slicer
+import vtk
 
 from . import workflow as W
 
@@ -46,9 +50,11 @@ FUSION_OPACITY = 0.5
 FUNCTIONAL_COLORMAP = "Inferno"
 
 SEGMENTATION_3D_ATTRIBUTE = "Taranis.Segmentation3D"       # on the extra display node of the 3D view
+SEGMENTATION_FUSED_ATTRIBUTE = "Taranis.SegmentationFused" # on the extra display node of the fused views (outlines)
+EXTRA_DISPLAY_ATTRIBUTES = (SEGMENTATION_3D_ATTRIBUTE, SEGMENTATION_FUSED_ATTRIBUTE)
 SAVED_VIEWS_ATTRIBUTE = "Taranis.SavedViewNodeIDs"         # on the main display node while the layout is shown
 SAVED_FILL_ATTRIBUTE = "Taranis.SavedFillOpacity"          # idem: 2D fill opacity before the layout
-FILL_OPACITY_2D = 0.2                                      # segment fill in the slice views of the layout
+FILL_OPACITY_2D = 0.2                                      # segment fill in the reference slice views
 # Wireframe opacity per role, as in the dosimetry modules (dense meshes: low opacity)
 SEGMENT_3D_OPACITY = {W.SEGMENT_LIVER: 0.03, W.SEGMENT_PERFUSED: 0.05, W.SEGMENT_TUMOR: 0.10, W.SEGMENT_VIABLE: 0.10,
                       W.SEGMENT_LUNGS: 0.03, W.SEGMENT_OTHER: 0.05, "": 0.05}
@@ -367,9 +373,80 @@ def _mainDisplayNode(segmentationNode):
     segmentationNode.CreateDefaultDisplayNodes()
     for index in range(segmentationNode.GetNumberOfDisplayNodes()):
         displayNode = segmentationNode.GetNthDisplayNode(index)
-        if displayNode is not None and not displayNode.GetAttribute(SEGMENTATION_3D_ATTRIBUTE):
+        if displayNode is not None and not any(displayNode.GetAttribute(name) for name in EXTRA_DISPLAY_ATTRIBUTES):
             return displayNode
     return None
+
+
+def fusedDisplayNode(segmentationNode, create=True):
+    """Extra display node of the segmentation for the fused slice views: outlines only, so the SPECT/PET stays
+    readable. Created after the main display node, so it is never the segmentation's first display node."""
+    for index in range(segmentationNode.GetNumberOfDisplayNodes()):
+        displayNode = segmentationNode.GetNthDisplayNode(index)
+        if displayNode is not None and displayNode.GetAttribute(SEGMENTATION_FUSED_ATTRIBUTE):
+            return displayNode
+    if not create:
+        return None
+    _mainDisplayNode(segmentationNode)   # the main display node first
+    displayNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationDisplayNode", "Taranis segments fused")
+    displayNode.SetAttribute(SEGMENTATION_FUSED_ATTRIBUTE, "1")
+    segmentationNode.AddAndObserveDisplayNodeID(displayNode.GetID())
+    return displayNode
+
+
+_fusedSync = {}   # segmentation node ID -> (main display node, observer tag)
+
+
+def _syncFusedDisplay(mainDisplayNode, fused):
+    """The fused outlines follow the main display node: overall and per-segment visibility (eye buttons of the
+    segment list, the isolation for Fill between slices) and opacity (lowered by the auto-complete effects while
+    their preview is shown)."""
+    wasModifying = fused.StartModify()
+    fused.SetVisibility(mainDisplayNode.GetVisibility())
+    fused.SetVisibility2D(mainDisplayNode.GetVisibility2D())
+    fused.SetVisibility3D(False)
+    fused.SetVisibility2DFill(False)
+    fused.SetVisibility2DOutline(True)
+    fused.SetOpacity(mainDisplayNode.GetOpacity())
+    fused.SetOpacity2DOutline(mainDisplayNode.GetOpacity2DOutline())
+    fused.SetSliceIntersectionThickness(mainDisplayNode.GetSliceIntersectionThickness())
+    segmentationNode = mainDisplayNode.GetDisplayableNode()
+    segmentation = segmentationNode.GetSegmentation() if segmentationNode is not None else None
+    if segmentation is not None:
+        for index in range(segmentation.GetNumberOfSegments()):
+            segmentID = segmentation.GetNthSegmentID(index)
+            visible = mainDisplayNode.GetSegmentVisibility(segmentID)
+            if fused.GetSegmentVisibility(segmentID) != visible:
+                fused.SetSegmentVisibility(segmentID, visible)
+            outline = mainDisplayNode.GetSegmentVisibility2DOutline(segmentID)
+            if fused.GetSegmentVisibility2DOutline(segmentID) != outline:
+                fused.SetSegmentVisibility2DOutline(segmentID, outline)
+    fused.EndModify(wasModifying)
+
+
+def _observeMainDisplay(segmentationNode, mainDisplayNode, fused):
+    previous = _fusedSync.get(segmentationNode.GetID())
+    if previous is not None:
+        if previous[0] is mainDisplayNode:
+            return
+        _stopFusedSync(segmentationNode)
+
+    def onModified(caller, event, fusedID=fused.GetID()):
+        node = slicer.mrmlScene.GetNodeByID(fusedID)
+        if node is not None:
+            _syncFusedDisplay(caller, node)
+
+    _fusedSync[segmentationNode.GetID()] = (mainDisplayNode,
+                                            mainDisplayNode.AddObserver(vtk.vtkCommand.ModifiedEvent, onModified))
+
+
+def _stopFusedSync(segmentationNode):
+    previous = _fusedSync.pop(segmentationNode.GetID(), None)
+    if previous is not None:
+        try:
+            previous[0].RemoveObserver(previous[1])
+        except Exception:
+            pass
 
 
 def showLayout(anatomy, functional, segmentationNode, fit=True, fusionOpacity=FUSION_OPACITY, placeWindow=False):
@@ -449,8 +526,8 @@ def setSliceViewsLinked(linked):
 
 
 def showSegmentation(segmentationNode, nodes=None):
-    """Segments in the four slice views (outline + fill, the segmentation's own settings; the Segment Editor only
-    acts in views where the segmentation is shown, so the fused views need them too) and as wireframe in
+    """Segments in the reference slice views (outline + fill, the segmentation's own settings), as outlines in the
+    fused views (the Segment Editor only acts in views where the segmentation is shown) and as wireframe in
     the 3D view. The previous view list of the segmentation is kept and restored by leaveLayout."""
     nodes = nodes or viewNodes()
     displayNode = _mainDisplayNode(segmentationNode)
@@ -461,11 +538,17 @@ def showSegmentation(segmentationNode, nodes=None):
     if not displayNode.GetAttribute(SAVED_FILL_ATTRIBUTE):
         displayNode.SetAttribute(SAVED_FILL_ATTRIBUTE, repr(displayNode.GetOpacity2DFill()))
     displayNode.SetOpacity2DFill(FILL_OPACITY_2D)
-    sliceViews = [nodes[key].GetID() for key in SLICE_VIEWS if nodes.get(key)]
-    if sliceViews:
-        displayNode.SetViewNodeIDs(sliceViews)
+    referenceViews = [nodes[key].GetID() for key in ("axialReference", "coronalReference") if nodes.get(key)]
+    if referenceViews:
+        displayNode.SetViewNodeIDs(referenceViews)
     displayNode.SetVisibility(True)
     displayNode.SetVisibility2D(True)
+    fusedViews = [nodes[key].GetID() for key in ("axialFused", "coronalFused") if nodes.get(key)]
+    if fusedViews:
+        fused = fusedDisplayNode(segmentationNode)
+        fused.SetViewNodeIDs(fusedViews)
+        _syncFusedDisplay(displayNode, fused)
+        _observeMainDisplay(segmentationNode, displayNode, fused)
 
 
 def showBackground(volumeNode):
@@ -497,7 +580,7 @@ def resetThreeDView(viewNode, rotate=True):
 
 
 def leaveLayout(segmentationNode):
-    """Restore the segmentation's view list and hide the extra 3D display node (the layout stays as it is)."""
+    """Restore the segmentation's view list and hide the extra 3D and fused display nodes (the layout stays as it is)."""
     if segmentationNode is None or segmentationNode.GetScene() is None:
         return
     try:
@@ -513,5 +596,9 @@ def leaveLayout(segmentationNode):
         extra = segmentation3DDisplayNode(segmentationNode, create=False)
         if extra is not None:
             extra.SetVisibility(False)
+        _stopFusedSync(segmentationNode)
+        fused = fusedDisplayNode(segmentationNode, create=False)
+        if fused is not None:
+            fused.SetVisibility(False)
     except Exception as e:
         logging.warning(f"Taranis: could not restore the segmentation display: {e}")

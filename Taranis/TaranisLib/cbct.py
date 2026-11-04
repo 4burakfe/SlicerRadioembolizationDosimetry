@@ -1456,7 +1456,7 @@ def outlineSegments2D(segmentationNode, thickness=2):
     segmentationNode.CreateDefaultDisplayNodes()
     for index in range(segmentationNode.GetNumberOfDisplayNodes()):
         display = segmentationNode.GetNthDisplayNode(index)
-        if display is None or display.GetAttribute(PLANNING_3D_ATTRIBUTE) or display.GetAttribute("Taranis.Segmentation3D"):
+        if display is None or display.GetAttribute(PLANNING_3D_ATTRIBUTE) or display.GetAttribute("Taranis.Segmentation3D") or display.GetAttribute("Taranis.SegmentationFused"):
             continue
         display.SetVisibility2DFill(True)
         display.SetOpacity2DFill(0.0)
@@ -1582,7 +1582,7 @@ def _showInPlanningSliceViews(nodes):
             continue
         for index in range(node.GetNumberOfDisplayNodes()):
             display = node.GetNthDisplayNode(index)
-            if display is None or display.GetAttribute(PLANNING_3D_ATTRIBUTE) or                     display.GetAttribute("Taranis.Segmentation3D"):
+            if display is None or display.GetAttribute(PLANNING_3D_ATTRIBUTE) or                     display.GetAttribute("Taranis.Segmentation3D") or display.GetAttribute("Taranis.SegmentationFused"):
                 continue
             current = [display.GetNthViewNodeID(i) for i in range(display.GetNumberOfViewNodeIDs())]
             if current:   # empty: shown everywhere already
