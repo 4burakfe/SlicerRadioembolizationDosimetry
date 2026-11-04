@@ -607,6 +607,13 @@ class CBCTPlanningWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             if snapped.get(pointID) is not None and np.allclose(snapped[pointID], ras, atol=1e-3):
                 continue
             label = node.GetNthControlPointLabel(index)
+            exact = next((p for p in getattr(self, "_exactTips", []) if np.allclose(p, ras, atol=1e-3)), None)
+            if exact is not None:
+                # added from the feeder finder: already a centerline point, kept where it was previewed (snapping
+                # it along the 3D viewing line could move it onto a vessel in front of it)
+                self._exactTips.remove(exact)
+                snapped[pointID] = tuple(ras)
+                continue
             viewLine = None if C.placedOnSlice(ras) else C.viewLineThrough(ras)
             try:
                 target, distance = self.session.snapPlaced(ras, viewLine)
@@ -1181,7 +1188,17 @@ class CBCTPlanningWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             return
         node = C.markupsNode(self.store, REF_PLANNING_TIPS, create=True)
         self._observeTips()
-        node.AddControlPointWorld(vtk.vtkVector3d(*self._feeders[row]["ras"]))
+        ras = tuple(self._feeders[row]["ras"])
+        # the point is added where the preview shows it: _snapTips must not move it (it is not a click, and when it
+        # lies on no slice plane it would otherwise be snapped as a 3D-view click, onto the nearest vessel to the
+        # camera along the viewing line)
+        self._exactTips = getattr(self, "_exactTips", []) + [ras]
+        try:
+            index = node.AddControlPointWorld(vtk.vtkVector3d(*ras))
+            if index >= 0:
+                self._snappedTips[node.GetNthControlPointID(index)] = ras
+        finally:
+            self._exactTips = [p for p in self._exactTips if p is not ras]
         self.statusLabel.text = "Tip added: click 'Predict territories'."
 
     def _enhancementImage(self):
