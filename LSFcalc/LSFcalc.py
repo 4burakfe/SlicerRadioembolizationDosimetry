@@ -633,6 +633,37 @@ class SegmentComboBox:
             self._onChanged()
 
 
+class _BannerLabel(qt.QLabel):
+    """The extension banner, as wide as the module panel (aspect ratio kept, sharp on scaled displays)."""
+
+    def __init__(self, path):
+        qt.QLabel.__init__(self)
+        self._pixmap = qt.QPixmap(path)
+        self._shownWidth = -1
+        self.setAlignment(qt.Qt.AlignCenter)
+        self.setSizePolicy(qt.QSizePolicy.Ignored, qt.QSizePolicy.Fixed)
+        self.setMinimumWidth(1)
+        self.setFixedHeight(120)
+
+    def resizeEvent(self, event):
+        qt.QLabel.resizeEvent(self, event)
+        width = self.contentsRect().width()
+        if width < 20 or width == self._shownWidth or self._pixmap.isNull():
+            return
+        self._shownWidth = width
+        try:
+            ratio = float(self.devicePixelRatioF())
+        except Exception:
+            ratio = 1.0
+        scaled = self._pixmap.scaledToWidth(int(round(width * ratio)), qt.Qt.SmoothTransformation)
+        try:
+            scaled.setDevicePixelRatio(ratio)
+        except Exception:
+            pass
+        self.setFixedHeight(int(round(scaled.height() / ratio)))
+        self.setPixmap(scaled)
+
+
 class LSFcalcWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     NODE_REFERENCES = [("Spect", "spectSelector"), ("CT", "ctSelector"), ("Segmentation", "segmentationSelector"),
@@ -662,9 +693,7 @@ class LSFcalcWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if not os.path.exists(bannerPath):   # the banner ships with the main module (Taranis)
             bannerPath = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Taranis", "Resources", "Images", "banner.jpg")
         if os.path.exists(bannerPath):
-            bannerLabel = qt.QLabel()
-            bannerLabel.setPixmap(qt.QPixmap(bannerPath).scaledToWidth(400, qt.Qt.SmoothTransformation))
-            bannerLabel.setAlignment(qt.Qt.AlignCenter)
+            bannerLabel = _BannerLabel(bannerPath)     # as wide as the panel
             self.layout.addWidget(bannerLabel)
         else:
             logging.warning(f"Banner file not found at {bannerPath}")
