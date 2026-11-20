@@ -341,7 +341,7 @@ class TaranisWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         _startup()
         self.controller = WorkflowController.instance()
 
-        bannerPath = os.path.join(os.path.dirname(__file__), "Resources", "banner.png")
+        bannerPath = os.path.join(os.path.dirname(__file__), "Resources", "Images", "banner.jpg")
         if os.path.exists(bannerPath):
             banner = qt.QLabel()
             banner.setPixmap(qt.QPixmap(bannerPath).scaledToWidth(400, qt.Qt.SmoothTransformation))

@@ -658,7 +658,9 @@ class LSFcalcWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         ScriptedLoadableModuleWidget.setup(self)
         self.logic = LSFcalcLogic()
 
-        bannerPath = os.path.join(os.path.dirname(__file__), "Resources", "banner.png")
+        bannerPath = os.path.join(os.path.dirname(__file__), "Resources", "Images", "banner.jpg")
+        if not os.path.exists(bannerPath):   # the banner ships with the main module (Taranis)
+            bannerPath = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Taranis", "Resources", "Images", "banner.jpg")
         if os.path.exists(bannerPath):
             bannerLabel = qt.QLabel()
             bannerLabel.setPixmap(qt.QPixmap(bannerPath).scaledToWidth(400, qt.Qt.SmoothTransformation))

@@ -1,12 +1,12 @@
+<p align="center">
+  <img src="Branding/Taranis_banner.jpg" alt="Taranis: Radioembolization Dosimetry Suite" width="100%">
+</p>
+
 # Taranis: Open-Source Dosimetry Suite for Radioembolization
 
 Author: Burak Demir, MD, FEBNM
 
 Contact: 4burakfe@gmail.com
-
-![Banner](banner.png)
-
-
 
 **Taranis** is an open-source suite of Python modules for voxel-based liver radioembolization dosimetry, developed for use within [3D Slicer](https://www.slicer.org/) (5.12.4+).
 
