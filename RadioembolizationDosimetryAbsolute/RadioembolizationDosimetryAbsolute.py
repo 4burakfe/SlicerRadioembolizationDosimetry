@@ -847,6 +847,7 @@ class RadioembolizationDosimetryAbsoluteWidget(DosimetryWidgetBase):
         lungIDs = [sid for sid, c in inputs["categories"].items() if c == CATEGORY_LUNGS]
         lungVoxels = 0
         lungMask = None
+        densityArray = None   # voxel densities (g/mL) when the lungs have their own density
         if lungIDs:
             # dose = concentration x factor / density: voxels of the lungs (not also in the whole liver) get the lung
             # density instead of the liver density
@@ -857,6 +858,10 @@ class RadioembolizationDosimetryAbsoluteWidget(DosimetryWidgetBase):
             lungVoxels = int(np.count_nonzero(lungMask))
             if lungVoxels:
                 doseArray[lungMask] *= inputs["density"] / inputs["lungDensity"]
+                # Segment activities and masses come from the voxel masses: a segment that only partly covers
+                # the lungs (e.g. the whole field of view) must not take the lung voxels at the liver density
+                densityArray = np.full(doseArray.shape, inputs["density"], dtype=np.float32)
+                densityArray[lungMask] = inputs["lungDensity"]
         # Voxel S (experimental): the LDM map is convolved with the kernel scaled to the liver density; the lungs stay
         # at local deposition. The activity of the segments is always read from the LDM map.
         ldmArray = doseArray
@@ -878,10 +883,8 @@ class RadioembolizationDosimetryAbsoluteWidget(DosimetryWidgetBase):
         stats = self.logic.segmentStatistics(doseArray, inputs["segmentation"], inputs["spect"], voxelVolumeML,
                                              inputs["conversionFactor"], inputs["density"],
                                              inputs["liverID"], inputs["categories"],
-                                             activityDoseArray=ldmArray if voxelS else None)
-        for s in stats:  # lung activity from the lung density (LDM dose x mass / conversion factor)
-            if s["role"] == CATEGORY_LUNGS and np.isfinite(s["activityDose"]):
-                s["activity"] = s["activityDose"] * s["volume"] * inputs["lungDensity"] / inputs["conversionFactor"]
+                                             activityDoseArray=ldmArray if voxelS else None,
+                                             densityArray=densityArray)
 
         # Same (prepared) values as the dose map, so the QC numbers are consistent with it
         outsideFraction = countsOutsideMaskFraction(concentration, liverMask)
@@ -1008,10 +1011,13 @@ class RadioembolizationDosimetryAbsoluteWidget(DosimetryWidgetBase):
         # Segment dose table
         rows = list(firstRows)
         for s in stats:
-            density = inputs.get("lungDensity") if (s["role"] == CATEGORY_LUNGS and inputs.get("lungDensity")) \
-                else inputs["density"]
+            mass = s.get("mass")
+            if mass is None:
+                density = inputs.get("lungDensity") if (s["role"] == CATEGORY_LUNGS and inputs.get("lungDensity")) \
+                    else inputs["density"]
+                mass = s["volume"] * density
             rows.append((s["label"], s["roleLabel"], formatNumber(s["dose"]), formatNumber(s["volume"]),
-                         formatNumber(s["volume"] * density),
+                         formatNumber(mass),
                          formatNumber(s["activity"])))
         self._fillTable(self.segmentDoseTable, rows)
         self.resultNoteLabel.setText(qcNote)
@@ -1135,12 +1141,14 @@ class RadioembolizationDosimetryAbsoluteLogic(DosimetryLogicBase):
                 concentration, negativeVoxels)
 
     def segmentStatistics(self, doseArray, segmentationNode, referenceVolumeNode, voxelVolumeML,
-                          conversionFactor, densityGPerML, liverSegmentID, categories, activityDoseArray=None):
+                          conversionFactor, densityGPerML, liverSegmentID, categories, activityDoseArray=None,
+                          densityArray=None):
         """One dict per segment, plus 'All tumors (combined)' (union of the tumor segments, id None) when
         tumors are categorized; ordered by role. Keys: id, name, displayName, label, role, roleLabel, color,
         dose, volume, activity, activityDose (mean dose of the map the activity comes from) and doses (sorted
         voxel doses, empty if not on the image grid). activityDoseArray: the LDM map when doseArray is a voxel S
-        map (activities from local deposition)."""
+        map (activities from local deposition). densityArray: voxel densities (g/mL) when they differ (lungs);
+        doses are then mass weighted and activities/masses summed voxel by voxel (key mass, g)."""
         segmentation = segmentationNode.GetSegmentation()
         results = []
         tumorMask = None
@@ -1158,28 +1166,32 @@ class RadioembolizationDosimetryAbsoluteLogic(DosimetryLogicBase):
                 viableMask = mask.copy() if viableMask is None else (viableMask | mask)
             results.append(self._statisticsEntry(doseArray, mask, voxelVolumeML, conversionFactor, densityGPerML,
                                                  segmentID, name, role, tuple(segmentation.GetSegment(segmentID).GetColor()),
-                                                 activityDoseArray))
+                                                 activityDoseArray, densityArray))
         if tumorMask is not None:
             results.append(self._statisticsEntry(doseArray, tumorMask, voxelVolumeML, conversionFactor, densityGPerML,
-                                                 None, COMBINED_TUMORS_NAME, "tumors", COLOR_TUMOR, activityDoseArray))
+                                                 None, COMBINED_TUMORS_NAME, "tumors", COLOR_TUMOR, activityDoseArray,
+                                                 densityArray))
         if viableMask is not None:
             results.append(self._statisticsEntry(doseArray, viableMask, voxelVolumeML, conversionFactor, densityGPerML,
-                                                 None, COMBINED_VIABLE_NAME, "viables", COLOR_VIABLE, activityDoseArray))
+                                                 None, COMBINED_VIABLE_NAME, "viables", COLOR_VIABLE, activityDoseArray,
+                                                 densityArray))
         return sortResults(results)
 
     @staticmethod
     def _statisticsEntry(doseArray, mask, voxelVolumeML, conversionFactor, densityGPerML, segmentID, name, role, color,
-                         activityDoseArray=None):
+                         activityDoseArray=None, densityArray=None):
         dose, volume, activity = segmentDoseStatistics(doseArray, mask, voxelVolumeML, conversionFactor, densityGPerML,
-                                                       activityDoseArray)
-        activityDose = activity * conversionFactor / (volume * densityGPerML) if volume > 0 else float("nan")
+                                                       activityDoseArray, densityArray)
+        mass = segmentMassG(mask, voxelVolumeML, densityGPerML, densityArray)
+        activityDose = activity * conversionFactor / mass if mass > 0 else float("nan")
         modelled = volume > 0
         if not modelled:
             logging.warning(f"Segment '{name}' has no voxels on the image grid.")
         doses = np.sort(doseArray[mask]) if modelled else np.zeros(0)
         return {"id": segmentID, "name": name, "displayName": name, "label": name,
                 "role": role, "roleLabel": RESULT_ROLES[role][0], "color": color,
-                "dose": dose, "volume": volume, "activity": activity, "activityDose": activityDose, "doses": doses}
+                "dose": dose, "volume": volume, "mass": mass, "activity": activity, "activityDose": activityDose,
+                "doses": doses}
 
 class RadioembolizationDosimetryAbsoluteTest(ScriptedLoadableModuleTest):
     """Synthetic-data checks of the dose math ("Reload and Test" in developer mode)."""

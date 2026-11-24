@@ -255,19 +255,37 @@ def countsOutsideMaskFraction(counts, mask):
 
 
 def segmentDoseStatistics(doseArray, segmentMask, voxelVolumeML, conversionFactor, densityGPerML,
-                          activityDoseArray=None):
+                          activityDoseArray=None, densityArray=None):
     """Return (mean dose Gy, volume mL, activity MBq). Dose/activity are NaN for empty masks.
     activityDoseArray: the local deposition (LDM) dose map the activity is calculated from, when doseArray is not
-    one (voxel S: the energy of a voxel is spread to its neighbours, the activity stays where it is)."""
+    one (voxel S: the energy of a voxel is spread to its neighbours, the activity stays where it is).
+    densityArray: tissue density of every voxel (g/mL) when it is not the same everywhere (absolute mode: the lung
+    voxels have the lung density). The LDM dose of a voxel is activity x factor / its own mass, so the activity is
+    sum(LDM dose x voxel mass) / factor and the mean dose is mass weighted (absorbed energy / mass). With one density
+    (densityArray None) both reduce to the plain voxel mean."""
     nVoxels = int(np.count_nonzero(segmentMask))
     volumeML = nVoxels * voxelVolumeML
     if nVoxels == 0:
         return float("nan"), 0.0, float("nan")
-    meanDoseGy = float(np.mean(doseArray[segmentMask], dtype=np.float64))
-    activityDoseGy = meanDoseGy if activityDoseArray is None else \
-        float(np.mean(activityDoseArray[segmentMask], dtype=np.float64))
-    activityMBq = activityDoseGy * volumeML * densityGPerML / conversionFactor
+    ldm = doseArray if activityDoseArray is None else activityDoseArray
+    if densityArray is None:
+        meanDoseGy = float(np.mean(doseArray[segmentMask], dtype=np.float64))
+        activityDoseGy = meanDoseGy if activityDoseArray is None else \
+            float(np.mean(ldm[segmentMask], dtype=np.float64))
+        activityMBq = activityDoseGy * volumeML * densityGPerML / conversionFactor
+        return meanDoseGy, volumeML, activityMBq
+    rho = np.asarray(densityArray[segmentMask], dtype=np.float64)
+    massG = float(rho.sum()) * voxelVolumeML
+    meanDoseGy = float(np.dot(np.asarray(doseArray[segmentMask], dtype=np.float64), rho) / rho.sum())
+    activityMBq = float(np.dot(np.asarray(ldm[segmentMask], dtype=np.float64), rho)) * voxelVolumeML / conversionFactor
     return meanDoseGy, volumeML, activityMBq
+
+
+def segmentMassG(segmentMask, voxelVolumeML, densityGPerML, densityArray=None):
+    """Mass of a segment (g): volume x density, or the sum of the voxel masses with a density map."""
+    if densityArray is None:
+        return int(np.count_nonzero(segmentMask)) * voxelVolumeML * densityGPerML
+    return float(np.sum(densityArray[segmentMask], dtype=np.float64)) * voxelVolumeML
 
 
 def doseAtVolumePercent(sortedDosesAsc, volumePercent):
@@ -3552,6 +3570,7 @@ __all__ = [
     "negativeVoxelNote",
     "countsOutsideMaskFraction",
     "segmentDoseStatistics",
+    "segmentMassG",
     "doseAtVolumePercent",
     "volumePercentAtDose",
     "cumulativeDvh",
