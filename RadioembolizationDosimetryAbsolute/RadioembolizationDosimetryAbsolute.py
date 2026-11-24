@@ -952,7 +952,7 @@ class RadioembolizationDosimetryAbsoluteWidget(DosimetryWidgetBase):
             parameters.append(("Lung Density", f"{inputs['lungDensity']:.2f} g/mL (voxels of the lung segments)"))
         parameters.append(("Isodose set", inputs["isodosePreset"]))
         self._finishCalculation(inputs, stats, voxelVolumeML, liverMask, [], parameters, notes, qcNote,
-                                "Taranis - Absolute Quantification")
+                                "Absolute Quantification")
         if self.lastResult:   # stored with the results by _publishDoseChecks below
             self.lastResult["methodLines"] = DK.reportLines(inputs["doseMethod"], inputs["nuclide"])
         # dose check warnings first, then the lung density question
@@ -1271,6 +1271,28 @@ class RadioembolizationDosimetryAbsoluteTest(ScriptedLoadableModuleTest):
         assert png.hex()[:64] in rtf.replace("\n", "")
         assert rtf.index("Screenshots") < rtf.index("End of Report")
         rtf.encode("ascii")  # still pure ASCII
+        # banner on top of the report above the title, full text width, left aligned: a JPEG header of 400 x 100 px (only the frame header is read)
+        jpeg = (b"\xff\xd8" + b"\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+                + b"\xff\xc0\x00\x11\x08\x00\x64\x01\x90\x03" + b"\x01\x22\x00\x02\x11\x01\x03\x11\x01"
+                + b"\xff\xd9")
+        assert jpegSize(jpeg) == (400, 100)
+        rtf = buildRtfReport(["T"], [], [], banner=jpeg)
+        assert "\\ql\\sa160 {\\pict\\jpegblip\\picw400\\pich100\\picwgoal9638\\pichgoal2410" in rtf
+        assert rtf.index("jpegblip") < rtf.index("\\fs28 T")       # above the title
+        assert "jpegblip" not in buildRtfReport(["T"], [], [], banner=False)
+        html = buildHtmlReport(["T"], [], [], banner=jpeg)
+        assert "data:image/jpeg;base64," in html and html.index("<img") < html.index(">T<")
+        assert "width='698'" in html and "align='left'" in html
+        assert "<img" not in buildHtmlReport(["T"], [], [], banner=False)
+        assert reportBanner(b"not an image") is None                # a bad banner never breaks the report
+        # Parameters table: every cell left aligned, numbers too; the segment dose table keeps numbers right aligned
+        params = [("Half-life", "64.20 h"), ("Decay correction factor", "1.2958")]
+        doseRows = [("Liver", "Whole liver", "43.16", "1490.79", "1565.32", "1360.08")]
+        html = buildHtmlReport(["T"], params, doseRows, banner=False)
+        assert "<td align='left'>1.2958</td>" in html and "<th bgcolor='#dde4ed' align='left'>Value</th>" in html
+        assert "<td align='right'>43.16</td>" in html
+        rtf = buildRtfReport(["T"], params, doseRows, banner=False)
+        assert "\\ql\\fs18 1.2958\\cell" in rtf and "\\qr\\fs18 43.16\\cell" in rtf
         self.delayDisplay("Report screenshots OK")
 
     def test_segmentModelRoles(self):

@@ -352,16 +352,81 @@ def pngSize(pngBytes):
     return int.from_bytes(pngBytes[16:20], "big"), int.from_bytes(pngBytes[20:24], "big")
 
 
-def rtfPicture(pngBytes, maxWidthTwips=8600):
-    """RTF picture group for a PNG, scaled to at most maxWidthTwips wide (the default RTF text width is
-    8640 twips = 6 inch)."""
-    width, height = pngSize(pngBytes)
-    goalWidth = min(maxWidthTwips, width * 15)  # 15 twips per pixel at 96 dpi
-    goalHeight = int(round(goalWidth * height / max(width, 1)))
-    hexData = pngBytes.hex()
+def jpegSize(jpegBytes):
+    """(width, height) in pixels from the frame header (SOFn) of a JPEG."""
+    if jpegBytes[:2] != b"\xff\xd8":
+        raise ValueError("Not a JPEG image.")
+    i = 2
+    while i + 9 < len(jpegBytes):
+        if jpegBytes[i] != 0xFF:
+            raise ValueError("Corrupt JPEG header.")
+        marker = jpegBytes[i + 1]
+        if marker == 0xFF:                              # fill byte
+            i += 1
+            continue
+        if marker == 0x01 or 0xD0 <= marker <= 0xD8:    # markers without a length
+            i += 2
+            continue
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            return int.from_bytes(jpegBytes[i + 7:i + 9], "big"), int.from_bytes(jpegBytes[i + 5:i + 7], "big")
+        i += 2 + int.from_bytes(jpegBytes[i + 2:i + 4], "big")
+    raise ValueError("No JPEG frame header.")
+
+
+def imageSize(imageBytes):
+    """(width, height) in pixels of a PNG or JPEG."""
+    return jpegSize(imageBytes) if imageBytes[:2] == b"\xff\xd8" else pngSize(imageBytes)
+
+
+def imageMimeType(imageBytes):
+    return "image/jpeg" if imageBytes[:2] == b"\xff\xd8" else "image/png"
+
+
+def fitImageSize(width, height, maxWidth, maxHeight=None, nativeWidth=None):
+    """(width, height) scaled to at most maxWidth wide (and maxHeight high), never above nativeWidth; aspect kept."""
+    shownWidth = min(maxWidth, nativeWidth if nativeWidth is not None else maxWidth)
+    shownHeight = shownWidth * height / max(width, 1)
+    if maxHeight is not None and shownHeight > maxHeight:
+        shownWidth, shownHeight = shownWidth * maxHeight / shownHeight, maxHeight
+    return int(round(shownWidth)), int(round(shownHeight))
+
+
+def rtfPicture(imageBytes, maxWidthTwips=8600, maxHeightTwips=None, enlarge=False):
+    """RTF picture group for a PNG or JPEG, scaled to at most maxWidthTwips wide (the default RTF text width is
+    8640 twips = 6 inch) and maxHeightTwips high; enlarge also scales above its own size (96 dpi) up to that width."""
+    width, height = imageSize(imageBytes)
+    # 15 twips per pixel at 96 dpi
+    goalWidth, goalHeight = fitImageSize(width, height, maxWidthTwips, maxHeightTwips, None if enlarge else width * 15)
+    blip = "jpegblip" if imageBytes[:2] == b"\xff\xd8" else "pngblip"
+    hexData = imageBytes.hex()
     lines = "\n".join(hexData[i:i + 128] for i in range(0, len(hexData), 128))
-    return (r"{\pict\pngblip\picw%d\pich%d\picwgoal%d\pichgoal%d" % (width, height, goalWidth, goalHeight)
+    return (r"{\pict\%s\picw%d\pich%d\picwgoal%d\pichgoal%d" % (blip, width, height, goalWidth, goalHeight)
             + "\n" + lines + "}")
+
+
+# the report banner, on top of the RTF and PDF reports above the title: full text width, left aligned
+REPORT_BANNER_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                  "Resources", "Images", "report_banner.png")
+
+
+def reportBanner(banner=None):
+    """Banner image bytes for a report: banner=None reads REPORT_BANNER_PATH; False or b"" means no banner.
+    None when there is none or it cannot be read (the report is then written without it)."""
+    if banner is None:
+        try:
+            with open(REPORT_BANNER_PATH, "rb") as f:
+                banner = f.read()
+        except OSError as e:
+            logging.warning(f"Report banner not found ({e}); the report has no banner.")
+            return None
+    if not banner:
+        return None
+    try:
+        imageSize(banner)
+    except ValueError as e:
+        logging.warning(f"Report banner is not a PNG or JPEG ({e}); the report has no banner.")
+        return None
+    return banner
 
 
 def dicomValue(volumeNode, tag):
@@ -500,13 +565,22 @@ def metricTable(lines):
     return ["Segment", "Metric", "Value"], [[label, metric, value] for label, items in parsed for metric, value in items]
 
 
+PARAMETER_TABLE_HEADER = ["Parameter", "Value"]
+
+
+def _leftAlignedTable(header):
+    """The (Parameter | Value) table mixes text and numbers with units: all its cells are left aligned; the other
+    tables right-align their numbers."""
+    return list(header or []) == PARAMETER_TABLE_HEADER
+
+
 def reportBlocks(parameters, rows, notes=(), sections=(), patient=()):
     """The report content as blocks shared by the RTF and PDF writers:
     ("table", heading, header or None, rows) and ("text", heading, lines)."""
     blocks = []
     if patient:
         blocks.append(("table", "Patient", None, [[str(a), str(b)] for a, b in patient]))
-    blocks.append(("table", "Parameters", ["Parameter", "Value"], [[str(a), str(b)] for a, b in parameters]))
+    blocks.append(("table", "Parameters", list(PARAMETER_TABLE_HEADER), [[str(a), str(b)] for a, b in parameters]))
     header, table = segmentDoseTable(rows)
     blocks.append(("table", "Segment Doses", header, table))
     for section in sections:
@@ -571,8 +645,9 @@ def rtfColumnWidths(header, rows, total=RTF_PAGE_WIDTH_TWIPS):
 
 
 def rtfTable(header, rows):
-    """RTF table with a shaded, bold, repeated header row; numbers right-aligned."""
+    """RTF table with a shaded, bold, repeated header row; numbers right-aligned (except in the Parameters table)."""
     columns = header or (rows[0] if rows else [""])
+    leftOnly = _leftAlignedTable(header)
     widths = rtfColumnWidths(columns, rows)
     border = r"\clbrdrt\brdrs\brdrw6\brdrcf3\clbrdrl\brdrs\brdrw6\brdrcf3\clbrdrb\brdrs\brdrw6\brdrcf3" \
              r"\clbrdrr\brdrs\brdrw6\brdrcf3"
@@ -589,8 +664,12 @@ def rtfTable(header, rows):
         texts = []
         for col in range(len(widths)):
             text = str(cells[col]) if col < len(cells) else ""
-            align = r"\qr" if (header and col > 0 and not isHeader and _isNumeric(text)) else (r"\qc" if isHeader and col > 0
-                                                                                   else r"\ql")
+            if leftOnly or col == 0:
+                align = r"\ql"
+            elif isHeader:
+                align = r"\qc"
+            else:
+                align = r"\qr" if (header and _isNumeric(text)) else r"\ql"
             bold = isHeader or (not header and col == 0)   # header-less (label | value) tables: bold labels
             content = (r"{\b " + rtfEscape(text) + "}") if bold else rtfEscape(text)
             texts.append(r"\pard\intbl" + align + r"\fs18 " + content + r"\cell")
@@ -599,14 +678,18 @@ def rtfTable(header, rows):
     return "".join(out)
 
 
-def buildRtfReport(titleLines, parameters, rows, notes=(), sections=(), screenshots=(), patient=()):
+def buildRtfReport(titleLines, parameters, rows, notes=(), sections=(), screenshots=(), patient=(), banner=None):
     """parameters: (label, value) pairs; rows: (segment, category, dose, volume, mass, activity) strings (older
     results without mass: 5 values); notes: text lines; sections: (heading, [lines]) pairs after the segment
     doses (D / V / custom metric lines become tables as in the module); screenshots: (caption, pngBytes) pairs,
-    one per view, appended at the end of the report."""
+    one per view, appended at the end of the report; banner: image bytes above the title, page wide (None: the
+    Taranis report banner, False: none)."""
     parts = [r"{\rtf1\ansi\deff0{\fonttbl{\f0 Arial;}}"
              r"{\colortbl;\red0\green0\blue0;\red221\green228\blue237;\red140\green140\blue140;\red220\green0\blue0;}"
              r"\paperw11906\paperh16838\margl1134\margr1134\margt1134\margb1134\f0\fs20" + "\n"]
+    banner = reportBanner(banner)
+    if banner:
+        parts.append(r"\pard\ql\sa160 " + rtfPicture(banner, RTF_PAGE_WIDTH_TWIPS, enlarge=True) + r"\par" + "\n")
     parts.append(r"\pard\sa60{\b\fs28 " + r"\line ".join(rtfEscape(t) for t in titleLines) + r"}\par" + "\n")
     parts.append(r"\pard\sa120{\b\cf4 " + rtfEscape(REPORT_WARNING) + r"}\par" + "\n")   # colour 4: red
     parts.append(r"\pard\sa200 Generated: " + rtfEscape(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -643,10 +726,19 @@ PDF_FOOTER_MM = 7                  # page number line at the bottom of the print
 PDF_IMAGE_WIDTH_PX = int((210 - PDF_MARGINS_MM[0] - PDF_MARGINS_MM[2]) / 25.4 * PDF_RESOLUTION) - 4
 
 
-def buildHtmlReport(titleLines, parameters, rows, notes=(), sections=(), screenshots=(), patient=()):
+def buildHtmlReport(titleLines, parameters, rows, notes=(), sections=(), screenshots=(), patient=(), banner=None):
     """The report as HTML for Qt's rich text engine (PDF export): same content and tables as the RTF report."""
     import base64
-    out = ["<html><body style='font-family: Arial; font-size: 9pt;'>",
+    out = ["<html><body style='font-family: Arial; font-size: 9pt;'>"]
+    banner = reportBanner(banner)
+    if banner:
+        width, height = imageSize(banner)
+        shownWidth, shownHeight = fitImageSize(width, height, PDF_IMAGE_WIDTH_PX)
+        data = base64.b64encode(banner).decode("ascii")
+        out.append(f"<p align='left' style='margin-top: 0px; margin-bottom: 6px;'>"
+                   f"<img src='data:{imageMimeType(banner)};base64,{data}' width='{shownWidth}' "
+                   f"height='{shownHeight}'></p>")
+    out += [
            "<p style='font-size: 14pt; font-weight: bold; margin-bottom: 2px;'>"
            + "<br>".join(_html(t) for t in titleLines) + "</p>",
            f"<p style='color: #dc0000; font-weight: bold;'>{_html(REPORT_WARNING)}</p>",
@@ -657,15 +749,16 @@ def buildHtmlReport(titleLines, parameters, rows, notes=(), sections=(), screens
                    f"{_html(heading)}</p>")
         if kind == "table":
             header, table = block[2], block[3]
+            leftOnly = _leftAlignedTable(header)
             out.append("<table width='100%' border='1' cellspacing='0' cellpadding='3' "
                        "style='border-collapse: collapse; border-color: #8c8c8c;'>")
             if header:
                 out.append("<thead><tr>" + "".join(
-                    f"<th bgcolor='#dde4ed' align='{'left' if i == 0 else 'center'}'>{_html(h)}</th>"
+                    f"<th bgcolor='#dde4ed' align='{'left' if i == 0 or leftOnly else 'center'}'>{_html(h)}</th>"
                     for i, h in enumerate(header)) + "</tr></thead>")
             for cells in table:
                 out.append("<tr>" + "".join(
-                    f"<td align='{'right' if header and i > 0 and _isNumeric(c) else 'left'}'>"
+                    f"<td align='{'right' if header and not leftOnly and i > 0 and _isNumeric(c) else 'left'}'>"
                     + (f"<b>{_html(c)}</b>" if (not header and i == 0) else _html(c)) + "</td>"
                     for i, c in enumerate(cells)) + "</tr>")
             out.append("</table>")
@@ -676,8 +769,7 @@ def buildHtmlReport(titleLines, parameters, rows, notes=(), sections=(), screens
         out.append("<p style='page-break-before: always; font-size: 11pt; font-weight: bold;'>Screenshots</p>")
         for caption, pngBytes in screenshots:
             width, height = pngSize(pngBytes)
-            shownWidth = min(PDF_IMAGE_WIDTH_PX, width)
-            shownHeight = int(round(shownWidth * height / max(width, 1)))
+            shownWidth, shownHeight = fitImageSize(width, height, PDF_IMAGE_WIDTH_PX, nativeWidth=width)
             data = base64.b64encode(pngBytes).decode("ascii")
             out.append(f"<p style='margin-top: 10px;'><b>{_html(caption)}</b><br>"
                        f"<img src='data:image/png;base64,{data}' width='{shownWidth}' height='{shownHeight}'></p>")
@@ -2680,7 +2772,10 @@ class DosimetryWidgetBase(ScriptedLoadableModuleWidget):
             except Exception as e:
                 logging.warning(f"Could not read the patient information: {e}")
                 patient = []
-        content = ([self.lastResult["title"], "Radioembolization Dosimetry Report"], self.lastResult["parameters"],
+        # the banner above the title already says Taranis (older results still carry the "Taranis - " prefix)
+        title = self.lastResult["title"]
+        title = title[len("Taranis - "):] if title.startswith("Taranis - ") else title
+        content = ([f"{title} Dosimetry Report"], self.lastResult["parameters"],
                    self.lastResult["rows"], self.lastResult["notes"], sections, screenshots,
                    [tuple(p) for p in patient])
         with slicer.util.tryWithErrorDisplay("Could not save the report."):
@@ -3581,6 +3676,9 @@ __all__ = [
     "pngSize",
     "rtfPicture",
     "buildRtfReport",
+    "jpegSize",
+    "imageSize",
+    "reportBanner",
     "buildTsvTable",
     "dicomValue",
     "formatDicomName",

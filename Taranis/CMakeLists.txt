@@ -35,6 +35,7 @@ set(MODULE_PYTHON_RESOURCES
   Resources/Icons/SaveDicomSegments.png
   Resources/Icons/SaveDicomDose.png
   Resources/Images/banner.jpg
+  Resources/Images/report_banner.png
   Resources/Images/logo.png
   Resources/DoseKernels/90Y_64.10H_beta.io_processed.csv
   )

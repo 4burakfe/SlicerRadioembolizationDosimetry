@@ -1082,7 +1082,7 @@ class RadioembolizationDosimetryRelativeWidget(DosimetryWidgetBase):
             voxelS=voxelS, energyOutsidePerfusedFraction=energyOutside)
         notes, qcNote = self._withDoseChecks(notes, "\n".join(qcLines), checks)
         self._finishCalculation(inputs, stats, result["voxelVolumeML"], firstRows, parameters, notes,
-                                qcNote, "Taranis - Patient Relative Quantification")
+                                qcNote, "Patient Relative Quantification")
         if self.lastResult:   # stored with the results by _publishDoseChecks below
             self.lastResult["methodLines"] = DK.reportLines(inputs["doseMethod"], inputs["nuclide"])
         self._publishDoseChecks(checks)
