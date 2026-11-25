@@ -834,17 +834,79 @@ def _paintPdfPages(document, device):
         painter.end()
 
 
+def _reportDocument(html):
+    document = qt.QTextDocument()
+    document.setDefaultFont(qt.QFont("Arial", 9))
+    document.setDocumentMargin(0)   # the page margins are the only margins
+    # black text: painting the pages ourselves uses the application palette (white text in Slicer's dark theme)
+    document.setDefaultStyleSheet("body, p, table, tr, th, td, li, span, b, i { color: #000000; }")
+    document.setHtml(html)
+    return document
+
+
+REPORT_IMAGE_DPI = 150      # the report pages as images (DICOM secondary capture): A4 at this resolution
+
+
+def reportPageImages(html, folder, dpi=REPORT_IMAGE_DPI):
+    """The HTML report as A4 page images (PNG files in folder), laid out as in the PDF (same margins, page breaks
+    and page numbers); their paths."""
+    layoutDpi = float(PDF_RESOLUTION)
+    toLayout = layoutDpi / 25.4                                   # layout pixels per mm
+    left, top, right, bottom = PDF_MARGINS_MM
+    width = (210.0 - left - right) * toLayout
+    footer = PDF_FOOTER_MM * toLayout
+    bodyHeight = (297.0 - top - bottom) * toLayout - footer
+    zoom = dpi / layoutDpi
+    pagePixels = (int(round(210.0 / 25.4 * dpi)), int(round(297.0 / 25.4 * dpi)))
+
+    def pageImage():
+        image = qt.QImage(pagePixels[0], pagePixels[1], qt.QImage.Format_RGB32)
+        # the image's logical resolution is the layout's: fonts in points match the layout, the painter zooms
+        image.setDotsPerMeterX(int(round(layoutDpi / 0.0254)))
+        image.setDotsPerMeterY(int(round(layoutDpi / 0.0254)))
+        image.fill(qt.QColor(255, 255, 255))
+        return image
+
+    document = _reportDocument(html)
+    layoutDevice = pageImage()
+    document.documentLayout().setPaintDevice(layoutDevice)
+    document.setPageSize(qt.QSizeF(width, bodyHeight))
+    pageCount = max(1, document.pageCount())
+    font = qt.QFont("Arial", 8)
+    paths = []
+    for page in range(pageCount):
+        image = pageImage()
+        painter = qt.QPainter()
+        if not painter.begin(image):
+            raise RuntimeError("Could not draw the report page.")
+        try:
+            painter.setRenderHint(qt.QPainter.Antialiasing, True)
+            painter.setRenderHint(qt.QPainter.TextAntialiasing, True)
+            painter.setRenderHint(qt.QPainter.SmoothPixmapTransform, True)
+            painter.scale(zoom, zoom)
+            painter.translate(left * toLayout, top * toLayout)
+            painter.save()
+            painter.translate(0.0, -page * bodyHeight)
+            document.drawContents(painter, qt.QRectF(0.0, page * bodyHeight, width, bodyHeight))
+            painter.restore()
+            painter.setFont(font)
+            painter.setPen(qt.QColor(0, 0, 0))
+            painter.drawText(qt.QRectF(0.0, bodyHeight, width, footer),
+                             int(qt.Qt.AlignRight | qt.Qt.AlignVCenter), f"{page + 1} / {pageCount}")
+        finally:
+            painter.end()
+        path = os.path.join(folder, f"report_page{page + 1:02d}.png")
+        if not image.save(path, "PNG"):
+            raise RuntimeError(f"Could not write {path}")
+        paths.append(path)
+    return paths
+
+
 def writePdfReport(html, fileName):
     """Render the HTML report to an A4 PDF with Qt's rich text engine: 12 mm side margins, screenshots scaled to
     the text width (PDF_IMAGE_WIDTH_PX)."""
     def newDocument():
-        document = qt.QTextDocument()
-        document.setDefaultFont(qt.QFont("Arial", 9))
-        document.setDocumentMargin(0)   # the page margins are the only margins
-        # black text: painting the pages ourselves uses the application palette (white text in Slicer's dark theme)
-        document.setDefaultStyleSheet("body, p, table, tr, th, td, li, span, b, i { color: #000000; }")
-        document.setHtml(html)
-        return document
+        return _reportDocument(html)
 
     device = _pdfDevice(fileName)
     try:
@@ -2754,6 +2816,18 @@ class DosimetryWidgetBase(ScriptedLoadableModuleWidget):
             return
         if not fileName.lower().endswith(extension):
             fileName += extension
+        content = self.reportContent()
+        with slicer.util.tryWithErrorDisplay("Could not save the report."):
+            if fileFormat == "pdf":
+                writePdfReport(buildHtmlReport(*content), fileName)
+            else:
+                with open(fileName, "w", encoding="ascii", newline="") as f:  # pure ASCII after escaping
+                    f.write(buildRtfReport(*content))
+            self._recordSavedReport(fileName)
+            slicer.util.infoDisplay(f"{fileFormat.upper()} report saved successfully.")
+
+    def reportContent(self):
+        """The report of the last calculation, as the arguments of buildHtmlReport / buildRtfReport."""
         sections = [
             ("Dose calculation method", self.lastResult.get("methodLines") or []),   # empty: older results
             ("D values (minimum dose to the hottest x % of the volume)", self.lastResult["sections"]["D values"]),
@@ -2775,17 +2849,9 @@ class DosimetryWidgetBase(ScriptedLoadableModuleWidget):
         # the banner above the title already says Taranis (older results still carry the "Taranis - " prefix)
         title = self.lastResult["title"]
         title = title[len("Taranis - "):] if title.startswith("Taranis - ") else title
-        content = ([f"{title} Dosimetry Report"], self.lastResult["parameters"],
-                   self.lastResult["rows"], self.lastResult["notes"], sections, screenshots,
-                   [tuple(p) for p in patient])
-        with slicer.util.tryWithErrorDisplay("Could not save the report."):
-            if fileFormat == "pdf":
-                writePdfReport(buildHtmlReport(*content), fileName)
-            else:
-                with open(fileName, "w", encoding="ascii", newline="") as f:  # pure ASCII after escaping
-                    f.write(buildRtfReport(*content))
-            self._recordSavedReport(fileName)
-            slicer.util.infoDisplay(f"{fileFormat.upper()} report saved successfully.")
+        return ([f"{title} Dosimetry Report"], self.lastResult["parameters"],
+                self.lastResult["rows"], self.lastResult["notes"], sections, screenshots,
+                [tuple(p) for p in patient])
 
     def onExportTsvClicked(self):
         """Segment doses with their D and V values side by side, as a tab-separated file (last calculation)."""
@@ -3697,6 +3763,7 @@ __all__ = [
     "buildHtmlReport",
     "pdfExportAvailable",
     "writePdfReport",
+    "reportPageImages",
     "segmentVolumeML",
     "voxelVolumeMLFromNode",
     "segmentIsEmpty",

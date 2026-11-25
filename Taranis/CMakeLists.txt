@@ -19,6 +19,7 @@ set(MODULE_PYTHON_SCRIPTS
   TaranisLib/vascular.py
   TaranisLib/cbct.py
   TaranisLib/dicomexport.py
+  TaranisLib/capture.py
   TaranisLib/widgets.py
   TaranisLib/timing.py
   TaranisLib/toolbar.py

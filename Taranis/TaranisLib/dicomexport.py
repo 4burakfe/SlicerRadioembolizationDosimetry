@@ -445,3 +445,47 @@ def exportIcon(key, size=(143, 44)):
     if scale != 1:
         pixmap.setDevicePixelRatio(scale)
     return qt.QIcon(pixmap)
+
+
+EXPORT_TITLES = {"scene": "Scene", "segments": "Segments", "dose": "Dose Map"}
+
+
+def _advance(font, text):
+    metrics = qt.QFontMetrics(font)
+    return metrics.horizontalAdvance(text) if hasattr(metrics, "horizontalAdvance") else metrics.width(text)
+
+
+def exportTextIcon(key, height=44):
+    """The banner without its picture (narrow toolbars): "Save as DICOM:" over the object's name, on the same dark
+    rounded background. Returns (QIcon, width px)."""
+    scale = int(max(1, round(slicer.app.devicePixelRatio()))) if hasattr(slicer.app, 'devicePixelRatio') else 1
+    small, big = qt.QFont(), qt.QFont()
+    small.setPixelSize(max(8, int(height * 0.27)))
+    big.setPixelSize(max(10, int(height * 0.40)))
+    big.setBold(True)
+    title = EXPORT_TITLES[key]
+    textWidth = max(_advance(small, "Save as DICOM:"), _advance(big, title))
+    width = int(textWidth + 16)
+    pixmap = qt.QPixmap(width * scale, height * scale)
+    pixmap.fill(qt.QColor(0, 0, 0, 0))
+    painter = qt.QPainter(pixmap)
+    try:
+        painter.setRenderHint(qt.QPainter.Antialiasing)
+        painter.setRenderHint(qt.QPainter.TextAntialiasing)
+        painter.scale(scale, scale)
+        painter.setPen(qt.QPen(qt.QColor("#5a6269"), 1))
+        painter.setBrush(qt.QBrush(qt.QColor("#26292d")))
+        painter.drawRoundedRect(qt.QRectF(0.5, 0.5, width - 1, height - 1), 6, 6)
+        painter.setFont(small)
+        painter.setPen(qt.QColor("#d4d8dc"))
+        painter.drawText(qt.QRectF(8, 3, width - 16, height * 0.42), int(qt.Qt.AlignLeft | qt.Qt.AlignVCenter),
+                         "Save as DICOM:")
+        painter.setFont(big)
+        painter.setPen(qt.QColor("#2fd6c8"))
+        painter.drawText(qt.QRectF(8, height * 0.40, width - 16, height * 0.56),
+                         int(qt.Qt.AlignLeft | qt.Qt.AlignVCenter), title)
+    finally:
+        painter.end()
+    if scale != 1:
+        pixmap.setDevicePixelRatio(scale)
+    return qt.QIcon(pixmap), width

@@ -45,19 +45,22 @@ WIDTH_CHECK_INTERVAL_MS = 1000  # fallback polling of the window width (resize e
 # Compaction levels, tried in order until the toolbar fits in the width available to it.
 #   step: (text width or None = title width, explanation lines, show texts)  case: (max text width, lines)
 #   issues: (lines, show texts)  epona: (text width, lines, show texts)  exports: the "Save … as DICOM" buttons
-#   (else in the "⋯" menu)  fold: "Disable at startup" and "Close"
+#   with their pictures ("full"), as text only ("text"), else (False) in the "⋯" menu with the report and screenshot
+#   buttons  fold: "Disable at startup" and "Close"
 #   in the "⋯" menu  arrows: "›" between the steps  logo: Taranis logo
 COMPACT_LEVELS = [
     dict(step=(STEP_TEXT_WIDTH, 2, True), case=(CASE_TEXT_WIDTH_MAX, 1), issues=(1, True), epona=(150, 2, True),
-         exports=True, fold=False, arrows=True, logo=True),
+         exports="full", fold=False, arrows=True, logo=True),
     dict(step=(STEP_TEXT_WIDTH, 2, True), case=(200, 1), issues=(1, True), epona=(None, 0, True),
-         exports=True, fold=True, arrows=True, logo=True),
+         exports="full", fold=True, arrows=True, logo=True),
+    dict(step=(STEP_TEXT_WIDTH, 2, True), case=(200, 1), issues=(1, True), epona=(None, 0, True),
+         exports="text", fold=True, arrows=True, logo=True),
     dict(step=(125, 2, True), case=(160, 1), issues=(1, True), epona=(None, 0, True),
-         exports=True, fold=True, arrows=True, logo=True),
+         exports="text", fold=True, arrows=True, logo=True),
     dict(step=(None, 0, True), case=(140, 1), issues=(0, True), epona=(None, 0, False),
-         exports=True, fold=True, arrows=True, logo=True),
+         exports="text", fold=True, arrows=True, logo=True),
     dict(step=(None, 0, True), case=(110, 0), issues=(0, False), epona=(None, 0, False),
-         exports=True, fold=True, arrows=False, logo=False),
+         exports="text", fold=True, arrows=False, logo=False),
     dict(step=(None, 0, False), case=(90, 0), issues=(0, False), epona=(None, 0, False),
          exports=False, fold=True, arrows=False, logo=False),
 ]
@@ -339,10 +342,14 @@ class WorkflowToolbar:
         spacer.setSizePolicy(qt.QSizePolicy.Expanding, qt.QSizePolicy.Preferred)
         self.toolbar.addWidget(spacer)
 
+        # Report and screenshot: a small two-row block (left of the "Save as DICOM" buttons)
+        self._buildCaptureButtons()
+
         # Save as DICOM: scene, segments, dose map (left of "Disable at startup")
         from . import dicomexport as DX
         self.exportActions = []
         self.exportMenuActions = []
+        self.exportPictures = []    # (key, picture label, button): full banner or text only (_applyLevel)
         for key, function in (("scene", DX.saveSceneAsDicom),
                               ("segments", DX.saveSegmentsAsDicom),
                               ("dose", DX.saveDoseAsDicom)):
@@ -360,6 +367,8 @@ class WorkflowToolbar:
             button.connect("clicked()", lambda function=function: function())
             self.exportActions.append(self.toolbar.addWidget(button))
             button.setFixedSize(EXPORT_ICON_SIZE[0] + 6, min(BUTTON_HEIGHT, EXPORT_ICON_SIZE[1] + 6))
+            self.exportPictures.append((key, picture, button))
+        self._exportStyle = "full"
         self.exportSeparatorAction = self.toolbar.addSeparator()
 
         self.disableAtStartupButton = qt.QToolButton()
@@ -388,6 +397,18 @@ class WorkflowToolbar:
         self.optionsButton.setPopupMode(qt.QToolButton.InstantPopup)
         self.optionsMenu = qt.QMenu(self.optionsButton)
         self.optionsMenu.setToolTipsVisible(True)
+        from . import capture as CP
+        self.reportMenuActions = []
+        for label, function, isReport in (("Save report as PDF", lambda: CP.saveReportPdf(self.controller), True),
+                                          ("Save report as DICOM", lambda: CP.saveReportDicom(self.controller), True),
+                                          ("Screenshot to clipboard", CP.screenshotToClipboard, False),
+                                          ("Save screenshot as DICOM", lambda: CP.screenshotToDicom(self.controller),
+                                           False)):
+            action = self.optionsMenu.addAction(label)
+            action.connect("triggered()", lambda function=function: function())
+            if isReport:
+                self.reportMenuActions.append(action)
+        self.optionsMenu.addSeparator()
         for key, label, function in (("scene", "Save scene as DICOM", DX.saveSceneAsDicom),
                                      ("segments", "Save segments as DICOM", DX.saveSegmentsAsDicom),
                                      ("dose", "Save dose map as DICOM", DX.saveDoseAsDicom)):
@@ -420,6 +441,75 @@ class WorkflowToolbar:
         self.eponaAction = self.toolbar.addWidget(self.eponaButton.button)
         self.eponaSeparatorAction.setVisible(SHOW_EPONA)
         self.eponaAction.setVisible(SHOW_EPONA)
+
+    def _buildCaptureButtons(self):
+        """Report: PDF / DICOM (enabled once the dosimetry has results), Screenshot: Clipboard / DICOM; two rows in
+        the height of one toolbar button."""
+        from . import capture as CP
+        box = qt.QWidget()
+        grid = qt.QGridLayout(box)
+        grid.setContentsMargins(4, 0, 4, 0)
+        grid.setHorizontalSpacing(3)
+        grid.setVerticalSpacing(2)
+        self.reportButtons = []
+
+        def button(row, column, text, tip, function):
+            item = qt.QToolButton()
+            item.text = text
+            item.setToolTip(tip)
+            item.setAutoRaise(False)
+            item.setStyleSheet("QToolButton { font-size: 11px; padding: 1px 6px; }")
+            item.setFixedHeight(int((BUTTON_HEIGHT - 6) / 2))
+            item.setFocusPolicy(qt.Qt.NoFocus)
+            item.connect("clicked()", function)
+            grid.addWidget(item, row, column)
+            return item
+
+        for row, text in enumerate(("Report:", "Screenshot:")):
+            caption = qt.QLabel(text)
+            caption.setStyleSheet("QLabel { font-size: 11px; font-weight: bold; }")
+            grid.addWidget(caption, row, 0, qt.Qt.AlignRight | qt.Qt.AlignVCenter)
+        self.reportButtons.append(button(0, 1, "PDF", "Save the dosimetry report of the last calculation as a PDF",
+                                         lambda: CP.saveReportPdf(self.controller)))
+        self.reportButtons.append(button(
+            0, 2, "DICOM", "Save the dosimetry report as images (one per page) straight into the DICOM database, "
+                           "under the patient and study of the case's images",
+            lambda: CP.saveReportDicom(self.controller)))
+        button(1, 1, "Clipboard", "Copy a screenshot of the views to the clipboard", CP.screenshotToClipboard)
+        button(1, 2, "DICOM", "Save a screenshot of the views straight into the DICOM database, under the patient "
+                              "and study of the case's images", lambda: CP.screenshotToDicom(self.controller))
+        self.captureAction = self.toolbar.addWidget(box)
+        self.captureSeparatorAction = self.toolbar.addSeparator()
+        self.activeActions += [self.captureAction, self.captureSeparatorAction]
+        self._refreshCapture()
+
+    def _refreshCapture(self):
+        """The report buttons enabled once the dosimetry has results and PDF export is possible."""
+        from . import capture as CP
+        try:
+            available = CP.reportAvailable(self.controller)
+        except Exception as e:
+            logging.warning(f"Taranis: report availability: {e}")
+            available = False
+        tip = "" if available else " (run the dosimetry first)"
+        for item in getattr(self, "reportButtons", []) + getattr(self, "reportMenuActions", []):
+            item.enabled = available
+            item.setToolTip(item.toolTip.split(" (run the dosimetry first)")[0] + tip)
+
+    def _setExportStyle(self, style):
+        """The "Save as DICOM" buttons with their pictures ("full") or as text only ("text")."""
+        if style == getattr(self, "_exportStyle", None):
+            return
+        from . import dicomexport as DX
+        height = min(BUTTON_HEIGHT, EXPORT_ICON_SIZE[1] + 6)
+        for key, picture, button in self.exportPictures:
+            if style == "text":
+                icon, width = DX.exportTextIcon(key, EXPORT_ICON_SIZE[1])
+            else:
+                icon, width = DX.exportIcon(key, EXPORT_ICON_SIZE), EXPORT_ICON_SIZE[0]
+            picture.setPixmap(icon.pixmap(width, EXPORT_ICON_SIZE[1]))
+            button.setFixedSize(width + 6, height)
+        self._exportStyle = style
 
     def destroy(self):
         """Disconnect; the toolbar is hidden and replaced by the next instance (see _build)."""
@@ -507,6 +597,7 @@ class WorkflowToolbar:
             action.setVisible(active)
         if active:
             self._refreshActive(controller)
+        self._refreshCapture()
         self.updateLayout()
         self.applyVisibility()
 
@@ -655,8 +746,12 @@ class WorkflowToolbar:
             action.setVisible(active and spec["arrows"])
         self.logoAction.setVisible(spec["logo"])
         self.disableAction.setVisible(not spec["fold"])
+        if spec["exports"]:
+            self._setExportStyle(spec["exports"])
         for action in self.exportActions + [self.exportSeparatorAction]:
-            action.setVisible(spec["exports"])
+            action.setVisible(bool(spec["exports"]))
+        for action in (self.captureAction, self.captureSeparatorAction):
+            action.setVisible(active and bool(spec["exports"]))
         self.closeAction.setVisible(not spec["fold"])
         self.optionsAction.setVisible(spec["fold"] or not spec["exports"])
 
