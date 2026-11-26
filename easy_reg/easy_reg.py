@@ -21,9 +21,9 @@ MODULE_VERSION = "2.2"
 # Each chain starts with the simpler stages, so the later stages start from a good alignment.
 METHODS = [
     ("Rigid", "Rigid", True,
-     "Rotation and translation only. Recommended default: the images are not distorted."),
+     "Rotation and translation only: the images are not distorted."),
     ("Affine", "Rigid,Affine", True,
-     "Rigid, then affine (adds scaling and shearing). Compensates small size/scale differences."),
+     "Rigid, then affine (adds scaling and shearing). Compensates small size/scale differences. Default."),
     ("Deformable", "Rigid,Deformable", False,
      "Rigid first, then deformable (B-spline) passes to fine-tune: a coarse-to-fine grid of control points, each "
      "pass kept only if it improves the match. Compensates breathing and organ shape differences. "
@@ -32,6 +32,10 @@ METHODS = [
 # The BRAINSFit B-spline registration was removed (unacceptably slow, >10 GB of memory even at 0.2 % sampling).
 # "Deformable" is the multi-resolution engine's iterative B-spline stage (sitkreg), stored as a grid transform.
 DEFORMABLE_METHOD = "Deformable"
+DEFAULT_METHOD = "Affine"          # (user 2026-11-27; was Rigid)
+# Defaults of this module (user 2026-11-27), kept apart from sitkreg's shared defaults
+DEFAULT_FINAL_SPACING_MM = 4.0
+DEFAULT_GRID_SPACING_MM = 30.0
 METHOD_BY_NAME = {name: (chain, linear, text) for name, chain, linear, text in METHODS}
 
 # Functional-only path (a SPECT/PET without its own CT registered directly to the reference CT/MRI)
@@ -56,8 +60,8 @@ FUNCTIONAL_VIEWS = [("Reference", "reference", None), ("SPECT / PET", "spect", N
 def isRigidMethod(method):
     return bool(method) and not any(name in method for name in NON_RIGID_METHODS)
 
-# (label, BRAINSFit samplingPercentage). The multi-resolution engine uses the same labels with a fixed number of
-# metric samples per level (sitkreg.QUALITY_SAMPLES).
+# (label, BRAINSFit samplingPercentage). The multi-resolution engine uses the same labels as a fraction of each
+# level's voxels (sitkreg.QUALITY_PERCENT, samplingMode SAMPLING_PERCENT; at least sitkreg.MIN_LEVEL_SAMPLES).
 QUALITY_PRESETS = [("Fast", 0.002), ("Standard", 0.01), ("Thorough", 0.05)]
 INIT_SEARCH_MODE = "search"
 # (label, BRAINSFit initializeTransformMode or INIT_SEARCH_MODE)
@@ -94,7 +98,7 @@ def qualityLabelFor(samplingPercentage):
 
 def qualityText(label, engine):
     if engine == ENGINE_MULTIRES:
-        return f"{label} ({SR.QUALITY_SAMPLES[label] // 1000}k samples per level)"
+        return f"{label} ({100 * SR.QUALITY_PERCENT[label]:g} %)"
     return f"{label} ({100 * dict(QUALITY_PRESETS)[label]:g}% of voxels sampled)"
 
 
@@ -861,13 +865,13 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.methodGroup.addButton(button)
             self.methodButtons[name] = button
             methodColumn.addWidget(button)
-        self.methodButtons["Rigid"].setChecked(True)
+        self.methodButtons[DEFAULT_METHOD].setChecked(True)
         registerLayout.addRow("Method: ", methodColumn)
 
         self.gridSpacingComboBox = qt.QComboBox()
         for label, spacing in SR.GRID_SPACING_CHOICES:
-            self.gridSpacingComboBox.addItem(label, f"{spacing:g}")
-        self.gridSpacingComboBox.setCurrentIndex(self.gridSpacingComboBox.findData(f"{SR.DEFAULT_GRID_SPACING_MM:g}"))
+            self.gridSpacingComboBox.addItem(label.split(" (")[0], f"{spacing:g}")
+        self.gridSpacingComboBox.setCurrentIndex(self.gridSpacingComboBox.findData(f"{DEFAULT_GRID_SPACING_MM:g}"))
         self.gridSpacingComboBox.setToolTip(
             "Distance between the control points of the last deformable pass. A coarser grid is stiffer (whole-organ "
             "differences only); a finer grid follows local differences but can distort the image. The run time grows "
@@ -896,7 +900,9 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.qualityComboBox = qt.QComboBox()
         for label, _ in QUALITY_PRESETS:
             self.qualityComboBox.addItem(label, label)
-        self.qualityComboBox.setToolTip("More samples are more robust but slower.")
+        self.qualityComboBox.setToolTip(
+            "Metric sample points, as a share of each level's voxels (all stages: rigid, affine, deformable). More "
+            "samples are more robust but slower.")
         registerLayout.addRow("Quality: ", self.qualityComboBox)
 
         self.finalSpacingComboBox = self._makeFinalSpacingComboBox()
@@ -1181,8 +1187,8 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def _makeFinalSpacingComboBox():
         comboBox = qt.QComboBox()
         for label, spacing in SR.FINAL_SPACING_CHOICES:
-            comboBox.addItem(label, f"{spacing:g}")
-        comboBox.setCurrentIndex(comboBox.findData(f"{SR.DEFAULT_FINAL_SPACING_MM:g}"))
+            comboBox.addItem(label.split(" (")[0], f"{spacing:g}")
+        comboBox.setCurrentIndex(comboBox.findData(f"{DEFAULT_FINAL_SPACING_MM:g}"))
         comboBox.setToolTip(
             "Voxel size of the last (finest) step of the multi-resolution registration; the steps before it run at "
             "about 16, 8, 4 ... mm.\n"
@@ -1191,7 +1197,7 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             "1 mm: for CBCT or small ROIs around the liver. Without ROIs the resolution is coarsened automatically "
             "when the images would not fit in memory.\n"
             "A finer final step does not make a SPECT/PET sharper: an image is never resampled below its own voxel "
-            "size. The run time depends little on it (a fixed number of samples per step).")
+            "size. A finer final step takes longer (the samples are a share of each step's voxels).")
         return comboBox
 
     def currentEngine(self):
@@ -1746,7 +1752,7 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 reference, spect, liverSegmentation, liverSegmentID, self.maskMarginSpinBox.value,
                 dict(QUALITY_PRESETS)[self.refineQualityComboBox.currentData],
                 followers=self._functionalFollowers(), onFinished=self.onRefineFinished, engine=self.currentEngine(),
-                finalSpacingMm=float(self.refineFinalSpacingComboBox.currentData or SR.DEFAULT_FINAL_SPACING_MM),
+                finalSpacingMm=float(self.refineFinalSpacingComboBox.currentData or DEFAULT_FINAL_SPACING_MM),
                 quality=self.refineQualityComboBox.currentData, progress=self._onProgress)
         except (ValueError, RuntimeError) as error:
             self._elapsedTimer.stop()
@@ -2004,9 +2010,9 @@ class easy_regWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 followers=[node for node in (spect, segmentation) if node is not None],
                 hardenRigid=self.hardenRigidCheckBox.checked,
                 onFinished=self.onRegistrationFinished, engine=engine,
-                finalSpacingMm=float(self.finalSpacingComboBox.currentData or SR.DEFAULT_FINAL_SPACING_MM),
+                finalSpacingMm=float(self.finalSpacingComboBox.currentData or DEFAULT_FINAL_SPACING_MM),
                 quality=self.qualityComboBox.currentData, progress=self._onProgress,
-                gridSpacingMm=float(self.gridSpacingComboBox.currentData or SR.DEFAULT_GRID_SPACING_MM),
+                gridSpacingMm=float(self.gridSpacingComboBox.currentData or DEFAULT_GRID_SPACING_MM),
                 deformablePasses=self.passesSpinBox.value, deformableIterations=self.iterationsSpinBox.value)
         except (ValueError, RuntimeError) as error:
             self._elapsedTimer.stop()
@@ -2301,11 +2307,11 @@ class easy_regLogic(ScriptedLoadableModuleLogic):
         self.job = None
 
     def setDefaultParameters(self, parameterNode):
-        defaults = {"Method": "Rigid", "Path": PATH_HYBRID, "Quality": "Standard", "Initialization": "useGeometryAlign",
+        defaults = {"Method": DEFAULT_METHOD, "Path": PATH_HYBRID, "Quality": "Standard", "Initialization": "useGeometryAlign",
                     "HardenRigid": "false", "SplineGridSize": ",".join(str(v) for v in DEFAULT_SPLINE_GRID),
-                    "Engine": DEFAULT_ENGINE, "FinalSpacing": f"{SR.DEFAULT_FINAL_SPACING_MM:g}",
-                    "RefineFinalSpacing": f"{SR.DEFAULT_FINAL_SPACING_MM:g}", "RefineQuality": "Thorough",
-                    "GridSpacing": f"{SR.DEFAULT_GRID_SPACING_MM:g}",
+                    "Engine": DEFAULT_ENGINE, "FinalSpacing": f"{DEFAULT_FINAL_SPACING_MM:g}",
+                    "RefineFinalSpacing": f"{DEFAULT_FINAL_SPACING_MM:g}", "RefineQuality": "Thorough",
+                    "GridSpacing": f"{DEFAULT_GRID_SPACING_MM:g}",
                     "DeformablePasses": str(SR.DEFAULT_DEFORMABLE_PASSES),
                     "DeformableIterations": str(SR.DEFORMABLE_ITERATIONS)}
         for name, value in defaults.items():
@@ -2342,8 +2348,8 @@ class easy_regLogic(ScriptedLoadableModuleLogic):
                           initializeMode="useGeometryAlign", fixedRoi=None, movingRoi=None, followers=(),
                           splineGridSize=DEFAULT_SPLINE_GRID, hardenRigid=False, onFinished=None, wait=False,
                           fixedMask=None, preprocessMoving=False, temporaryNodes=None, engine=DEFAULT_ENGINE,
-                          finalSpacingMm=SR.DEFAULT_FINAL_SPACING_MM, quality=None, progress=None,
-                          gridSpacingMm=SR.DEFAULT_GRID_SPACING_MM, deformablePasses=SR.DEFAULT_DEFORMABLE_PASSES,
+                          finalSpacingMm=DEFAULT_FINAL_SPACING_MM, quality=None, progress=None,
+                          gridSpacingMm=DEFAULT_GRID_SPACING_MM, deformablePasses=SR.DEFAULT_DEFORMABLE_PASSES,
                           deformableIterations=SR.DEFORMABLE_ITERATIONS):
         """Register movingVolume to fixedVolume and apply the result to movingVolume and the followers.
         engine ENGINE_MULTIRES: SimpleITK multi-resolution registration (sitkreg), run inside this call; finalSpacingMm
@@ -2452,7 +2458,7 @@ class easy_regLogic(ScriptedLoadableModuleLogic):
 
     def _runMultiresolution(self, fixedVolume, movingVolume, method, transformType, initializeMode, fixedRoi,
                             movingRoi, followers, hardenRigid, onFinished, fixedMask, functionalMoving,
-                            temporaryNodes, finalSpacingMm, quality, progress, gridSpacingMm=SR.DEFAULT_GRID_SPACING_MM,
+                            temporaryNodes, finalSpacingMm, quality, progress, gridSpacingMm=DEFAULT_GRID_SPACING_MM,
                             deformablePasses=SR.DEFAULT_DEFORMABLE_PASSES,
                             deformableIterations=SR.DEFORMABLE_ITERATIONS):
         """SimpleITK multi-resolution registration (EasyRegLib.sitkreg), inside this call. The images are read in
@@ -2498,7 +2504,8 @@ class easy_regLogic(ScriptedLoadableModuleLogic):
             result = SR.register(images[0], images[1], initialMatrix, kind, finalSpacingMm, quality, mask,
                                  initialization, progress=progress, isCancelled=lambda: job["cancelRequested"],
                                  deformable=deformable, gridSpacingMm=gridSpacingMm, passes=deformablePasses,
-                                 fieldGeometry=fieldGeometry, deformableIterations=deformableIterations)
+                                 fieldGeometry=fieldGeometry, deformableIterations=deformableIterations,
+                                 samplingMode=SR.SAMPLING_PERCENT)
         except SR.RegistrationCancelled:
             return self._finishMultiresolution("cancelled")
         except Exception as error:
@@ -2843,7 +2850,7 @@ class easy_regLogic(ScriptedLoadableModuleLogic):
 
     def refineInLiver(self, fixedVolume, movingVolume, liverSegmentation, liverSegmentID, marginMm,
                       samplingPercentage, followers=(), onFinished=None, wait=False, engine=DEFAULT_ENGINE,
-                      finalSpacingMm=SR.DEFAULT_FINAL_SPACING_MM, quality=None, progress=None):
+                      finalSpacingMm=DEFAULT_FINAL_SPACING_MM, quality=None, progress=None):
         """Rigid mutual-information registration restricted to the dilated liver of the reference, starting from
         the current alignment. Affine / deformable are not offered for functional-only registration."""
         if liverSegmentation is None or not liverSegmentID:

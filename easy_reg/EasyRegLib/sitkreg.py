@@ -1,4 +1,7 @@
 """Multi-resolution rigid / affine registration for EasyReg (numpy + scipy + SimpleITK; no Slicer scene).
+The same engine as DICOMGatedDynamicPETLib/sitkreg.py of the PET4D extension (same author, MIT): keep the two copies in
+step when the engine changes (synced 2026-11-27: bounded B-spline passes, mask-only folding check, optional
+levels / grid scaling / percent sampling / per-iteration callback used by the PET4D Neuro normalization).
 
 Pipeline (register()):
   1. Both images are brought onto an (almost) isotropic working grid with the final resolution chosen by the user
@@ -64,7 +67,13 @@ MIN_LEVEL_VOXELS = 8              # a level is dropped when the image would have
 MAX_WORKING_VOXELS = 40_000_000   # per image; above this the final resolution is coarsened (memory)
 
 # Quality: number of metric samples per level
-QUALITY_SAMPLES = {"Fast": 20_000, "Standard": 60_000, "Thorough": 200_000}
+QUALITY_SAMPLES = {"Fastest": 8_000, "Fast": 20_000, "Standard": 60_000, "Thorough": 200_000}
+# Quality as a fraction of the voxels of each level (register(samplingMode=SAMPLING_PERCENT), e.g. the Neuro
+# normalization): coarse levels get fewer samples than fine ones, at least MIN_LEVEL_SAMPLES (or all voxels)
+SAMPLING_COUNT = "count"
+SAMPLING_PERCENT = "percent"
+QUALITY_PERCENT = {"Fastest": 0.003, "Fast": 0.01, "Standard": 0.03, "Thorough": 0.10}
+MIN_LEVEL_SAMPLES = 5_000
 DEFAULT_QUALITY = "Standard"
 EVALUATION_SAMPLES = 200_000      # samples for the before / after comparison
 HISTOGRAM_BINS = 32
@@ -96,6 +105,7 @@ GRID_SPACING_CHOICES = [
     ("50 mm (recommended; liver)", 50.0),
     ("30 mm (flexible; local differences)", 30.0),
     ("20 mm (very flexible; check for distortion)", 20.0),
+    ("10 mm (most flexible; check for distortion)", 10.0),
 ]
 DEFAULT_GRID_SPACING_MM = 50.0
 DEFAULT_DEFORMABLE_PASSES = 3     # control-point spacing halves from pass to pass, ending at the chosen spacing
@@ -104,9 +114,18 @@ DEFORMABLE_MIN_SPACING_MM = 2.0   # image resolution of a pass: grid spacing / 8
 DEFORMABLE_MAX_SPACING_MM = 8.0
 DEFORMABLE_ITERATIONS = 25        # most L-BFGS-B iterations per pass and level (a pass usually converges earlier)
 MIN_DEFORMABLE_ITERATIONS = 10
+DEFORMABLE_CORRECTIONS = 5        # L-BFGS-B memory (corrections kept for the Hessian approximation)
 MAX_DEFORMABLE_ITERATIONS = 200
 FOREGROUND_FRACTION = 0.1         # body (no mask): voxels above 10 % of the reference's intensity range
+# Each control point of a pass moves at most this fraction of the control-point spacing (L-BFGS-B bounds): below
+# about 0.4 a cubic B-spline cannot fold (Choi & Lee, 2000; Rueckert et al., 2006), so a pass is no longer fitted
+# to a folding deformation and then dropped as a whole (as happened without a bound)
+MAX_CONTROL_POINT_SHIFT = 0.4
 MIN_JACOBIAN = 0.1                # a pass that compresses any region below this volume ratio (or folds it) is dropped
+# A pass that folds is not dropped at once: its control-point shifts are scaled down by these factors in turn and the
+# first scaled pass that no longer folds and still improves the metric is kept (the bounded runs of a scaled grid can
+# fold together although each alone cannot)
+FOLD_BACKOFF_SCALES = (0.5, 0.25)
 FIELD_SPACING_MM = 4.0            # displacement field grid (coarsened when larger than MAX_FIELD_VOXELS)
 MAX_FIELD_VOXELS = 4_000_000
 
@@ -306,13 +325,22 @@ def smoothingSigmas(factors, spacingMm):
     return [0.5 * spacingMm * f if f > 1 else 0.0 for f in factors]
 
 
+class SampleFraction(float):
+    """A quality given as a fraction of each level's voxels (SAMPLING_PERCENT) instead of a number of samples."""
+
+
 def samplingPercentages(factors, voxelCount, samples):
     """Sampling fraction per level giving about `samples` metric samples (voxelCount: voxels of the working image,
-    or of the mask, at full resolution)."""
+    or of the mask, at full resolution). samples a SampleFraction: that fraction of each level's voxels, but at
+    least MIN_LEVEL_SAMPLES samples."""
     result = []
     for f in factors:
         count = max(1.0, voxelCount / float(f ** 3))
-        result.append(float(min(1.0, max(1e-4, samples / count))))
+        if isinstance(samples, SampleFraction):
+            wanted = max(float(samples), MIN_LEVEL_SAMPLES / count)
+        else:
+            wanted = samples / count
+        result.append(float(min(1.0, max(1e-4, wanted))))
     return result
 
 
@@ -502,8 +530,9 @@ def _stop(method):
 
 
 def runStage(fixedImage, movingImage, matrix, kind, centreLps, spacingMm, factors, voxelCount, samples,
-             fixedMask=None, progress=None, isCancelled=None, label=""):
-    """One optimisation stage (rigid or affine) over the pyramid levels. Returns (matrix, stop condition)."""
+             fixedMask=None, progress=None, isCancelled=None, label="", step=None):
+    """One optimisation stage (rigid or affine) over the pyramid levels. Returns (matrix, stop condition).
+    step(level index, iteration, metric), when given, is called at each iteration instead of the progress text."""
     import SimpleITK as sitk
     method = _method(samples, voxelCount, factors, fixedMask)
     # initial step of each level (mm); halved whenever the direction changes, down to minStep
@@ -524,7 +553,9 @@ def runStage(fixedImage, movingImage, matrix, kind, centreLps, spacingMm, factor
             state["cancelled"] = True
             _stop(method)
             return
-        if progress is not None:
+        if step is not None:
+            step(method.GetCurrentLevel(), method.GetOptimizerIteration(), method.GetMetricValue())
+        elif progress is not None:
             level = method.GetCurrentLevel()
             levelMm = spacingMm * factors[min(level, len(factors) - 1)]
             progress(f"{label}level {level + 1} of {len(factors)} ({levelMm:g} mm), iteration "
@@ -537,6 +568,10 @@ def runStage(fixedImage, movingImage, matrix, kind, centreLps, spacingMm, factor
         if state["cancelled"]:
             raise RegistrationCancelled()
         raise
+    finally:
+        # onIteration holds the method and the method holds onIteration through a C++ command, a cycle the
+        # garbage collector cannot see: without this every run leaks the method (and its images and masks)
+        method.RemoveAllCommands()
     if state["cancelled"]:
         raise RegistrationCancelled()
     return matrixFromSitk(transform), method.GetOptimizerStopConditionDescription()
@@ -593,6 +628,37 @@ def deformableShrink(gridSpacingMm, spacingMm, shape):
     while factor > 1 and min(shape) / factor < MIN_LEVEL_VOXELS:
         factor -= 1
     return factor
+
+
+def deformableLevels(levelsMm, spacingMm, shape):
+    """Shrink factors (coarse to fine) of the working images for the image sizes levelsMm (e.g. 8, 4, 2 mm): each
+    rounded to a whole factor of spacingMm (at least 1), levels with fewer than MIN_LEVEL_VOXELS along an axis and
+    repeats dropped. The last level may be coarser than the working images (e.g. 2 mm on 1 mm images)."""
+    factors = []
+    for mm in sorted((float(v) for v in levelsMm), reverse=True):
+        factor = max(1, int(round(mm / spacingMm)))
+        if min(shape) / factor < MIN_LEVEL_VOXELS or (factors and factor >= factors[-1]):
+            continue
+        factors.append(factor)
+    return factors or [1]
+
+
+def deformableFactors(gridSpacingMm, spacingMm, shape, coarse=True, levelsMm=None):
+    """Shrink factors (coarse to fine) of the levels of a deformable pass: levelsMm (deformableLevels) when given,
+    else a coarse level (deformableShrink) then the working images when coarse, else the working images only."""
+    if levelsMm:
+        return deformableLevels(levelsMm, spacingMm, shape)
+    shrink = deformableShrink(gridSpacingMm, spacingMm, shape)
+    return [shrink, 1] if shrink > 1 and coarse else [1]
+
+
+def gridScales(factors):
+    """With the control-point grid scaled together with the images (register(deformableGridScaling=True)): the
+    control-point spacing of each level as a multiple of the last one (e.g. images 8, 4, 2 mm -> 4, 2, 1), and the
+    mesh refinement of each level relative to the first (1, 2, 4). Whole numbers only (the factors halve)."""
+    last = max(1, int(factors[-1]))
+    ratios = [max(1, int(round(f / float(last)))) for f in factors]
+    return ratios, [max(1, ratios[0] // r) for r in ratios]
 
 
 def paddedDomain(working, padMm):
@@ -668,7 +734,8 @@ def _composite(transforms):
 
 def runDeformablePass(fixedImage, movingImage, fixedWorking, initialTransform, gridSpacingMm, spacingMm, voxelCount,
                       samples, fixedMask=None, progress=None, isCancelled=None, label="", coarse=True, domain=None,
-                      iterations=DEFORMABLE_ITERATIONS):
+                      iterations=DEFORMABLE_ITERATIONS, corrections=DEFORMABLE_CORRECTIONS, levelsMm=None,
+                      step=None, bounded=True, maxShift=MAX_CONTROL_POINT_SHIFT):
     """One B-spline pass: a new free-form deformation (control points gridSpacingMm apart) registered on top of
     initialTransform (fixed to moving; linear, or linear and the displacement field of the previous passes). The
     B-spline domain is domain (a Working box inside the fixed image, see deformableRegion; default the whole working
@@ -684,16 +751,18 @@ def runDeformablePass(fixedImage, movingImage, fixedWorking, initialTransform, g
     domain.SetSpacing(spacing)
     domain.SetDirection(direction)
     extent = [n * s for n, s in zip(size, spacing)]
+    factors = deformableFactors(gridSpacingMm, spacingMm, fixedWorking.shape, coarse, levelsMm)
     mesh = [max(1, int(round(length / gridSpacingMm))) for length in extent]
     bspline = sitk.BSplineTransformInitializer(domain, mesh, 3)
-    shrink = deformableShrink(gridSpacingMm, spacingMm, fixedWorking.shape)
-    factors = [shrink, 1] if shrink > 1 and coarse else [1]
     method = _method(samples, voxelCount, factors, fixedMask)
     iterations = int(min(MAX_DEFORMABLE_ITERATIONS, max(MIN_DEFORMABLE_ITERATIONS, iterations)))
+    # the coefficients are the control points' shifts (mm): bounded so that the pass cannot fold
+    bound = float(maxShift) * float(gridSpacingMm)
     method.SetOptimizerAsLBFGSB(gradientConvergenceTolerance=1e-5, numberOfIterations=iterations,
-                                maximumNumberOfCorrections=5,
+                                maximumNumberOfCorrections=int(max(1, corrections)),
                                 maximumNumberOfFunctionEvaluations=4 * iterations,
-                                costFunctionConvergenceFactor=1e7)
+                                costFunctionConvergenceFactor=1e7,
+                                **({"lowerBound": -bound, "upperBound": bound} if bounded else {}))
     method.SetShrinkFactorsPerLevel([int(f) for f in factors])
     method.SetSmoothingSigmasPerLevel(smoothingSigmas(factors, spacingMm))
     method.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
@@ -707,7 +776,9 @@ def runDeformablePass(fixedImage, movingImage, fixedWorking, initialTransform, g
             state["cancelled"] = True
             _stop(method)
             return
-        if progress is not None:
+        if step is not None:
+            step(method.GetCurrentLevel(), method.GetOptimizerIteration(), method.GetMetricValue())
+        elif progress is not None:
             level = factors[min(method.GetCurrentLevel(), len(factors) - 1)]
             progress(f"{label}control points {gridSpacingMm:g} mm apart, images {spacingMm * level:g} mm, "
                      f"iteration {method.GetOptimizerIteration()}, metric {method.GetMetricValue():.4f}")
@@ -719,13 +790,32 @@ def runDeformablePass(fixedImage, movingImage, fixedWorking, initialTransform, g
         if state["cancelled"]:
             raise RegistrationCancelled()
         raise
+    finally:
+        # onIteration holds the method and the method holds onIteration through a C++ command, a cycle the
+        # garbage collector cannot see: without this every run leaks the method (and its images and masks)
+        method.RemoveAllCommands()
     if state["cancelled"]:
         raise RegistrationCancelled()
     return bspline, method.GetOptimizerStopConditionDescription()
 
 
-def _field(transform, shape, ijkToWorld):
-    """(SimpleITK displacement field image (LPS) of a transform on a grid, minimum Jacobian determinant)."""
+def maskOnGrid(maskWorking, working, shape, ijkToWorld, dilateVoxels=1):
+    """The registration mask (bool, on the working image's grid) on another grid (e.g. the displacement field's),
+    dilated by dilateVoxels; None without a mask."""
+    if maskWorking is None:
+        return None
+    region = resampleOnto(np.asarray(maskWorking, dtype=np.uint8), working.ijkToWorld, shape, ijkToWorld, order=0,
+                          fill=0) > 0
+    if dilateVoxels > 0 and region.any():
+        from scipy import ndimage
+        region = ndimage.binary_dilation(region, iterations=int(dilateVoxels))
+    return region
+
+
+def _field(transform, shape, ijkToWorld, region=None):
+    """(SimpleITK displacement field image (LPS) of a transform on a grid, minimum Jacobian determinant; within
+    region (bool [k, j, i] on that grid) when given: outside the mask the control points have no image to fit and
+    may fold where it does not matter)."""
     import SimpleITK as sitk
     reference = sitk.Image([int(v) for v in shape[::-1]], sitk.sitkUInt8)
     _place(reference, ijkToWorld)
@@ -737,26 +827,29 @@ def _field(transform, shape, ijkToWorld):
     if min(shape) >= 2:
         try:
             jacobian = sitk.DisplacementFieldJacobianDeterminant(field)   # kept alive while its array is read
-            minimumJacobian = float(np.min(sitk.GetArrayViewFromImage(jacobian)))
+            values = sitk.GetArrayViewFromImage(jacobian)
+            if region is not None and np.shape(region) == values.shape and np.any(region):
+                values = values[np.asarray(region, dtype=bool)]
+            minimumJacobian = float(np.min(values))
         except RuntimeError:
             pass
     return field, minimumJacobian
 
 
-def fieldTransform(transform, shape, ijkToWorld):
+def fieldTransform(transform, shape, ijkToWorld, region=None):
     """(SimpleITK displacement field transform equal to a transform (fixed to moving) on a grid, minimum Jacobian
-    determinant)."""
+    determinant (within region when given))."""
     import SimpleITK as sitk
-    field, minimumJacobian = _field(transform, shape, ijkToWorld)
+    field, minimumJacobian = _field(transform, shape, ijkToWorld, region)
     return sitk.DisplacementFieldTransform(field), minimumJacobian
 
 
-def displacementField(transform, shape, ijkToWorld):
+def displacementField(transform, shape, ijkToWorld, region=None):
     """(displacement [k, j, i, 3] in world RAS mm, minimum Jacobian determinant) of a SimpleITK transform (fixed to
     moving) on a grid: the moving-image point of world point x is x + displacement(x). This is the transform from
     parent of a Slicer grid transform."""
     import SimpleITK as sitk
-    field, minimumJacobian = _field(transform, shape, ijkToWorld)
+    field, minimumJacobian = _field(transform, shape, ijkToWorld, region)
     displacement = np.array(sitk.GetArrayFromImage(field), dtype=np.float64)
     displacement[..., :2] *= -1.0   # LPS -> RAS
     return displacement, minimumJacobian
@@ -764,33 +857,71 @@ def displacementField(transform, shape, ijkToWorld):
 
 def _deformableStage(fixedImage, movingImage, fixedWorking, matrix, kind, centreLps, spacing, voxelCount, samples,
                      maskImage, maskWorking, gridSpacingMm, passes, fieldGeometry, progress, isCancelled, notes,
-                     iterations=DEFORMABLE_ITERATIONS):
+                     iterations=DEFORMABLE_ITERATIONS, coarse=True, corrections=DEFORMABLE_CORRECTIONS,
+                     levelsMm=None, step=None, gridScaling=False, foldGuard=True,
+                     maxShift=MAX_CONTROL_POINT_SHIFT):
     """Iterative B-spline passes on top of the linear matrix (see the module doc). A pass that does not improve the
     metric is dropped and the next, finer pass starts from the previous result. The deformation of the kept passes
     is carried between passes as a displacement field on the working grid. Returns a dict: displacement (None when
     no pass was kept), fieldIjkToWorld, minimumJacobian, passes [(grid mm, metric before, after, kept)], metric."""
+    import SimpleITK as sitk
     linear = sitkTransform(matrix, kind, centreLps)
     metric = _evaluateTransform(fixedImage, movingImage, linear, voxelCount, maskImage)
     carried = None          # displacement field transform of the kept passes (fixed to fixed), or None
-    workShape, workMatrix = fieldGrid(fixedWorking.shape, fixedWorking.ijkToWorld)
+    # (the runs are listed first: the carried field must be fine enough for the finest grid, or its interpolation
+    # shows folds that the B-splines do not have)
+    runs = []
+    for index, gridMm in enumerate(deformablePasses(gridSpacingMm, passes)):
+        passFactors = deformableFactors(gridMm, spacing, fixedWorking.shape, coarse and index == 0, levelsMm)
+        if gridScaling and len(passFactors) > 1:
+            ratios = gridScales(passFactors)[0]
+            runs += [(index, j, gridMm * r, [spacing * f], False) for j, (f, r) in enumerate(zip(passFactors, ratios))]
+        else:
+            runs.append((index, None, gridMm, levelsMm, coarse and index == 0))
+    fieldSpacing = max(float(spacing), min(FIELD_SPACING_MM, min(run[2] for run in runs) / 4.0))
+    workShape, workMatrix = fieldGrid(fixedWorking.shape, fixedWorking.ijkToWorld, fieldSpacing)
+    # the folding check of a pass only inside the (dilated) mask, when there is one
+    workRegion = maskOnGrid(maskWorking, fixedWorking, workShape, workMatrix)
     region = deformableRegion(fixedWorking, maskWorking)
     history = []
-    gridSpacings = deformablePasses(gridSpacingMm, passes)
-    for index, gridMm in enumerate(gridSpacings):
+    # runs: (pass index, level index within the pass, grid mm, image levels mm, coarse). With gridScaling each image
+    # level of a pass is its own run with the grid scaled as the images (e.g. 40, 20, 10 mm on 8, 4, 2 mm), each on
+    # top of the previous one (a bounded L-BFGS-B cannot refine its mesh between levels)
+    for number, (index, sub, gridMm, runLevels, runCoarse) in enumerate(runs):
         start = _composite([linear, carried]) if carried is not None else linear
+        if step is None:
+            runStep = None
+        elif sub is None:
+            runStep = (lambda *a, i=index: step(i, *a))
+        else:
+            runStep = (lambda level, *a, i=index, j=sub: step(i, j, *a))
         bspline, _ = runDeformablePass(fixedImage, movingImage, fixedWorking, start, gridMm, spacing, voxelCount,
                                        samples, maskImage, progress, isCancelled,
-                                       f"Deformable pass {index + 1} of {len(gridSpacings)}: ",
-                                       coarse=index == 0, domain=region, iterations=iterations)
-        local = _composite([carried, bspline]) if carried is not None else bspline
-        value = _evaluateTransform(fixedImage, movingImage, _composite([linear, local]), voxelCount, maskImage)
-        kept = math.isfinite(value) and value < metric
-        if kept:
-            candidate, jacobian = fieldTransform(local, workShape, workMatrix)
-            if math.isfinite(jacobian) and jacobian <= MIN_JACOBIAN:
-                kept = False
-                notes.append(f"Deformable pass {index + 1} ({gridMm:g} mm grid) was dropped: it folds the image "
-                             f"(minimum Jacobian determinant {jacobian:.2f}).")
+                                       f"Deformable pass {number + 1} of {len(runs)}: ",
+                                       coarse=runCoarse, domain=region, iterations=iterations,
+                                       corrections=corrections, levelsMm=runLevels, step=runStep,
+                                       bounded=foldGuard, maxShift=maxShift)
+        full = np.asarray(bspline.GetParameters(), dtype=np.float64)
+        kept, value, candidate = False, math.nan, None
+        for scale in (1.0,) + (tuple(FOLD_BACKOFF_SCALES) if foldGuard else ()):
+            if scale != 1.0:
+                bspline = sitk.BSplineTransform(bspline)        # a copy: the composites above keep the old one
+                bspline.SetParameters(tuple(full * scale))
+            local = _composite([carried, bspline]) if carried is not None else bspline
+            value = _evaluateTransform(fixedImage, movingImage, _composite([linear, local]), voxelCount, maskImage)
+            if not (math.isfinite(value) and value < metric):
+                break                                           # a smaller step only gives back less of the gain
+            candidate, jacobian = fieldTransform(local, workShape, workMatrix, workRegion)
+            if foldGuard and math.isfinite(jacobian) and jacobian <= MIN_JACOBIAN:
+                notes.append(f"Deformable pass {number + 1} ({gridMm:g} mm grid) folds the image at "
+                             f"{scale:g} of its shifts (minimum Jacobian determinant {jacobian:.2f}).")
+                continue
+            kept = True
+            if scale != 1.0:
+                notes.append(f"Deformable pass {number + 1} ({gridMm:g} mm grid) kept at {scale:g} of its shifts.")
+            break
+        if not kept and foldGuard:
+            notes.append(f"Deformable pass {number + 1} ({gridMm:g} mm grid) was dropped.")
         history.append((gridMm, metric, value, kept))
         if kept:
             metric = value
@@ -799,17 +930,18 @@ def _deformableStage(fixedImage, movingImage, fixedWorking, matrix, kind, centre
               "metric": metric}
     keptGrids = [f"{grid:g}" for grid, _, _, ok in history if ok]
     if carried is None:
-        notes.append("The deformable passes (control points " + ", ".join(f"{g:g}" for g in gridSpacings)
+        notes.append("The deformable passes (control points " + ", ".join(f"{run[2]:g}" for run in runs)
                      + " mm apart) did not improve the match: the linear result was kept.")
         return result
     if progress is not None:
         progress("Computing the displacement field")
     if fieldGeometry is None:
         fieldGeometry = (fixedWorking.shape, fixedWorking.ijkToWorld)
-    fieldShape, fieldMatrix = fieldGrid(*fieldGeometry)
-    displacement, minimumJacobian = displacementField(_composite([linear, carried]), fieldShape, fieldMatrix)
+    fieldShape, fieldMatrix = fieldGrid(*fieldGeometry, spacingMm=fieldSpacing)
+    displacement, minimumJacobian = displacementField(_composite([linear, carried]), fieldShape, fieldMatrix,
+                                                      maskOnGrid(maskWorking, fixedWorking, fieldShape, fieldMatrix))
     result.update(displacement=displacement, fieldIjkToWorld=fieldMatrix, minimumJacobian=minimumJacobian)
-    notes.append(f"Deformable: {len(keptGrids)} of {len(gridSpacings)} passes kept (control points "
+    notes.append(f"Deformable: {len(keptGrids)} of {len(runs)} passes kept (control points "
                  f"{', '.join(keptGrids)} mm apart); mutual information {history[0][1]:.4f} \u2192 {metric:.4f}.")
     if math.isfinite(minimumJacobian) and minimumJacobian <= 0:
         notes.append(f"Warning: the deformation folds (minimum Jacobian determinant {minimumJacobian:.2f}). Use a "
@@ -821,7 +953,10 @@ def register(fixed, moving, initialMatrix=None, transformType=RIGID, finalSpacin
              quality=DEFAULT_QUALITY, fixedMask=None, initialization=INIT_CURRENT,
              searchRangeMm=DEFAULT_SEARCH_RANGE_MM, progress=None, isCancelled=None, deformable=False,
              gridSpacingMm=DEFAULT_GRID_SPACING_MM, passes=DEFAULT_DEFORMABLE_PASSES, fieldGeometry=None,
-             deformableIterations=DEFORMABLE_ITERATIONS):
+             deformableIterations=DEFORMABLE_ITERATIONS, coarsestMm=COARSEST_SPACING_MM, deformableCoarse=True,
+             deformableCorrections=DEFORMABLE_CORRECTIONS, deformableLevelsMm=None, samplingMode=SAMPLING_COUNT,
+             onIteration=None, deformableGridScaling=False, deformableFoldGuard=True,
+             deformableMaxShift=MAX_CONTROL_POINT_SHIFT):
     """
     Register moving (ImageInput, native coordinates) to fixed (ImageInput). fixedMask: (bool [k, j, i], ijkToWorld)
     restricting the comparison, or None. initialMatrix: current moving-to-world matrix (identity if None).
@@ -829,6 +964,26 @@ def register(fixed, moving, initialMatrix=None, transformType=RIGID, finalSpacin
     deformable: after the linear stage (transformType), iterative B-spline passes (control points gridSpacingMm apart
     in the last pass, at most deformableIterations optimiser iterations per pass and level); fieldGeometry: (shape
     [k, j, i], ijkToWorld) of the image the displacement field must cover (default: the fixed image given).
+    deformableCoarse: False runs the first deformable pass on the working images only (no coarser level first; the
+    linear stage already brought the images close, e.g. a brain to a template after an affine).
+    deformableCorrections: L-BFGS-B corrections (memory) of the deformable passes.
+    deformableLevelsMm: image sizes (mm) of the levels of every deformable pass, e.g. (8, 4, 2); None: the default
+    (a coarse level in the first pass, see deformableCoarse, then the working images).
+    deformableFoldGuard: False lets the B-spline passes fold (no bound on the control points, no pass dropped for
+    folding; a warning note is still written), as BRAINSFit does. With it a folding pass is scaled down
+    (FOLD_BACKOFF_SCALES) before it is dropped.
+    deformableMaxShift: the bound of each control point's shift as a fraction of its grid spacing (with the fold
+    guard; 0.4 at most for a single cubic B-spline not to fold, smaller values give a smoother, gentler deformation).
+    deformableGridScaling: the control-point spacing scaled with the images of the deformable levels (e.g. grid 10
+    mm on 8, 4, 2 mm images: 40, 20, 10 mm), the mesh refined between the levels.
+    samplingMode: SAMPLING_COUNT (quality = number of samples per level, QUALITY_SAMPLES) or SAMPLING_PERCENT
+    (quality = fraction of each level's voxels, QUALITY_PERCENT).
+    onIteration(info), when given, is called at every optimiser iteration (the progress text then only tells the
+    phases): info is a dict with plan (the levels of the whole run: [{"stage", "levelMm", "maxIterations"}]), index
+    (current entry of plan), stage, level / levels (within the stage), levelMm, iteration, maxIterations, metric
+    (Mattes mutual information, lower is better), seconds.
+    coarsestMm: voxel size of the first pyramid level (smaller for images that are already close, e.g. the frames of
+    one dynamic acquisition in Motion Correction).
 
     Returns a dict: matrix (moving-to-world RAS, to set on the transform), initialMatrix (after the starting
     position), refined (False: the result did not improve the match and the starting position is returned),
@@ -843,7 +998,10 @@ def register(fixed, moving, initialMatrix=None, transformType=RIGID, finalSpacin
     matrix0 = np.eye(4) if initialMatrix is None else np.array(initialMatrix, dtype=float)
     if transformType not in (RIGID, AFFINE):
         raise ValueError(f"Unknown transform type '{transformType}'.")
-    samples = QUALITY_SAMPLES.get(quality, QUALITY_SAMPLES[DEFAULT_QUALITY])
+    if samplingMode == SAMPLING_PERCENT:
+        samples = SampleFraction(QUALITY_PERCENT.get(quality, QUALITY_PERCENT[DEFAULT_QUALITY]))
+    else:
+        samples = QUALITY_SAMPLES.get(quality, QUALITY_SAMPLES[DEFAULT_QUALITY])
 
     report("Preparing the images")
     spacing, note = workingSpacing([fixed, moving], finalSpacingMm)
@@ -891,14 +1049,52 @@ def register(fixed, moving, initialMatrix=None, transformType=RIGID, finalSpacin
 
     initialMetric = evaluateMetric(fixedImage, movingImage, matrix0, transformType, centreLps, voxelCount, maskImage)
 
-    factors = pyramid(spacing, fixedWorking.shape)
+    factors = pyramid(spacing, fixedWorking.shape, coarsestMm)
     levels = [spacing * f for f in factors]
-    matrix, stop = runStage(fixedImage, movingImage, matrix0, RIGID, centreLps, spacing, factors, voxelCount,
-                            samples, maskImage, report, isCancelled, "Rigid: ")
+    affineFactors = [f for f in factors if spacing * f <= AFFINE_START_SPACING_MM + 1e-6] or [1]
+    # the levels of the whole run, for onIteration
+    plan = [{"stage": "Rigid", "levelMm": spacing * f, "maxIterations": MAX_ITERATIONS} for f in factors]
+    offsets = {"Rigid": 0}
     if transformType == AFFINE:
-        affineFactors = [f for f in factors if spacing * f <= AFFINE_START_SPACING_MM + 1e-6] or [1]
+        offsets["Affine"] = len(plan)
+        plan += [{"stage": "Affine", "levelMm": spacing * f, "maxIterations": MAX_ITERATIONS} for f in affineFactors]
+    if deformable:
+        bsplineIterations = int(min(MAX_DEFORMABLE_ITERATIONS, max(MIN_DEFORMABLE_ITERATIONS, deformableIterations)))
+        gridList = deformablePasses(gridSpacingMm, passes)
+        for passIndex, gridMm in enumerate(gridList):
+            offsets[f"B-spline {passIndex}"] = len(plan)
+            name = f"B-spline, grid {gridMm:g} mm" + (f" (pass {passIndex + 1} of {len(gridList)})"
+                                                     if len(gridList) > 1 else "")
+            passFactors = deformableFactors(gridMm, spacing, fixedWorking.shape,
+                                            deformableCoarse and passIndex == 0, deformableLevelsMm)
+            ratios = gridScales(passFactors)[0] if deformableGridScaling and len(passFactors) > 1 \
+                else [1] * len(passFactors)
+            plan += [{"stage": name, "levelMm": spacing * f, "maxIterations": bsplineIterations,
+                      "gridMm": gridMm * r} for f, r in zip(passFactors, ratios)]
+
+    def stepper(key):
+        """step callback of a stage: maps (level, iteration, metric) to onIteration(info)."""
+        if onIteration is None:
+            return None
+        offset = offsets[key]
+        count = sum(1 for entry in plan[offset:] if entry["stage"] == plan[offset]["stage"])
+
+        def step(level, iteration, metric):
+            index = min(offset + int(level), len(plan) - 1)
+            entry = plan[index]
+            onIteration({"plan": plan, "index": index, "stage": entry["stage"], "level": int(level),
+                         "gridMm": entry.get("gridMm"),
+                         "levels": count, "levelMm": entry["levelMm"], "iteration": int(iteration),
+                         "maxIterations": entry["maxIterations"], "metric": float(metric),
+                         "seconds": time.time() - start})
+        return step
+
+    matrix, stop = runStage(fixedImage, movingImage, matrix0, RIGID, centreLps, spacing, factors, voxelCount,
+                            samples, maskImage, report, isCancelled, "Rigid: ", step=stepper("Rigid"))
+    if transformType == AFFINE:
         matrix, stop = runStage(fixedImage, movingImage, matrix, AFFINE, centreLps, spacing, affineFactors,
-                                voxelCount, samples, maskImage, report, isCancelled, "Affine: ")
+                                voxelCount, samples, maskImage, report, isCancelled, "Affine: ",
+                                step=stepper("Affine"))
 
     finalMetric = evaluateMetric(fixedImage, movingImage, matrix, transformType, centreLps, voxelCount, maskImage)
     refined = math.isfinite(finalMetric) and finalMetric < initialMetric
@@ -913,7 +1109,11 @@ def register(fixed, moving, initialMatrix=None, transformType=RIGID, finalSpacin
     if deformable:
         stage = _deformableStage(fixedImage, movingImage, fixedWorking, matrix, transformType, centreLps, spacing,
                                  voxelCount, samples, maskImage, maskWorking, gridSpacingMm, passes, fieldGeometry,
-                                 report, isCancelled, notes, deformableIterations)
+                                 report, isCancelled, notes, deformableIterations, deformableCoarse,
+                                 deformableCorrections, deformableLevelsMm,
+                                 step=(lambda passIndex, *a: stepper(f"B-spline {passIndex}")(*a))
+                                 if onIteration is not None else None, gridScaling=deformableGridScaling,
+                                 foldGuard=deformableFoldGuard, maxShift=deformableMaxShift)
         result.update(displacement=stage["displacement"], fieldIjkToWorld=stage["fieldIjkToWorld"],
                       minimumJacobian=stage["minimumJacobian"], deformablePasses=stage["passes"])
         if stage["displacement"] is not None:
